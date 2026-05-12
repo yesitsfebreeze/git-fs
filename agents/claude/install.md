@@ -18,7 +18,7 @@ You are a Claude Code agent installing git-fs for a user. Follow this flow end-t
 | OS | Arch | Artifact |
 |----|------|----------|
 | Linux | x86_64 | `git-fs-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux | aarch64 / arm64 | `git-fs-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux | aarch64 / arm64 | _not yet released — build from source: `cargo build --release -p git-fs`_ |
 | macOS | Intel | `git-fs-x86_64-apple-darwin.tar.gz` |
 | macOS | Apple Silicon | `git-fs-aarch64-apple-darwin.tar.gz` |
 | Windows | x86_64 | `git-fs-x86_64-pc-windows-msvc.zip` |

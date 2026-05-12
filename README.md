@@ -117,7 +117,6 @@ Every tagged release publishes:
 | Target | Artifact |
 |--------|----------|
 | Linux x86_64 | `git-fs-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `git-fs-aarch64-unknown-linux-gnu.tar.gz` |
 | macOS Intel | `git-fs-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `git-fs-aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `git-fs-x86_64-pc-windows-msvc.zip` |
@@ -136,6 +135,7 @@ Every tagged release publishes:
 - [ ] `Session-Id:` git trailer on every commit
 - [ ] Old-branch sweeper (`git-fs prune --merged --older-than 7d`)
 - [ ] Cursor / Windsurf / Cline agent guides
+- [ ] Linux aarch64 release binary (needs `cargo-zigbuild` for libgit2-sys cross-compile)
 
 ## Other agents
 
