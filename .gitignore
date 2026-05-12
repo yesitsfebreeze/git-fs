@@ -1,0 +1,18 @@
+target/
+Cargo.lock.bak
+
+# git-fs storage + per-session metadata
+/.git-fs/
+.agent
+CONFLICTS.md
+
+# Local tooling state
+/.vicky/
+/.wiki/
+.claude/settings.local.json
+.claude/projects/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

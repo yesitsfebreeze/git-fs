@@ -1,0 +1,3 @@
+[workspace]
+members = ["git-fs"]
+resolver = "2"

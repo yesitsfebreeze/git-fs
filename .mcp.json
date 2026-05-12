@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "git-fs": {
+      "command": "git-fs-mcp"
+    }
+  }
+}

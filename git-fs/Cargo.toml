@@ -1,0 +1,23 @@
+[package]
+name = "git-fs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "git-fs"
+path = "src/main.rs"
+
+[[bin]]
+name = "git-fs-mcp"
+path = "src/bin/mcp.rs"
+
+[dependencies]
+git2 = "0.20"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+serde_json = "1"
+globset = "0.4"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

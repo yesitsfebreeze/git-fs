@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "deny": ["Edit", "Write"]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{"type": "command", "command": "git-fs hook session-start"}]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{"type": "command", "command": "git-fs hook stop"}]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [{"type": "command", "command": "git-fs hook read"}]
+      }
+    ]
+  }
+}

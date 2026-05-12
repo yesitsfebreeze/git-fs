@@ -1,0 +1,113 @@
+# gitfs — virtual git filesystem CLI
+# Requires: cargo, just
+
+set windows-shell := ["powershell.exe", "-NoProfile", "-NonInteractive", "-c"]
+
+default: build
+
+# ── build ─────────────────────────────────────────────────────────────────────
+
+build:
+    cargo build
+
+release:
+    cargo build --release
+
+install:
+    cargo install --path .
+
+# Install then bootstrap a project. Run from your project root.
+# Creates .gitfs/ bare repo + writes .claude/settings.json MCP entry.
+setup: install
+    gitfs init-project
+
+# ── quality ───────────────────────────────────────────────────────────────────
+
+check:
+    cargo clippy -- -D warnings
+
+fmt:
+    cargo fmt
+
+test:
+    cargo test
+
+# ── demo (Unix / macOS / WSL) ─────────────────────────────────────────────────
+
+[unix]
+demo: build
+    #!/usr/bin/env sh
+    set -e
+    BIN=./target/debug/gitfs
+    REPO=$(mktemp -d)/demo.git
+    export GITFS_REPO="$REPO"
+
+    echo "=== init ==="
+    $BIN init
+    $BIN branch create main
+
+    echo "=== write files ==="
+    printf 'fn main() {\n    println!("hello from gitfs");\n}\n' \
+        | $BIN write main src/main.rs -m "add main"
+    printf '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n' \
+        | $BIN write main Cargo.toml -m "add Cargo.toml"
+
+    echo "=== ls (recursive) ==="
+    $BIN ls main --recursive
+
+    echo "=== log ==="
+    $BIN log main
+
+    echo "=== branch + merge ==="
+    $BIN branch create feat --from main
+    printf 'pub fn greet() -> &'"'"'static str { "hi" }\n' \
+        | $BIN write feat src/lib.rs -m "add lib"
+    $BIN merge main feat --base main --into merged -m "merge feat"
+    echo "--- merged tree ---"
+    $BIN ls merged --recursive
+
+    echo "=== diff main..merged ==="
+    $BIN diff main merged
+
+    echo "=== checkout to disk ==="
+    OUT=$(mktemp -d)
+    $BIN checkout merged "$OUT"
+    find "$OUT" -type f
+
+    echo "=== done: $REPO ==="
+
+# ── demo (Windows PowerShell) ─────────────────────────────────────────────────
+
+[windows]
+demo: build
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "\
+        $ErrorActionPreference = 'Stop'; \
+        $bin  = '.\target\debug\gitfs.exe'; \
+        $repo = Join-Path $env:TEMP 'gitfs-demo.git'; \
+        $env:GITFS_REPO = $repo; \
+        Write-Host '=== init ==='; \
+        & $bin init; \
+        & $bin branch create main; \
+        Write-Host '=== write files ==='; \
+        'fn main() { println!(\"hello\"); }' | & $bin write main src/main.rs -m 'add main'; \
+        '[package]' | & $bin write main Cargo.toml -m 'add Cargo.toml'; \
+        Write-Host '=== ls ==='; \
+        & $bin ls main --recursive; \
+        Write-Host '=== log ==='; \
+        & $bin log main; \
+        Write-Host '=== branch + merge ==='; \
+        & $bin branch create feat --from main; \
+        'pub fn greet() {}' | & $bin write feat src/lib.rs -m 'add lib'; \
+        & $bin merge main feat --base main --into merged -m 'merge feat'; \
+        & $bin ls merged --recursive; \
+        Write-Host '=== checkout ==='; \
+        $out = Join-Path $env:TEMP 'gitfs-out'; \
+        & $bin checkout merged $out; \
+        Get-ChildItem $out -Recurse | Select-Object FullName; \
+        Write-Host '=== done ===' \
+    "
+
+# ── clean ─────────────────────────────────────────────────────────────────────
+
+clean:
+    cargo clean
