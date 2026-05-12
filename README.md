@@ -22,21 +22,15 @@ Each agent session works on its own `agent/<session-id>` branch. Every `Read` / 
 
 **Why this matters in 2026.** Agent swarms keep colliding on shared filesystems: stale reads, overwritten edits, lost work after a crash. git-fs swaps the filesystem for git's object store so concurrent agents get isolation, atomic commits, and a real audit trail — without bolting on locks or coordination servers.
 
-## Install (Claude Code)
+## Install
 
-Paste this into Claude Code:
+See [`INSTALL.md`](INSTALL.md) for the full flow and the per-agent guides. TL;DR: paste the prompt for your agent and it will detect your platform, fetch the matching binary from the [latest release](https://github.com/yesitsfebreeze/git-fs/releases/latest), and register the MCP + skill.
 
-```
-Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/install.md and install git-fs.
-```
+Supported agents: **Claude Code**. PRs for others welcome under [`agents/`](agents/).
 
-The agent will detect your platform, download the matching binary from the [latest release](https://github.com/yesitsfebreeze/git-fs/releases/latest), register the MCP server, drop the skill into `~/.claude/skills/git-fs/`, and walk you through the optional hooks.
+## Update
 
-### Update
-
-```
-Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/update.md and update git-fs.
-```
+See [`UPDATE.md`](UPDATE.md).
 
 ### Build from source
 
