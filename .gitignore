@@ -12,6 +12,10 @@ CONFLICTS.md
 .claude/settings.local.json
 .claude/projects/
 
+# Skills: exclude all, then re-include git-fs-relevant ones
+.claude/skills/*
+!.claude/skills/merge/
+
 # OS / editor
 .DS_Store
 Thumbs.db
