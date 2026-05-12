@@ -59,6 +59,19 @@ Multiple Claude Code sessions can run against the same git-fs repo in parallel.
 - Read another session's intent: `git_fs_read ref:agent/<other-id> path:.git-fs/session/intent.md`.
 - Mergeignore paths are stripped before a session's branch merges to `main`. Hard defaults: `.agent`, `CONFLICTS.md`. Project-configurable extras: `.git-fs/mergeignore`.
 
+### Before editing a shared file
+
+Sibling agents commit to their own `agent/<id>` branch, **not** to `main`. The Stop hook merges at session end, not mid-session. So `main` does **not** reflect work that sibling agents have already shipped.
+
+1. `git_fs_branch_list` — enumerate active `agent/*` branches.
+2. For each file you plan to touch, check whether a sibling already changed it:
+   - `git_fs_log branch:agent/<sibling>` + `git_fs_diff ref_a:main ref_b:agent/<sibling>`
+   - Or `git_fs_read ref:agent/<sibling> path:<file>` to see their current version.
+3. **Always align to the latest version across all agent branches**, not just your own branch's view of the file. Base edits on the newest sibling content, otherwise two agents fork from stale state and clobber each other when Stop merges both branches into `main`.
+4. If a sibling already implemented a similar pattern, mirror it rather than inventing a parallel approach — reduces merge surface and keeps the codebase coherent.
+
+When you need a sibling's work visible mid-session (not at Stop), merge their branch into yours explicitly with `git_fs_merge` or via the `/merge` skill. Don't assume `main` is the integration point during a live session.
+
 Spec: https://github.com/yesitsfebreeze/git-fs/blob/main/docs/multi-agent-session.md.
 
 ## Stop hook

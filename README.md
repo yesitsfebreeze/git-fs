@@ -18,15 +18,53 @@
 
 ---
 
-Each agent session works on its own `agent/<session-id>` branch. Every `Read` / `Write` / `Edit` becomes a git commit. When the session ends, the branch is merged into `main` and materialized to disk.
+## Why use git-fs
 
-**Why this matters in 2026.** Agent swarms keep colliding on shared filesystems: stale reads, overwritten edits, lost work after a crash. git-fs swaps the filesystem for git's object store so concurrent agents get isolation, atomic commits, and a real audit trail — without bolting on locks or coordination servers.
+Run **5+ AI agents on the same repo at once** without them stomping each other.
+
+Plain filesystem + multiple agents = stale reads, overwritten edits, lost work on crash. git-fs gives every agent its own git branch in a shared object store. Edits are commits. Sessions end with a 3-way merge into `main`, then materialize to disk. **No locks, no coordination server, no clone-per-agent.**
+
+```
+┌─ agent A ──┐
+│ edit foo.rs│──┐
+└────────────┘  │
+┌─ agent B ──┐  ├──► merge.lock ──► 3-way merge ──► main ──► disk
+│ edit bar.rs│──┤
+└────────────┘  │
+┌─ agent C ──┐  │
+│ rm baz.rs  │──┘
+└────────────┘
+```
+
+## What you get
+
+| | Plain FS + N agents | git-fs |
+|---|---|---|
+| Session startup cost | clone / worktree add (seconds–minutes, full tree copy) | **`git branch` (~ms, 0 file copies)** |
+| Disk per extra agent | full working tree (~repo size × N) | **0 bytes — shared object store** |
+| Write atomicity | partial writes possible on crash | **every edit = 1 git commit, atomic** |
+| Concurrent edits to repo | last-writer-wins, silent loss | **isolated branches, explicit 3-way merge** |
+| Crash recovery | unsaved buffers gone | **`git reflog` — every tool call is recoverable** |
+| Audit trail | filesystem mtime, no author | **`git log` — who, what, when, which session** |
+| Cross-agent visibility | none | **siblings read each other's `.git-fs/session/` live** |
+| Merge race protection | none | **`flock` on `merge.lock` — serialized Stop hooks** |
+| Tooling for LLMs | shell out to `git` | **first-class MCP: `git_fs_read/write/replace/merge/...`** |
+
+## What it can do
+
+- 🌿 **N agents, 1 repo, 0 collisions** — each session lives on `agent/<uuid>`.
+- ⚡ **Edit-as-commit** — `git_fs_replace` / `write` / `rm` each produce one commit. Roll back with `git reset`.
+- 🔀 **Auto-merge on Stop** — exclusive `merge.lock` + 3-way merge into `main` + checkout to disk.
+- 🧹 **Mergeignore** — junk files (`.agent`, `CONFLICTS.md`, your own globs) never reach `main`.
+- 🪟 **Worktree-aware** — per-worktree by default, or share one bare repo across worktrees via `GIT_FS_REPO`.
+- 📜 **Full audit** — `git log agent/<id>` answers "what did this agent do?"
+- 🔌 **MCP-native** — works with any MCP client; Claude Code skill ships in-tree.
 
 ## Install
 
 See [`INSTALL.md`](INSTALL.md) for the full flow and the per-agent guides. TL;DR: paste the prompt for your agent and it will detect your platform, fetch the matching binary from the [latest release](https://github.com/yesitsfebreeze/git-fs/releases/latest), and register the MCP + skill.
 
-Supported agents: **Claude Code**. PRs for others welcome under [`agents/`](agents/).
+Supported agents: **Claude Code**, **Cursor**, **Windsurf**, **Cline**. PRs for others welcome under [`agents/`](agents/).
 
 ## Update
 
@@ -62,6 +100,19 @@ flowchart LR
 
 Spec: [`docs/multi-agent-session.md`](docs/multi-agent-session.md).
 
+## Cross-agent coordination
+
+Sibling agents commit to their own `agent/<id>` branch, not to `main`. `main` only catches up at Stop. So mid-session, `main` does **not** reflect work other agents have already shipped.
+
+Before editing a file a sibling might also be touching:
+
+1. `git_fs_branch_list` — find active `agent/*` branches.
+2. `git_fs_diff ref_a:main ref_b:agent/<sibling>` or `git_fs_read ref:agent/<sibling> path:<file>` — see their version.
+3. **Align to the latest version across all agent branches**, not just your own. Otherwise both agents fork from stale state and clobber each other at Stop.
+4. If a sibling already implemented a similar pattern, mirror it — less merge surface, more coherent code.
+
+Need a sibling's work visible mid-session? Merge it in explicitly with `git_fs_merge` (or the `/merge` skill). Don't wait for Stop and don't assume `main` is the integration point during a live session.
+
 ## Worktrees
 
 git-fs works across git worktrees in two modes.
@@ -84,26 +135,6 @@ git-fs works across git worktrees in two modes.
 
 In shared mode, `git_fs_branch_list` returns every agent across every worktree, the merge lock (flock on `<shared>/merge.lock`) serializes Stop hooks across worktrees, and Stop's final `checkout main → cwd` still writes into the calling session's own worktree — only the git history is shared.
 
-## Features
-
-- 🌿 **Per-session isolation.** One branch per agent, zero shared mutable state.
-- ⚡ **Atomic edits.** Every change is a git commit — no partial writes, no torn reads.
-- 🔀 **Concurrent merges.** Exclusive `merge.lock` serializes Stop hooks; sessions in flight see each other's intent via `.git-fs/session/`.
-- 🧹 **Mergeignore.** Hard defaults (`.agent`, `CONFLICTS.md`) keep `main` free of session cruft; project-extensible via `.git-fs/mergeignore`.
-- 📜 **Full audit trail.** `git log` answers "who changed what, when, in which session."
-- 🔌 **MCP-native.** Drop-in for any MCP-aware client; reference skill ships for Claude Code.
-
-## vs. plain git checkouts
-
-| | Plain git worktree per agent | **git-fs** |
-|---|---|---|
-| Setup per session | clone or worktree add | nothing — auto on SessionStart |
-| Disk usage | full copy per session | shared object store |
-| Read freshness | depends on `git pull` | always current branch tip |
-| Cross-session visibility | none (separate dirs) | sibling intent readable live |
-| Merge race | manual coordination | exclusive `merge.lock` |
-| LLM-friendly tools | wrap `git` CLI | first-class MCP API |
-
 ## Release artifacts
 
 Every tagged release publishes:
@@ -111,6 +142,7 @@ Every tagged release publishes:
 | Target | Artifact |
 |--------|----------|
 | Linux x86_64 | `git-fs-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64 | `git-fs-aarch64-unknown-linux-gnu.tar.gz` |
 | macOS Intel | `git-fs-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `git-fs-aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `git-fs-x86_64-pc-windows-msvc.zip` |
@@ -125,15 +157,22 @@ Every tagged release publishes:
 - [x] Exclusive merge lock
 - [x] Claude Code skill + install/update agents
 - [x] Release CI (5 targets + SHA256SUMS)
-- [ ] Sibling-branch reconcile (path-overlap warnings pre-merge)
-- [ ] `Session-Id:` git trailer on every commit
-- [ ] Old-branch sweeper (`git-fs prune --merged --older-than 7d`)
-- [ ] Cursor / Windsurf / Cline agent guides
-- [ ] Linux aarch64 release binary (needs `cargo-zigbuild` for libgit2-sys cross-compile)
+- [x] Sibling-branch reconcile (path-overlap warnings pre-merge)
+- [x] `Session-Id:` git trailer on every commit
+- [x] Old-branch sweeper (`git-fs prune --merged --older-than 7d`)
+- [x] Cursor / Windsurf / Cline agent guides
+- [x] Linux aarch64 release binary (via `cargo-zigbuild`)
 
 ## Other agents
 
-Currently only Claude Code is wired up. PRs welcome under `agents/<agent>/install.md` + `update.md`.
+| Agent | Install | Update |
+|-------|---------|--------|
+| Claude Code | [`agents/claude/install.md`](agents/claude/install.md) | [`agents/claude/update.md`](agents/claude/update.md) |
+| Cursor | [`agents/cursor/install.md`](agents/cursor/install.md) | [`agents/cursor/update.md`](agents/cursor/update.md) |
+| Windsurf | [`agents/windsurf/install.md`](agents/windsurf/install.md) | [`agents/windsurf/update.md`](agents/windsurf/update.md) |
+| Cline | [`agents/cline/install.md`](agents/cline/install.md) | [`agents/cline/update.md`](agents/cline/update.md) |
+
+Claude Code is the only agent with full hook-driven session-branch + auto-merge. The others use the MCP tools directly on `main` (or with manual branch + merge). PRs for additional agents welcome under `agents/<agent>/install.md` + `update.md`.
 
 ## Star history
 
