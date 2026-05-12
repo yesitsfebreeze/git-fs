@@ -112,6 +112,26 @@ enum Cmd {
         mcp_config: String,
     },
 
+    /// Delete stale agent branches. Defaults to a dry run.
+    Prune {
+        /// Only delete branches fully merged into this ref
+        #[arg(long)]
+        merged: bool,
+        /// Only delete branches whose tip commit is older than this duration
+        /// (e.g. `7d`, `24h`, `30m`). Combine with --merged for "safe sweep".
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+        /// Compare merged-status against this ref (default: main)
+        #[arg(long, default_value = "main")]
+        into: String,
+        /// Branch-name prefix to consider (default: `agent/`)
+        #[arg(long, default_value = "agent/")]
+        prefix: String,
+        /// Actually delete. Without this flag prune only reports.
+        #[arg(long)]
+        apply: bool,
+    },
+
     /// Claude Code hook handlers — called directly by harness, cross-platform
     #[command(subcommand)]
     Hook(HookCmd),
@@ -442,6 +462,82 @@ fn run(cli: Cli) -> Result<()> {
             println!("Tools: git_fs_write, git_fs_read, git_fs_ls, git_fs_merge, git_fs_diff, git_fs_log ...");
         }
 
+        Cmd::Prune {
+            merged,
+            older_than,
+            into,
+            prefix,
+            apply,
+        } => {
+            let store = Store::open(&cli.repo)?;
+            let cutoff = older_than
+                .as_deref()
+                .map(parse_duration_secs)
+                .transpose()?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let mut report = Vec::new();
+            for branch in store.branch_list()? {
+                if !branch.starts_with(&prefix) || branch == into { continue; }
+                let age = match store.tip_time(&branch) {
+                    Ok(t) => now.saturating_sub(t),
+                    Err(_) => continue,
+                };
+                if let Some(max) = cutoff {
+                    if age < max { continue; }
+                }
+                let is_merged = store.is_merged_into(&branch, &into).unwrap_or(false);
+                if merged && !is_merged { continue; }
+                report.push((branch, age, is_merged));
+            }
+
+            let mut deleted = Vec::new();
+            if apply {
+                for (b, _, _) in &report {
+                    match store.branch_delete(b) {
+                        Ok(()) => deleted.push(b.clone()),
+                        Err(e) => eprintln!("prune: failed to delete {b}: {e}"),
+                    }
+                }
+            }
+
+            if json {
+                let v: Vec<_> = report
+                    .iter()
+                    .map(|(b, age, m)| {
+                        serde_json::json!({
+                            "branch": b,
+                            "age_secs": age,
+                            "merged": m,
+                            "deleted": apply && deleted.contains(b),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "applied": apply,
+                        "candidates": v,
+                    })
+                );
+            } else if report.is_empty() {
+                println!("nothing to prune");
+            } else {
+                let verb = if apply { "deleted" } else { "would delete" };
+                println!("{verb} {} branch(es):", report.len());
+                for (b, age, m) in &report {
+                    let tag = if *m { "merged" } else { "UNMERGED" };
+                    println!("  {b}  age={}s  {tag}", age);
+                }
+                if !apply {
+                    println!("\n(dry run — pass --apply to delete)");
+                }
+            }
+        }
+
         Cmd::Hook(action) => run_hook(action)?,
     }
 
@@ -487,7 +583,7 @@ fn run_hook(action: HookCmd) -> Result<()> {
                 &branch,
                 ".agent",
                 format!("model: {model}\nsession: {session_id}\nbase: {base_oid}\n").as_bytes(),
-                &format!("session start\n\nmodel: {model}\nsession: {session_id}"),
+                &format!("session start\n\nmodel: {model}"),
             )?;
             // Seed session scratch (mergeignored — visible to siblings, stripped pre-merge)
             let intent_template = format!(
@@ -502,7 +598,7 @@ fn run_hook(action: HookCmd) -> Result<()> {
                 &branch,
                 ".git-fs/session/intent.md",
                 intent_template.as_bytes(),
-                &format!("seed session intent\n\nsession: {session_id}"),
+                "seed session intent",
             );
             eprintln!("git-fs: branch '{branch}' ready (model: {model})");
             println!(
@@ -515,42 +611,6 @@ fn run_hook(action: HookCmd) -> Result<()> {
                 Use git_fs_branch_list to see all agent sessions.\n\
                 Load schemas upfront: ToolSearch select:git_fs_write,git_fs_read,git_fs_replace,git_fs_patch,git_fs_ls,git_fs_rm,git_fs_merge,git_fs_diff,git_fs_log,git_fs_branch_create,git_fs_branch_list,git_fs_branch_delete,git_fs_checkout"
             );
-
-            // Surface stale sibling agent branches with unmerged work (idle >30min)
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            const STALE_SECS: i64 = 30 * 60;
-            let mut stale: Vec<(String, i64)> = Vec::new();
-            if let Ok(branches) = store.branch_list() {
-                for b in branches {
-                    if !b.starts_with("agent/") || b == branch { continue; }
-                    let tip = match store.resolve_commit_oid(&b) { Ok(o) => o, Err(_) => continue };
-                    let base = match store.merge_base(&b, "main") { Ok(Some(o)) => o, _ => continue };
-                    if tip == base { continue; }
-                    let entries = match store.log(&b, 1) { Ok(e) => e, Err(_) => continue };
-                    let Some(last) = entries.first() else { continue };
-                    let age = now - last.time;
-                    if age >= STALE_SECS {
-                        stale.push((b, age));
-                    }
-                }
-            }
-            if !stale.is_empty() {
-                stale.sort_by(|a, b| b.1.cmp(&a.1));
-                println!("\nStale agent branches with unmerged work (idle >30min):");
-                for (b, age) in &stale {
-                    let mins = age / 60;
-                    let label = if mins >= 60 {
-                        format!("{}h{}m", mins / 60, mins % 60)
-                    } else {
-                        format!("{mins}m")
-                    };
-                    println!("  {b}  (idle {label})");
-                }
-                println!("Run git_fs_merge to merge or git_fs_branch_delete to drop.");
-            }
         }
 
         HookCmd::PostWrite | HookCmd::PostEdit => {
@@ -560,7 +620,7 @@ fn run_hook(action: HookCmd) -> Result<()> {
             let content = std::fs::read(file_path)?;
             let op = match action { HookCmd::PostWrite => "write", _ => "edit" };
             let store = Store::open(&repo)?;
-            if store.write_file(&branch, &rel, &content, &format!("{op} {rel}\n\nsession: {session_id}")).is_ok() {
+            if store.write_file(&branch, &rel, &content, &format!("{op} {rel}")).is_ok() {
                 eprintln!("git-fs: {op} {branch}:{rel}");
             }
         }
@@ -605,10 +665,16 @@ fn run_hook(action: HookCmd) -> Result<()> {
             // Strip mergeignored paths from agent branch BEFORE acquiring the merge
             // lock — strip only mutates the agent branch, no contention on main.
             let mi_set = load_mergeignore(&store, "main");
-            match strip_mergeignored(&store, &branch, &mi_set, session_id) {
+            match strip_mergeignored(&store, &branch, &mi_set) {
                 Ok(0) => {}
                 Ok(n) => eprintln!("git-fs: stripped {n} mergeignored path(s) from {branch}"),
                 Err(e) => eprintln!("git-fs: strip mergeignored failed: {e}"),
+            }
+
+            // Sibling reconcile: warn when in-flight agent branches touch the
+            // same paths we touched. Cheap, advisory — does not block the merge.
+            if let Err(e) = report_sibling_overlap(&store, &branch, &mi_set) {
+                eprintln!("git-fs: sibling reconcile failed: {e}");
             }
 
             // Serialize concurrent Stop hooks racing on main
@@ -621,7 +687,7 @@ fn run_hook(action: HookCmd) -> Result<()> {
             };
 
             match store.merge(&base, &branch, "main", Some("main"),
-                &format!("merge from {branch}\n\nsession: {session_id}")) {
+                &format!("merge from {branch}")) {
                 Ok(git_fs::store::MergeResult::Clean { commit_oid, .. }) => {
                     if commit_oid.is_some() {
                         eprintln!("git-fs: merged {branch} → main");
@@ -633,7 +699,7 @@ fn run_hook(action: HookCmd) -> Result<()> {
                     }
                 }
                 Ok(git_fs::store::MergeResult::Conflicts(conflicts)) => {
-                    let mut report = format!("# Conflicts: {branch} → main\n\nsession: {session_id}\n\n");
+                    let mut report = format!("# Conflicts: {branch} → main\n\n");
                     for c in &conflicts {
                         report.push_str(&format!("## {}\n\nours:\n```\n{}\n```\n\ntheirs:\n```\n{}\n```\n\n",
                             c.path,
@@ -642,7 +708,7 @@ fn run_hook(action: HookCmd) -> Result<()> {
                         ));
                     }
                     let _ = store.write_file(&branch, "CONFLICTS.md", report.as_bytes(),
-                        &format!("conflict report\n\nsession: {session_id}"));
+                        "conflict report");
                     eprintln!("git-fs: conflicts on merge {branch} → main; see CONFLICTS.md");
                 }
                 Err(e) => eprintln!("git-fs: merge error: {e}"),
@@ -689,7 +755,6 @@ fn strip_mergeignored(
     store: &Store,
     branch: &str,
     set: &globset::GlobSet,
-    session_id: &str,
 ) -> Result<usize> {
     if set.is_empty() { return Ok(0); }
     let entries = store.list_files(branch, "", true)?;
@@ -703,9 +768,71 @@ fn strip_mergeignored(
     store.remove_paths(
         branch,
         &paths,
-        &format!("strip mergeignored ({n} path(s))\n\nsession: {session_id}"),
+        &format!("strip mergeignored ({n} path(s))"),
     )?;
     Ok(n)
+}
+
+/// Parse a short duration like `30s`, `15m`, `24h`, `7d` into seconds.
+fn parse_duration_secs(s: &str) -> Result<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration");
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    // Allow plain integer = seconds when no unit suffix.
+    if unit.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        return s.parse::<i64>().map_err(|e| anyhow::anyhow!("bad duration '{s}': {e}"));
+    }
+    let n: i64 = num
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad duration '{s}': {e}"))?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        "w" => n * 86_400 * 7,
+        other => anyhow::bail!("unknown duration unit '{other}' in '{s}'"),
+    };
+    Ok(secs)
+}
+
+/// Walk all `agent/*` branches except `ours`, diff each against `main`, and
+/// print a stderr warning for every path that overlaps with our own change-set.
+/// Mergeignored paths are excluded since they never reach `main`.
+fn report_sibling_overlap(
+    store: &Store,
+    ours: &str,
+    mi_set: &globset::GlobSet,
+) -> Result<()> {
+    let our_paths: std::collections::BTreeSet<String> = store
+        .changed_paths("main", ours)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !mi_set.is_match(p))
+        .collect();
+    if our_paths.is_empty() { return Ok(()); }
+
+    let branches = store.branch_list()?;
+    for sib in &branches {
+        if sib == ours || !sib.starts_with("agent/") { continue; }
+        let sib_paths = match store.changed_paths("main", sib) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let overlap: Vec<&String> = sib_paths
+            .iter()
+            .filter(|p| !mi_set.is_match(p) && our_paths.contains(*p))
+            .collect();
+        if overlap.is_empty() { continue; }
+        eprintln!(
+            "git-fs: sibling overlap with {sib} on {} path(s):",
+            overlap.len()
+        );
+        for p in overlap { eprintln!("  {p}"); }
+    }
+    Ok(())
 }
 
 fn acquire_merge_lock(repo: &str) -> Result<std::fs::File> {

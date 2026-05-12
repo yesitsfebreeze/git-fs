@@ -1,10 +1,8 @@
 /// git-fs-mcp — MCP server over stdio. Set GIT_FS_REPO to the bare repo path.
-use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
 use anyhow::Context;
 use git_fs::store::{MergeResult, Store};
-use rayon::prelude::*;
 use serde_json::{json, Value};
 
 fn repo() -> String {
@@ -26,6 +24,7 @@ fn main() {
             Err(_) => continue,
         };
 
+        // Notifications (no id) don't get responses
         if msg.get("id").is_none() {
             continue;
         }
@@ -65,83 +64,6 @@ fn dispatch(method: &str, params: &Value) -> anyhow::Result<Value> {
     }
 }
 
-// ── batching ──────────────────────────────────────────────────────────────────
-
-const BATCHABLE: &[&str] = &[
-    "git_fs_read",
-    "git_fs_write",
-    "git_fs_replace",
-    "git_fs_patch",
-    "git_fs_rm",
-    "git_fs_ls",
-    "git_fs_log",
-    "git_fs_diff",
-];
-
-fn is_read_only(name: &str) -> bool {
-    matches!(
-        name,
-        "git_fs_read" | "git_fs_ls" | "git_fs_log" | "git_fs_diff"
-    )
-}
-
-fn to_batch_value(r: anyhow::Result<String>) -> Value {
-    match r {
-        Ok(s) => json!({"ok": true, "result": s}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    }
-}
-
-/// Group writes by branch. Different branches run in parallel (no HEAD race),
-/// items within one branch run sequentially (commit chain).
-fn run_batch(name: &str, repo_path: &str, items: &[Value]) -> String {
-    if is_read_only(name) {
-        let results: Vec<Value> = items
-            .par_iter()
-            .map(|item| {
-                let res = (|| -> anyhow::Result<String> {
-                    let store = Store::open(repo_path)?;
-                    call_tool_single(name, &store, item)
-                })();
-                to_batch_value(res)
-            })
-            .collect();
-        return serde_json::to_string(&results).unwrap();
-    }
-
-    let mut groups: BTreeMap<String, Vec<(usize, Value)>> = BTreeMap::new();
-    for (i, item) in items.iter().enumerate() {
-        let br = item
-            .get("branch")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        groups.entry(br).or_default().push((i, item.clone()));
-    }
-
-    let grouped: Vec<(String, Vec<(usize, Value)>)> = groups.into_iter().collect();
-    let mut indexed: Vec<(usize, Value)> = grouped
-        .into_par_iter()
-        .flat_map(|(_branch, batch)| {
-            let store_res = Store::open(repo_path);
-            batch
-                .into_iter()
-                .map(|(i, item)| {
-                    let v = match &store_res {
-                        Ok(store) => call_tool_single(name, store, &item),
-                        Err(e) => Err(anyhow::anyhow!(e.to_string())),
-                    };
-                    (i, to_batch_value(v))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    indexed.sort_by_key(|(i, _)| *i);
-    let arr: Vec<Value> = indexed.into_iter().map(|(_, v)| v).collect();
-    serde_json::to_string(&arr).unwrap()
-}
-
 // ── tool dispatcher ───────────────────────────────────────────────────────────
 
 fn commit_json(oid: impl std::fmt::Display, branch: &str, path: &str) -> String {
@@ -154,18 +76,7 @@ fn call_tool(name: &str, a: &Value) -> anyhow::Result<String> {
         Store::init(&r)?;
         return Ok(format!("Initialized repo: {r}"));
     }
-
-    if BATCHABLE.contains(&name) {
-        if let Some(items) = a.get("items").and_then(|v| v.as_array()) {
-            return Ok(run_batch(name, &r, items));
-        }
-    }
-
     let store = Store::open(&r)?;
-    call_tool_single(name, &store, a)
-}
-
-fn call_tool_single(name: &str, store: &Store, a: &Value) -> anyhow::Result<String> {
     match name {
         "git_fs_branch_create" => {
             let name = a["name"].as_str().context("name required")?;
@@ -312,7 +223,7 @@ fn call_tool_single(name: &str, store: &Store, a: &Value) -> anyhow::Result<Stri
             let reference = a["ref"].as_str().context("ref required")?;
             let dest = a["dest"].as_str().context("dest required")?;
             store.checkout(reference, dest)?;
-            Ok(format!("Checked out {reference} -> {dest}"))
+            Ok(format!("Checked out '{reference}' → {dest}"))
         }
 
         _ => anyhow::bail!("unknown tool: {name}"),
@@ -358,56 +269,56 @@ fn tool_list() -> Value {
         },
         {
             "name": "git_fs_write",
-            "description": "Write text content to a file in a branch. Creates a commit. Intermediate directories are created automatically. Batch mode: pass `items: [{...}, ...]` to run many writes in one call. Returns JSON array of {ok, result|error} in input order. Writes parallelize across distinct branches; same-branch items serialize.",
+            "description": "Write text content to a file in a branch. Creates a commit. Intermediate directories are created automatically.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "branch":  {"type":"string","description":"Target branch"},
                     "path":    {"type":"string","description":"File path, e.g. src/main.rs"},
                     "content": {"type":"string","description":"Full file content"},
-                    "message": {"type":"string","description":"Commit message (default: write)"},
-                    "items":   {"type":"array","description":"Batch: array of {branch,path,content,message?} objects. When present, single-call args are ignored."}
-                }
+                    "message": {"type":"string","description":"Commit message (default: 'write')"}
+                },
+                "required": ["branch","path","content"]
             }
         },
         {
             "name": "git_fs_read",
-            "description": "Read file content from a ref. Use start_line/end_line (1-indexed, inclusive) to read a slice instead of the full file. Batch mode: pass `items: [{...}, ...]` to read many files in one call (fully parallel). Returns JSON array of {ok, result|error} in input order.",
+            "description": "Read file content from a ref. Use start_line/end_line (1-indexed, inclusive) to read a slice instead of the full file.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "ref":        {"type":"string","description":"Git ref to read from"},
                     "path":       {"type":"string","description":"File path"},
                     "start_line": {"type":"integer","description":"First line to return (1-indexed, inclusive)"},
-                    "end_line":   {"type":"integer","description":"Last line to return (1-indexed, inclusive)"},
-                    "items":      {"type":"array","description":"Batch: array of {ref,path,start_line?,end_line?} objects. Reads execute in parallel."}
-                }
+                    "end_line":   {"type":"integer","description":"Last line to return (1-indexed, inclusive)"}
+                },
+                "required": ["ref","path"]
             }
         },
         {
             "name": "git_fs_rm",
-            "description": "Remove a file from a branch. Creates a commit. Batch mode: pass `items: [{...}, ...]`. Returns JSON array; same-branch items serialize, cross-branch run in parallel.",
+            "description": "Remove a file from a branch. Creates a commit.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "branch":  {"type":"string","description":"Target branch"},
                     "path":    {"type":"string","description":"File path to remove"},
-                    "message": {"type":"string","description":"Commit message (optional)"},
-                    "items":   {"type":"array","description":"Batch: array of {branch,path,message?} objects."}
-                }
+                    "message": {"type":"string","description":"Commit message (optional)"}
+                },
+                "required": ["branch","path"]
             }
         },
         {
             "name": "git_fs_ls",
-            "description": "List files in a ref. Use recursive=true to walk all subdirectories. Batch mode: pass `items: [{...}, ...]` (fully parallel).",
+            "description": "List files in a ref. Use recursive=true to walk all subdirectories.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "ref":       {"type":"string","description":"Git ref"},
                     "path":      {"type":"string","description":"Subdirectory to list (optional, default: root)"},
-                    "recursive": {"type":"boolean","description":"Walk subdirectories (default: false)"},
-                    "items":     {"type":"array","description":"Batch: array of {ref,path?,recursive?} objects. Parallel."}
-                }
+                    "recursive": {"type":"boolean","description":"Walk subdirectories (default: false)"}
+                },
+                "required": ["ref"]
             }
         },
         {
@@ -420,38 +331,38 @@ fn tool_list() -> Value {
                     "theirs":  {"type":"string","description":"Their branch"},
                     "base":    {"type":"string","description":"Common ancestor ref"},
                     "into":    {"type":"string","description":"Commit merge result to this branch (optional)"},
-                    "message": {"type":"string","description":"Merge commit message (default: merge)"}
+                    "message": {"type":"string","description":"Merge commit message (default: 'merge')"}
                 },
                 "required": ["ours","theirs","base"]
             }
         },
         {
             "name": "git_fs_diff",
-            "description": "Unified diff between two refs. Batch mode: pass `items: [{...}, ...]` (fully parallel).",
+            "description": "Unified diff between two refs.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "ref_a": {"type":"string","description":"First ref"},
-                    "ref_b": {"type":"string","description":"Second ref"},
-                    "items": {"type":"array","description":"Batch: array of {ref_a,ref_b} objects. Parallel."}
-                }
+                    "ref_b": {"type":"string","description":"Second ref"}
+                },
+                "required": ["ref_a","ref_b"]
             }
         },
         {
             "name": "git_fs_log",
-            "description": "Commit log for a ref. Batch mode: pass `items: [{...}, ...]` (fully parallel).",
+            "description": "Commit log for a ref.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "ref":   {"type":"string","description":"Git ref"},
-                    "count": {"type":"integer","description":"Max commits to return (default: 10)"},
-                    "items": {"type":"array","description":"Batch: array of {ref,count?} objects. Parallel."}
-                }
+                    "count": {"type":"integer","description":"Max commits to return (default: 10)"}
+                },
+                "required": ["ref"]
             }
         },
         {
             "name": "git_fs_patch",
-            "description": "Replace a line range in a file and commit. Equivalent to Edit but writes directly to git history. Lines are 1-indexed, inclusive. Batch mode: pass `items: [{...}, ...]`. Same-branch items serialize.",
+            "description": "Replace a line range in a file and commit. Equivalent to Edit but writes directly to git history. Lines are 1-indexed, inclusive.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
@@ -460,14 +371,14 @@ fn tool_list() -> Value {
                     "start_line": {"type":"integer","description":"First line to replace (1-indexed, inclusive)"},
                     "end_line":   {"type":"integer","description":"Last line to replace (1-indexed, inclusive)"},
                     "content":    {"type":"string","description":"Replacement content for the specified line range"},
-                    "message":    {"type":"string","description":"Commit message (default: patch)"},
-                    "items":      {"type":"array","description":"Batch: array of {branch,path,start_line,end_line,content,message?} objects."}
-                }
+                    "message":    {"type":"string","description":"Commit message (default: 'patch')"}
+                },
+                "required": ["branch","path","start_line","end_line","content"]
             }
         },
         {
             "name": "git_fs_replace",
-            "description": "Replace an exact string in a file and commit. old_str must match exactly once. Include surrounding context to make it unique. Immune to line-number drift. Prefer over git_fs_patch for most edits. Batch mode: pass `items: [{...}, ...]`. Same-branch items serialize.",
+            "description": "Replace an exact string in a file and commit. old_str must match exactly once — include surrounding context to make it unique. Immune to line-number drift. Prefer over git_fs_patch for most edits.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
@@ -475,14 +386,14 @@ fn tool_list() -> Value {
                     "path":    {"type":"string","description":"File path"},
                     "old_str": {"type":"string","description":"Exact string to replace (must match exactly once)"},
                     "new_str": {"type":"string","description":"Replacement string"},
-                    "message": {"type":"string","description":"Commit message (default: replace)"},
-                    "items":   {"type":"array","description":"Batch: array of {branch,path,old_str,new_str,message?} objects."}
-                }
+                    "message": {"type":"string","description":"Commit message (default: 'replace')"}
+                },
+                "required": ["branch","path","old_str","new_str"]
             }
         },
         {
             "name": "git_fs_checkout",
-            "description": "Materialize a ref to disk. Final extraction step. Writes all files to dest directory.",
+            "description": "Materialize a ref to disk. Final extraction step — writes all files to dest directory.",
             "inputSchema": {
                 "type":"object",
                 "properties": {

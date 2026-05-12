@@ -59,7 +59,6 @@ Plain filesystem + multiple agents = stale reads, overwritten edits, lost work o
 - 🪟 **Worktree-aware** — per-worktree by default, or share one bare repo across worktrees via `GIT_FS_REPO`.
 - 📜 **Full audit** — `git log agent/<id>` answers "what did this agent do?"
 - 🔌 **MCP-native** — works with any MCP client; Claude Code skill ships in-tree.
-- 🧵 **Batch + parallel** — every read/edit tool accepts items: [...] for many ops in one call. Reads fan out across rayon workers; writes parallelize across distinct branches and serialize within.
 
 ## Install
 

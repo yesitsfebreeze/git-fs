@@ -34,6 +34,24 @@ impl Store {
         Ok(Signature::now("git-fs", "git-fs@local")?)
     }
 
+    /// Append a `Session-Id:` git trailer to a commit message when the branch
+    /// is an agent branch (`agent/<uuid>`). Idempotent — skips when already
+    /// present. Non-agent branches are returned unchanged.
+    fn with_session_trailer(msg: &str, branch: &str) -> String {
+        let Some(session) = branch.strip_prefix("agent/") else {
+            return msg.to_string();
+        };
+        if msg.contains("Session-Id:") {
+            return msg.to_string();
+        }
+        let trimmed = msg.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return format!("Session-Id: {session}\n");
+        }
+        // Blank line before trailer block per git interpret-trailers convention.
+        format!("{trimmed}\n\nSession-Id: {session}\n")
+    }
+
     pub fn resolve_commit_oid(&self, refname: &str) -> Result<Oid> {
         self.repo
             .revparse_single(refname)
@@ -109,9 +127,10 @@ impl Store {
 
         let sig = Self::sig()?;
         let parents: Vec<&git2::Commit> = parent.iter().collect();
+        let msg = Self::with_session_trailer(msg, branch);
         Ok(self
             .repo
-            .commit(Some(&refname), &sig, &sig, msg, &new_tree, &parents)?)
+            .commit(Some(&refname), &sig, &sig, &msg, &new_tree, &parents)?)
     }
 
     pub fn remove_file(&self, branch: &str, path: &str, msg: &str) -> Result<Oid> {
@@ -124,9 +143,10 @@ impl Store {
         let new_tree_oid = self.tree_remove(Some(&base_tree), path)?;
         let new_tree = self.repo.find_tree(new_tree_oid)?;
         let sig = Self::sig()?;
+        let msg = Self::with_session_trailer(msg, branch);
         Ok(self
             .repo
-            .commit(Some(&refname), &sig, &sig, msg, &new_tree, &[&parent])?)
+            .commit(Some(&refname), &sig, &sig, &msg, &new_tree, &[&parent])?)
     }
 
     /// Remove many paths in a single commit. Missing paths are skipped silently.
@@ -155,11 +175,12 @@ impl Store {
         }
         let new_tree = self.repo.find_tree(tree_oid)?;
         let sig = Self::sig()?;
+        let msg = Self::with_session_trailer(msg, branch);
         Ok(Some(self.repo.commit(
             Some(&refname),
             &sig,
             &sig,
-            msg,
+            &msg,
             &new_tree,
             &[&parent],
         )?))
@@ -330,7 +351,9 @@ impl Store {
             } else {
                 vec![&our_commit, &their_commit]
             };
-            Some(self.repo.commit(Some(&refname), &sig, &sig, msg, &tree, &parents)?)
+            // Trailer comes from the *source* branch (ours_ref), not the merge target.
+            let msg = Self::with_session_trailer(msg, ours_ref);
+            Some(self.repo.commit(Some(&refname), &sig, &sig, &msg, &tree, &parents)?)
         } else {
             None
         };
@@ -339,6 +362,45 @@ impl Store {
             tree_oid,
             commit_oid,
         })
+    }
+
+    /// Set of paths changed between two refs (any add / modify / delete / rename).
+    pub fn changed_paths(&self, from_ref: &str, to_ref: &str) -> Result<Vec<String>> {
+        let from_tree = self.resolve_tree(from_ref)?;
+        let to_tree = self.resolve_tree(to_ref)?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
+        let mut out = Vec::new();
+        for delta in diff.deltas() {
+            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                out.push(p.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Merge-base OID of two refs (common ancestor commit). None when unrelated.
+    pub fn merge_base(&self, a_ref: &str, b_ref: &str) -> Result<Option<Oid>> {
+        let a = self.resolve_commit_oid(a_ref)?;
+        let b = self.resolve_commit_oid(b_ref)?;
+        Ok(self.repo.merge_base(a, b).ok())
+    }
+
+    /// Time (unix seconds) of the tip commit of `refname`.
+    pub fn tip_time(&self, refname: &str) -> Result<i64> {
+        let oid = self.resolve_commit_oid(refname)?;
+        Ok(self.repo.find_commit(oid)?.time().seconds())
+    }
+
+    /// True when `branch` is fully merged into `into` (i.e. its tip is an
+    /// ancestor of `into`'s tip, so no commits would be lost on delete).
+    pub fn is_merged_into(&self, branch: &str, into: &str) -> Result<bool> {
+        let b = self.resolve_commit_oid(branch)?;
+        let i = self.resolve_commit_oid(into)?;
+        Ok(self.repo.graph_descendant_of(i, b).unwrap_or(false) || b == i)
     }
 
     // ── diff ─────────────────────────────────────────────────────────────────

@@ -12,6 +12,9 @@ MCP registration and hooks usually do not need to change between versions; if a 
 | Agent | Guide | Prompt to paste |
 |-------|-------|-----------------|
 | Claude Code | [`agents/claude/update.md`](agents/claude/update.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/update.md and update git-fs.` |
+| Cursor | [`agents/cursor/update.md`](agents/cursor/update.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/cursor/update.md and update git-fs.` |
+| Windsurf | [`agents/windsurf/update.md`](agents/windsurf/update.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/windsurf/update.md and update git-fs.` |
+| Cline | [`agents/cline/update.md`](agents/cline/update.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/cline/update.md and update git-fs.` |
 
 > Don't see your agent? See [Adding a new agent](INSTALL.md#adding-a-new-agent) in the install guide.
 

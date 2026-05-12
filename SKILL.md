@@ -43,25 +43,6 @@ https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/install.md.
 
 The agent branch for the current session is injected at session start in the banner as `Branch: agent/<uuid>`. Use it as the `branch` argument for write/edit/rm.
 
-
-## Batch mode (parallel ops)
-
-All edit/read tools accept an `items: [{...}, ...]` array as an alternative to single-call args. The server returns a JSON array of `{ok, result|error}` in input order. Per-item errors do not abort the batch.
-
-| Tool | Batch shape per item | Execution |
-|------|----------------------|-----------|
-| `git_fs_read`    | `{ref, path, start_line?, end_line?}`                       | Fully parallel |
-| `git_fs_ls`      | `{ref, path?, recursive?}`                                  | Fully parallel |
-| `git_fs_log`     | `{ref, count?}`                                             | Fully parallel |
-| `git_fs_diff`    | `{ref_a, ref_b}`                                            | Fully parallel |
-| `git_fs_write`   | `{branch, path, content, message?}`                         | Parallel across branches, serial within |
-| `git_fs_replace` | `{branch, path, old_str, new_str, message?}`                | Parallel across branches, serial within |
-| `git_fs_patch`   | `{branch, path, start_line, end_line, content, message?}`   | Parallel across branches, serial within |
-| `git_fs_rm`      | `{branch, path, message?}`                                  | Parallel across branches, serial within |
-
-Within a single branch, writes serialize into a commit chain — no HEAD race, full audit trail (one commit per item). When you have many independent reads or writes spanning multiple paths/branches, prefer batch over N single calls: one round-trip and true parallelism on the server.
-
-`git_fs_merge`, `git_fs_checkout`, and the `branch_*` tools are not batched.
 ## Decision flow for edits
 
 1. Reading an unknown file? `git_fs_read` first.

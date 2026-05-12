@@ -14,6 +14,9 @@ Find your agent in the table and paste the prompt into it. The agent reads the g
 | Agent | Guide | Prompt to paste |
 |-------|-------|-----------------|
 | Claude Code | [`agents/claude/install.md`](agents/claude/install.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/install.md and install git-fs.` |
+| Cursor | [`agents/cursor/install.md`](agents/cursor/install.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/cursor/install.md and install git-fs.` |
+| Windsurf | [`agents/windsurf/install.md`](agents/windsurf/install.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/windsurf/install.md and install git-fs.` |
+| Cline | [`agents/cline/install.md`](agents/cline/install.md) | `Read https://github.com/yesitsfebreeze/git-fs/blob/main/agents/cline/install.md and install git-fs.` |
 
 > Don't see your agent? See [Adding a new agent](#adding-a-new-agent).
 
