@@ -515,6 +515,42 @@ fn run_hook(action: HookCmd) -> Result<()> {
                 Use git_fs_branch_list to see all agent sessions.\n\
                 Load schemas upfront: ToolSearch select:git_fs_write,git_fs_read,git_fs_replace,git_fs_patch,git_fs_ls,git_fs_rm,git_fs_merge,git_fs_diff,git_fs_log,git_fs_branch_create,git_fs_branch_list,git_fs_branch_delete,git_fs_checkout"
             );
+
+            // Surface stale sibling agent branches with unmerged work (idle >30min)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            const STALE_SECS: i64 = 30 * 60;
+            let mut stale: Vec<(String, i64)> = Vec::new();
+            if let Ok(branches) = store.branch_list() {
+                for b in branches {
+                    if !b.starts_with("agent/") || b == branch { continue; }
+                    let tip = match store.resolve_commit_oid(&b) { Ok(o) => o, Err(_) => continue };
+                    let base = match store.merge_base(&b, "main") { Ok(Some(o)) => o, _ => continue };
+                    if tip == base { continue; }
+                    let entries = match store.log(&b, 1) { Ok(e) => e, Err(_) => continue };
+                    let Some(last) = entries.first() else { continue };
+                    let age = now - last.time;
+                    if age >= STALE_SECS {
+                        stale.push((b, age));
+                    }
+                }
+            }
+            if !stale.is_empty() {
+                stale.sort_by(|a, b| b.1.cmp(&a.1));
+                println!("\nStale agent branches with unmerged work (idle >30min):");
+                for (b, age) in &stale {
+                    let mins = age / 60;
+                    let label = if mins >= 60 {
+                        format!("{}h{}m", mins / 60, mins % 60)
+                    } else {
+                        format!("{mins}m")
+                    };
+                    println!("  {b}  (idle {label})");
+                }
+                println!("Run git_fs_merge to merge or git_fs_branch_delete to drop.");
+            }
         }
 
         HookCmd::PostWrite | HookCmd::PostEdit => {
