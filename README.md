@@ -68,6 +68,28 @@ flowchart LR
 
 Spec: [`docs/multi-agent-session.md`](docs/multi-agent-session.md).
 
+## Worktrees
+
+git-fs works across git worktrees in two modes.
+
+**Per-worktree (default).** Each worktree has its own `.git-fs/` at its root. Sessions in worktree A do not see worktree B. Full isolation.
+
+**Shared store across worktrees.** Point every worktree at one bare repo via `GIT_FS_REPO`:
+
+```jsonc
+// in each worktree's .mcp.json
+{
+  "mcpServers": {
+    "git-fs": {
+      "command": "git-fs-mcp",
+      "env": { "GIT_FS_REPO": "/abs/path/to/shared/.git-fs" }
+    }
+  }
+}
+```
+
+In shared mode, `git_fs_branch_list` returns every agent across every worktree, the merge lock (flock on `<shared>/merge.lock`) serializes Stop hooks across worktrees, and Stop's final `checkout main → cwd` still writes into the calling session's own worktree — only the git history is shared.
+
 ## Features
 
 - 🌿 **Per-session isolation.** One branch per agent, zero shared mutable state.

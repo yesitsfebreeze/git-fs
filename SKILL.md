@@ -73,6 +73,15 @@ The Stop hook does, in order:
 
 If you see `CONFLICTS.md` referenced in a sibling, that session ended in a merge conflict — pick it up or rebase.
 
+## Worktrees
+
+git-fs works across git worktrees in two modes.
+
+- **Per-worktree (default).** Each worktree has its own `.git-fs/`. Sessions are isolated per worktree — `git_fs_branch_list` only shows agents in this worktree.
+- **Shared store.** Every worktree's `.mcp.json` sets `env.GIT_FS_REPO` to one absolute path. All worktrees see the same branch graph; `git_fs_branch_list` returns every active agent across every worktree. The merge lock is global. Stop still materializes `main` into each session's own `cwd`, so disk contents stay per-worktree even though history is shared.
+
+Detect shared mode: read the `git-fs` entry of the project's `.mcp.json`. If `env.GIT_FS_REPO` is an absolute path outside the current worktree, you're in shared mode — siblings may be in other directories.
+
 ## Installation
 
 If `git-fs` MCP isn't registered yet on the user's machine, follow:
