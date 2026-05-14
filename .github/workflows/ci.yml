@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node-${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['20', '22']
+    defaults:
+      run:
+        working-directory: git-fs-ts
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: git-fs-ts/package-lock.json
+
+      - name: install
+        run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: test
+        run: npm test
+
+      - name: build
+        run: npm run build
+
+      - name: smoke (plugin launcher dispatches to bundle)
+        if: matrix.os != 'windows-latest'
+        run: |
+          tmp=$(mktemp -d)
+          export GIT_FS_REPO="$tmp/repo"
+          node dist/cli.js init
+          node dist/cli.js branch create main
+          printf 'hello\n' | node dist/cli.js write main hello.txt
+          node dist/cli.js read main hello.txt | grep -q hello

@@ -4,9 +4,7 @@
 
 **A virtual filesystem over a bare git object store — built for AI-agent swarms.**
 
-[![Build](https://github.com/yesitsfebreeze/git-fs/actions/workflows/release.yml/badge.svg)](https://github.com/yesitsfebreeze/git-fs/actions/workflows/release.yml)
-[![Release](https://img.shields.io/github/v/release/yesitsfebreeze/git-fs?display_name=tag&sort=semver)](https://github.com/yesitsfebreeze/git-fs/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/yesitsfebreeze/git-fs/total)](https://github.com/yesitsfebreeze/git-fs/releases)
+[![Build](https://github.com/yesitsfebreeze/git-fs/actions/workflows/ci.yml/badge.svg)](https://github.com/yesitsfebreeze/git-fs/actions/workflows/ci.yml)
 [![Stars](https://img.shields.io/github/stars/yesitsfebreeze/git-fs?style=social)](https://github.com/yesitsfebreeze/git-fs/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-orange)](https://claude.ai/code)
@@ -24,13 +22,13 @@ Plain filesystem + multiple agents = stale reads, overwritten edits, lost work o
 
 ```
 ┌─ agent A ──┐
-│ edit foo.rs│──┐
+│ edit foo.ts│──┐
 └────────────┘  │
 ┌─ agent B ──┐  ├──► merge.lock ──► 3-way merge ──► main ──► disk
-│ edit bar.rs│──┤
+│ edit bar.ts│──┤
 └────────────┘  │
 ┌─ agent C ──┐  │
-│ rm baz.rs  │──┘
+│ rm baz.ts  │──┘
 └────────────┘
 ```
 
@@ -45,14 +43,15 @@ Plain filesystem + multiple agents = stale reads, overwritten edits, lost work o
 | Crash recovery | unsaved buffers gone | **`git reflog` — every tool call is recoverable** |
 | Audit trail | filesystem mtime, no author | **`git log` — who, what, when, which session** |
 | Cross-agent visibility | none | **siblings read each other's `.git-fs/session/` live** |
-| Merge race protection | none | **`flock` on `merge.lock` — serialized Stop hooks** |
+| Merge race protection | none | **`proper-lockfile` on `merge.lock` — serialized Stop hooks** |
 | Tooling for LLMs | shell out to `git` | **first-class MCP: `git_fs_read/write/replace/merge/...`** |
+| Install footprint | — | **pure JS bundle, no native binary, no platform matrix** |
 
 ## What it can do
 
 - 🌿 **N agents, 1 repo, 0 collisions** — each session lives on `agent/<uuid>`.
 - ⚡ **Edit-as-commit** — `git_fs_replace` / `write` / `rm` each produce one commit. Roll back with `git reset`.
-- 🔀 **Auto-merge on Stop** — exclusive `merge.lock` + 3-way merge into `main` + checkout to disk.
+- 🔀 **Auto-merge on Stop** — exclusive `merge.lock` + 3-way line merge into `main` + checkout to disk.
 - 🧹 **Mergeignore** — junk files (`.agent`, `CONFLICTS.md`, your own globs) never reach `main`.
 - 🪟 **Worktree-aware** — per-worktree by default, or share one bare repo across worktrees via `GIT_FS_REPO`.
 - 📜 **Full audit** — `git log agent/<id>` answers "what did this agent do?"
@@ -67,35 +66,41 @@ Plain filesystem + multiple agents = stale reads, overwritten edits, lost work o
 
 That's it. On the next session start the plugin:
 
-1. **Downloads the matching `git-fs` + `git-fs-mcp` binary** for your OS/arch from the [latest release](https://github.com/yesitsfebreeze/git-fs/releases/latest) into the plugin folder. No PATH changes, no system install.
+1. **Spawns bundled JS** (`dist/cli.js` and `dist/mcp.js`) via the Node already running Claude Code. No binary download, no architecture matrix, no PATH changes.
 2. **Auto-initializes** any git repo it lands in — creates `.git-fs/` and writes `Edit`/`Write` deny rules into the project's `.claude/settings.json` so all edits go through git-fs MCP tools.
-3. **Registers** the `git-fs` MCP server and the `SessionStart` / `Stop` / `PreToolUse(Read)` hooks.
+3. **Registers** the `git-fs` MCP server and the `SessionStart` / `Stop` / `PreToolUse(Read)` / `PostToolUse(Write|Edit)` hooks.
 4. **Exposes** the `git-fs` skill so Claude knows the tool-selection rules.
 
 Verify: session banner shows `Branch: agent/<uuid>`, and `git_fs_branch_list` returns the active branches.
 
-Supported platforms: Linux x86_64 / aarch64, macOS Intel / Apple Silicon, Windows x86_64.
+Runtime requirement: Node 20+. Claude Code already ships with a compatible runtime, so the plugin works on any OS Claude Code supports.
 
 ### Other MCP-capable agents (Cursor, Windsurf, Cline, …)
 
-Install the binary manually and point the agent at it:
+Install from npm (when published) or clone + build:
 
 ```bash
-# Linux / macOS
-curl -L https://github.com/yesitsfebreeze/git-fs/releases/latest/download/git-fs-<target>.tar.gz | tar -xz -C ~/.local/bin/
-chmod +x ~/.local/bin/git-fs ~/.local/bin/git-fs-mcp
+git clone https://github.com/yesitsfebreeze/git-fs
+cd git-fs/git-fs-ts
+npm install
+npm run build
 ```
+
+Then point your agent at the MCP entry:
 
 ```json
 // .mcp.json (or your agent's equivalent)
 {
   "mcpServers": {
-    "git-fs": { "command": "git-fs-mcp" }
+    "git-fs": {
+      "command": "node",
+      "args": ["/abs/path/to/git-fs/dist/mcp.js"]
+    }
   }
 }
 ```
 
-Then `git-fs init-project` inside the target repo to create `.git-fs/`. Non-Claude agents do not get the auto-merge Stop hook — use `git_fs_merge` manually at end of session.
+Inside the target repo run `node /abs/path/to/git-fs/dist/cli.js init-project` to create `.git-fs/`. Non-Claude agents do not get the auto-merge Stop hook — use `git_fs_merge` manually at end of session.
 
 ## Update
 
@@ -103,14 +108,14 @@ Then `git-fs init-project` inside the target repo to create `.git-fs/`. Non-Clau
 /plugin update git-fs@git-fs
 ```
 
-The launcher caches binaries in the plugin folder. To force a fresh binary download, delete `bin/` inside the plugin install dir; the next session will re-fetch from the latest release.
-
-### Build from source
+## Build from source
 
 ```bash
-cargo build --release -p git-fs
-# → target/release/git-fs    (CLI + hooks)
-# → target/release/git-fs-mcp (MCP server)
+cd git-fs-ts
+npm install
+npm run typecheck
+npm test
+npm run build           # emits ./dist and ../dist (consumed by the plugin)
 ```
 
 ## How it works
@@ -131,7 +136,7 @@ flowchart LR
 |-------|--------------|
 | SessionStart | Create `agent/<uuid>` from `main`. Seed `.git-fs/session/intent.md`. |
 | Tool calls | `git_fs_*` MCP tools write commits to the agent branch. |
-| Stop | Strip mergeignored (hard defaults `.agent`, `CONFLICTS.md`) → take merge lock → 3-way merge into `main` → checkout to disk. |
+| Stop | Strip mergeignored (hard defaults `.agent`, `CONFLICTS.md`) → take merge lock → 3-way line merge into `main` → checkout to disk. |
 
 Spec: [`docs/multi-agent-session.md`](docs/multi-agent-session.md).
 
@@ -154,20 +159,14 @@ Need a sibling's work visible mid-session? Merge it in explicitly with `git_fs_m
 
 **Shared store across worktrees.** Set `GIT_FS_REPO` env var to one absolute bare repo path. In shared mode, `git_fs_branch_list` returns every agent across every worktree, the merge lock serializes Stop hooks globally, and Stop's final `checkout main → cwd` still writes into the calling session's own worktree — only the git history is shared.
 
-## Release artifacts
+## Stack
 
-Every tagged release publishes:
-
-| Target | Artifact |
-|--------|----------|
-| Linux x86_64 | `git-fs-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `git-fs-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS Intel | `git-fs-x86_64-apple-darwin.tar.gz` |
-| macOS Apple Silicon | `git-fs-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `git-fs-x86_64-pc-windows-msvc.zip` |
-| Checksums | `SHA256SUMS` |
-
-→ https://github.com/yesitsfebreeze/git-fs/releases/latest
+- [isomorphic-git](https://isomorphic-git.org/) — pure-JS git core.
+- [node-diff3](https://github.com/bhousel/node-diff3) — 3-way line merge.
+- [diff](https://github.com/kpdecker/jsdiff) — unified-diff patch output.
+- [picomatch](https://github.com/micromatch/picomatch) — mergeignore globs.
+- [proper-lockfile](https://github.com/moxystudio/node-proper-lockfile) — cross-platform merge lock.
+- [esbuild](https://esbuild.github.io/) — single-file bundling.
 
 ## Plugin layout
 
@@ -176,11 +175,12 @@ Every tagged release publishes:
 ├── .claude-plugin/
 │   ├── plugin.json          # MCP server registration
 │   └── marketplace.json     # marketplace entry
-├── hooks/hooks.json         # SessionStart / Stop / PreToolUse(Read)
-├── dist/launcher.js         # node: binary download + dispatch
+├── hooks/hooks.json         # SessionStart / Stop / PreToolUse / PostToolUse
+├── dist/launcher.js         # node: hook dispatch to cli.js
+├── dist/cli.js              # bundled CLI + hooks
+├── dist/mcp.js              # bundled MCP stdio server
 ├── skills/git-fs/SKILL.md   # tool-selection rules
-├── bin/                     # downloaded binaries (created on first run)
-└── git-fs/                  # Rust source (built into releases)
+└── git-fs-ts/               # TypeScript source
 ```
 
 ## License

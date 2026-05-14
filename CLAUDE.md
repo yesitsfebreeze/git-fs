@@ -28,3 +28,23 @@ Multiple agent branches may touch the same files concurrently. Before editing a 
 ## Exception
 
 `/merge` skill: uses `git_fs_merge` + `git_fs_checkout` directly. No Edit/Write needed there either.
+
+## Source layout
+
+The plugin runtime is pure TypeScript. Source lives in `git-fs-ts/` and bundles
+to repo-root `dist/` for the plugin to load.
+
+```
+git-fs-ts/
+├── src/
+│   ├── store.ts   git object operations (isomorphic-git)
+│   ├── mcp.ts     stdio JSON-RPC MCP server
+│   ├── cli.ts     CLI subcommands + hook dispatch
+│   └── hooks.ts   SessionStart / PostToolUse / PreToolUse / Stop handlers
+├── test/          node:test unit tests
+├── bench/         perf benchmarks
+└── build.mjs      esbuild bundler (emits to ./dist and ../dist)
+```
+
+Build: `cd git-fs-ts && npm install && npm run build`.
+Test:  `npm test`.

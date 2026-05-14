@@ -33,6 +33,28 @@
 					}
 				]
 			}
+		],
+		"PostToolUse": [
+			{
+				"matcher": "Write",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/launcher.js\" hook post-write",
+						"timeout": 10
+					}
+				]
+			},
+			{
+				"matcher": "Edit",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/launcher.js\" hook post-edit",
+						"timeout": 10
+					}
+				]
+			}
 		]
 	}
 }
