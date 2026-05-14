@@ -20,3 +20,6 @@ CONFLICTS.md
 .DS_Store
 Thumbs.db
 *.swp
+
+# claude-code scheduled task lock
+.claude/scheduled_tasks.lock
