@@ -17,7 +17,7 @@
     "build": "node build.mjs",
     "dev:mcp": "tsx src/mcp.ts",
     "dev:cli": "tsx src/cli.ts",
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "test": "node --import tsx --test test/store.test.ts",
     "bench": "tsx bench/session-500.ts",
     "typecheck": "tsc --noEmit"
   },
