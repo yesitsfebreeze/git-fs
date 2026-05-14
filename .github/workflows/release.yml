@@ -20,7 +20,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
             use_zigbuild: true
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: macos-latest
