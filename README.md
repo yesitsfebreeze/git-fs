@@ -81,7 +81,7 @@ Install from npm (when published) or clone + build:
 
 ```bash
 git clone https://github.com/yesitsfebreeze/git-fs
-cd git-fs/git-fs-ts
+cd git-fs/git-fs
 npm install
 npm run build
 ```
@@ -111,7 +111,7 @@ Inside the target repo run `node /abs/path/to/git-fs/dist/cli.js init-project` t
 ## Build from source
 
 ```bash
-cd git-fs-ts
+cd git-fs
 npm install
 npm run typecheck
 npm test
@@ -180,7 +180,7 @@ Need a sibling's work visible mid-session? Merge it in explicitly with `git_fs_m
 ├── dist/cli.js              # bundled CLI + hooks
 ├── dist/mcp.js              # bundled MCP stdio server
 ├── skills/git-fs/SKILL.md   # tool-selection rules
-└── git-fs-ts/               # TypeScript source
+└── git-fs/                  # TypeScript source
 ```
 
 ## License

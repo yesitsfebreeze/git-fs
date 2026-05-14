@@ -1,5 +1,5 @@
 /**
- * Claude Code hook handlers — port of git-fs/src/main.rs::run_hook.
+ * Claude Code hook handlers.
  *
  * Reads a JSON payload from stdin (Claude Code hook protocol), looks up the
  * session id, and dispatches the requested hook.
@@ -8,7 +8,6 @@
 import { Store } from "./store.js";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import picomatch from "picomatch";
 import lockfile from "proper-lockfile";
 
@@ -348,8 +347,6 @@ export async function initProject(repoPath: string, mcpConfigPath: string): Prom
   process.stdout.write(`Config:   ${mcpConfigPath}\n\n`);
   process.stdout.write(`Restart Claude Code to load the MCP server.\n`);
   process.stdout.write(`Tools: git_fs_write, git_fs_read, git_fs_ls, git_fs_merge, git_fs_diff, git_fs_log ...\n`);
-  // silence unused
-  void os;
 }
 
 // ── prune ────────────────────────────────────────────────────────────────────

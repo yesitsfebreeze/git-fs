@@ -18,7 +18,7 @@ jobs:
         node: ['20', '22']
     defaults:
       run:
-        working-directory: git-fs-ts
+        working-directory: git-fs
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +26,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-          cache-dependency-path: git-fs-ts/package-lock.json
+          cache-dependency-path: git-fs/package-lock.json
 
       - name: install
         run: npm ci

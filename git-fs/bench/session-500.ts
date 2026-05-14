@@ -1,16 +1,15 @@
 /**
- * 500-commit synthetic session benchmark.
+ * 500-commit synthetic session benchmark (in-process).
  *
- * Simulates a typical agent session:
+ * Drives the Store directly (no MCP IPC). Use bench/mcp-driver.ts to
+ * benchmark the end-to-end stdio path.
+ *
+ * Workload:
  *   - 500 writes (new files)
  *   - 500 replaces (text edits)
  *   - 200 reads (full + slice)
- *   - 1 final merge agent → main
+ *   - 1 merge agent → main
  *   - 1 checkout main → dest
- *
- * Outputs total wall-clock time and per-op average. Run separately against
- * the Rust git-fs binary to derive the ratio. The 2× / 5× decision gate
- * lives in git-fs-ts/README.md.
  */
 
 import { Store } from "../src/store.js";
@@ -32,7 +31,6 @@ async function run() {
 
   const t0 = performance.now();
 
-  // 500 writes
   const t1 = performance.now();
   for (let i = 0; i < N_FILES; i++) {
     const filepath = `src/mod_${i}.ts`;
@@ -41,7 +39,6 @@ async function run() {
   }
   const t2 = performance.now();
 
-  // 500 replaces
   for (let i = 0; i < N_FILES; i++) {
     const filepath = `src/mod_${i}.ts`;
     await store.replaceFile(
@@ -54,7 +51,6 @@ async function run() {
   }
   const t3 = performance.now();
 
-  // 200 reads (mix of full and slice)
   for (let i = 0; i < N_READS; i++) {
     const filepath = `src/mod_${i}.ts`;
     if (i % 2 === 0) {
@@ -65,12 +61,10 @@ async function run() {
   }
   const t4 = performance.now();
 
-  // 1 merge agent → main
   const mergeResult = await store.merge("main", "agent/bench", "main", "main", "merge bench");
   if (mergeResult.kind !== "clean") throw new Error("unexpected conflicts");
   const t5 = performance.now();
 
-  // 1 checkout
   const dest = path.join(tmp, "out");
   await store.checkout("main", dest);
   const t6 = performance.now();
@@ -83,29 +77,6 @@ async function run() {
   console.log(`merge   (1)          ${fmt(t5 - t4)}`);
   console.log(`checkout(1)          ${fmt(t6 - t5)}`);
   console.log(`TOTAL                ${fmt(t6 - t0)}`);
-
-  // Equivalent Rust invocation written to a sibling .sh for manual comparison.
-  const cmpScript = `#!/usr/bin/env bash
-# Manual comparison runner. Run after \`cargo build --release -p git-fs\`.
-set -euo pipefail
-TMP=\$(mktemp -d)
-REPO="\$TMP/repo"
-target/release/git-fs --repo "\$REPO" init
-target/release/git-fs --repo "\$REPO" branch create main
-target/release/git-fs --repo "\$REPO" branch create agent/bench --from main
-
-time (
-  for i in \$(seq 0 ${N_FILES - 1}); do
-    printf '// file %s\\nexport const x_%s = %s;\\n' "\$i" "\$i" "\$i" \\
-      | target/release/git-fs --repo "\$REPO" write agent/bench "src/mod_\${i}.ts" --message "add mod_\${i}" >/dev/null
-  done
-)
-echo "(replaces/reads/merge/checkout omitted from script; instrument with hyperfine if needed)"
-rm -rf "\$TMP"
-`;
-  const scriptPath = path.join(tmp, "rust-equivalent.sh");
-  fs.writeFileSync(scriptPath, cmpScript, { mode: 0o755 });
-  console.log(`\nRust comparator scaffold written to: ${scriptPath}`);
 }
 
 run().catch((e) => {

@@ -1,6 +1,5 @@
 /**
- * Store unit tests. Mirrors git-fs/src/store.rs #[cfg(test)] block.
- * Run with: npm test
+ * Store unit tests. Run with: npm test
  */
 
 import { test } from "node:test";
@@ -28,9 +27,9 @@ test("write_and_read_file", async () => {
 test("write_nested_path", async () => {
   const { store } = await tempStore();
   await store.branchCreate("main");
-  await store.writeFile("main", "src/lib.rs", Buffer.from("pub fn f() {}"), "add lib");
-  const content = await store.readFile("main", "src/lib.rs");
-  assert.equal(Buffer.from(content).toString("utf-8"), "pub fn f() {}");
+  await store.writeFile("main", "src/lib.ts", Buffer.from("export const x = 1;"), "add lib");
+  const content = await store.readFile("main", "src/lib.ts");
+  assert.equal(Buffer.from(content).toString("utf-8"), "export const x = 1;");
 });
 
 test("branch_create_list_delete", async () => {

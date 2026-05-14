@@ -1,9 +1,10 @@
 /**
  * Store — git object operations.
  *
- * Mirrors the surface of Rust crate `git-fs/src/store.rs` 1:1 so MCP/CLI
- * code can be ported without semantic drift. Backed by isomorphic-git
- * against a bare repository.
+ * Backed by isomorphic-git against a bare repository. Provides branch
+ * management, file ops (write/read/replace/patch/rm/ls), 3-way merge with
+ * line-level auto-resolution via diff3, unified diff via the `diff`
+ * package, and full-tree checkout to disk.
  */
 
 import * as git from "isomorphic-git";
@@ -214,8 +215,8 @@ export class Store {
   async readFileLines(ref: string, filepath: string, start?: number, end?: number): Promise<string> {
     const text = await this.readText(ref, filepath);
     const lines = text.split("\n");
-    // text.split keeps a trailing empty string when file ends with \n; drop it so
-    // line indexing matches Rust's `text.lines()` which excludes the empty tail.
+    // text.split keeps a trailing empty string when the file ends with \n; drop
+    // it so line indexing matches the convention "lines() excludes empty tail".
     if (lines.length > 0 && lines[lines.length - 1] === "" && text.endsWith("\n")) {
       lines.pop();
     }
@@ -266,7 +267,6 @@ export class Store {
     const idx = text.indexOf(oldStr);
     if (idx < 0) throw new Error(`old_str not found in '${filepath}'`);
     if (text.indexOf(oldStr, idx + oldStr.length) >= 0) {
-      // count remaining matches for parity with Rust's wording
       let count = 1;
       let from = idx + oldStr.length;
       while (true) {
@@ -310,7 +310,6 @@ export class Store {
     let scopeTreeOid = rootTreeOid;
     if (prefix.length > 0) {
       const { tree } = await git.readTree({ fs, gitdir: this.gitdir, oid: rootTreeOid, filepath: prefix });
-      // readTree with filepath: returns the tree at that path
       scopeTreeOid = await git.writeTree({ fs, gitdir: this.gitdir, tree });
     }
     const out: ListEntry[] = [];
@@ -339,10 +338,10 @@ export class Store {
   // ── merge / log / diff / checkout ─────────────────────────────────────────
 
   /**
-   * 3-way merge of `base/ours/theirs` commit refs. When a path has changed on
-   * both sides and the contents differ from the base, a conflict is reported.
-   * Otherwise the non-base side wins. Empty `theirs` deletes; empty `ours`
-   * keeps theirs; both sides identical → no-op.
+   * 3-way merge of `base/ours/theirs` commit refs. When both sides diverge
+   * from base on the same blob a line-level diff3 merge is attempted; if
+   * that still has conflicting hunks the path is reported as a conflict and
+   * `ours` is preserved in the tree.
    */
   async merge(
     baseRef: string,
@@ -366,7 +365,8 @@ export class Store {
 
     const targetRef = Store.branchRef(into);
     const targetTip = await this.tryReadRefCommit(targetRef);
-    // target's current tip must be first parent for ref update to land.
+    // The target's current tip must be the first parent so the ref update
+    // is fast-forward-or-merge rather than rewrite.
     const parents =
       targetTip === theirsCommit ? [theirsCommit, oursCommit] : [oursCommit, theirsCommit];
     const sig = this.now();
@@ -440,7 +440,6 @@ export class Store {
           full,
           conflicts,
         );
-        // Skip if recursion produced an empty tree on both sides (shouldn't normally).
         out.push({ mode: MODE_TREE, path: name, oid: subOid, type: "tree" });
         continue;
       }
@@ -465,8 +464,8 @@ export class Store {
         if (o) out.push(o);
         continue;
       }
-      // Both sides diverged from base. Try 3-way line merge before declaring
-      // conflict (parity with libgit2's merge_trees auto-merge).
+      // Both sides diverged from base. Try a line-level 3-way merge before
+      // declaring a conflict so non-overlapping concurrent edits compose.
       const lineMerge = await this.tryLineMerge(b, o, t);
       if (lineMerge.clean) {
         const mergedOid = await git.writeBlob({
@@ -498,10 +497,8 @@ export class Store {
   }
 
   /**
-   * 3-way line merge using diff3. Returns clean=true when no conflicting
-   * hunks; false when either side touches the same lines or any side is
-   * non-text. Matches libgit2's behavior of auto-merging non-overlapping
-   * concurrent changes to the same file.
+   * 3-way line merge. clean=true when no hunks overlap; false when either
+   * side touches the same lines or any side is non-text.
    */
   private async tryLineMerge(
     base: TreeEntry | undefined,
@@ -564,7 +561,11 @@ export class Store {
       const full = pathPrefix.length === 0 ? name : `${pathPrefix}/${name}`;
       if (ea && eb && ea.oid === eb.oid) continue;
       if (ea?.type === "tree" || eb?.type === "tree") {
-        out.push(...(await this.diffTrees(ea?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904", eb?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904", full)));
+        out.push(...(await this.diffTrees(
+          ea?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+          eb?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+          full,
+        )));
         continue;
       }
       const aText = ea ? await this.maybeBlobText(ea) : null;
@@ -752,8 +753,6 @@ export class Store {
 
 function unifiedDiff(filepath: string, a: string | null, b: string | null): string {
   // createPatch emits a leading "Index:" header we don't want; strip it.
-  // Empty-string-vs-empty-string yields a no-op patch, which is what we want
-  // for trees-changed-but-content-identical edge cases.
   const patch = createPatch(filepath, a ?? "", b ?? "", "", "", { context: 3 });
   return patch.replace(/^Index:.*\n=+\n/, "");
 }

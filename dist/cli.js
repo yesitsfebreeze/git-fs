@@ -22781,10 +22781,10 @@ Session-Id: ${session}
   }
   // ── merge / log / diff / checkout ─────────────────────────────────────────
   /**
-   * 3-way merge of `base/ours/theirs` commit refs. When a path has changed on
-   * both sides and the contents differ from the base, a conflict is reported.
-   * Otherwise the non-base side wins. Empty `theirs` deletes; empty `ours`
-   * keeps theirs; both sides identical → no-op.
+   * 3-way merge of `base/ours/theirs` commit refs. When both sides diverge
+   * from base on the same blob a line-level diff3 merge is attempted; if
+   * that still has conflicting hunks the path is reported as a conflict and
+   * `ours` is preserved in the tree.
    */
   async merge(baseRef, oursRef, theirsRef, into, msg) {
     const baseCommit = await this.resolveCommitOid(baseRef);
@@ -22900,10 +22900,8 @@ Session-Id: ${session}
     return m;
   }
   /**
-   * 3-way line merge using diff3. Returns clean=true when no conflicting
-   * hunks; false when either side touches the same lines or any side is
-   * non-text. Matches libgit2's behavior of auto-merging non-overlapping
-   * concurrent changes to the same file.
+   * 3-way line merge. clean=true when no hunks overlap; false when either
+   * side touches the same lines or any side is non-text.
    */
   async tryLineMerge(base, ours, theirs) {
     if (!base || !ours || !theirs) return { clean: false };
@@ -22958,7 +22956,11 @@ Session-Id: ${session}
       const full = pathPrefix.length === 0 ? name : `${pathPrefix}/${name}`;
       if (ea && eb && ea.oid === eb.oid) continue;
       if (ea?.type === "tree" || eb?.type === "tree") {
-        out.push(...await this.diffTrees(ea?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904", eb?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904", full));
+        out.push(...await this.diffTrees(
+          ea?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+          eb?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+          full
+        ));
         continue;
       }
       const aText = ea ? await this.maybeBlobText(ea) : null;
@@ -23133,7 +23135,6 @@ var import_picomatch = __toESM(require_picomatch2(), 1);
 var import_proper_lockfile = __toESM(require_proper_lockfile(), 1);
 import fs2 from "node:fs";
 import path2 from "node:path";
-import os from "node:os";
 var HARD_MERGEIGNORE = [".agent", "CONFLICTS.md"];
 function readStdinSync() {
   try {
@@ -23786,6 +23787,7 @@ USAGE:
 
 COMMANDS:
   init                                  Initialize a bare repo
+  init-project [--repo P] [--mcp-config P]  Bootstrap project (bare repo + .mcp.json)
   branch create NAME [--from REF]       Create branch
   branch list                           List branches
   branch delete NAME                    Delete branch
@@ -23798,6 +23800,9 @@ COMMANDS:
   log REF [--count N]                   Commit log
   checkout REF DEST                     Materialize ref to disk
   show REF                              Show tip commit
+  prune [--merged] [--older-than D] [--into REF] [--prefix P] [--apply]
+  hook (session-start|post-write|post-edit|read|stop)
+                                        Claude Code hook handlers
 `;
 main().catch((e) => {
   process.stderr.write(`error: ${e instanceof Error ? e.message : String(e)}

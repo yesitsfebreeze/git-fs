@@ -1,10 +1,9 @@
 /**
  * git-fs CLI.
  *
- * Mirrors git-fs/src/main.rs subcommands. Spike scope covers the
- * subcommands exercised by the perf benchmark + manual use; hook
- * subcommands (SessionStart/Stop/etc) are out of scope for the spike
- * and will be ported only if the perf gate passes.
+ * Dispatches `init`, `branch *`, file ops, `merge`, `diff`, `log`,
+ * `checkout`, `show`, `init-project`, `prune`, and Claude Code `hook *`
+ * subcommands.
  */
 
 import { Store, MergeResult } from "./store.js";
@@ -273,6 +272,7 @@ USAGE:
 
 COMMANDS:
   init                                  Initialize a bare repo
+  init-project [--repo P] [--mcp-config P]  Bootstrap project (bare repo + .mcp.json)
   branch create NAME [--from REF]       Create branch
   branch list                           List branches
   branch delete NAME                    Delete branch
@@ -285,6 +285,9 @@ COMMANDS:
   log REF [--count N]                   Commit log
   checkout REF DEST                     Materialize ref to disk
   show REF                              Show tip commit
+  prune [--merged] [--older-than D] [--into REF] [--prefix P] [--apply]
+  hook (session-start|post-write|post-edit|read|stop)
+                                        Claude Code hook handlers
 `;
 
 main().catch((e) => {

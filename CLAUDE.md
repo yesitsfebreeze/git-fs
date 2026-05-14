@@ -31,11 +31,11 @@ Multiple agent branches may touch the same files concurrently. Before editing a 
 
 ## Source layout
 
-The plugin runtime is pure TypeScript. Source lives in `git-fs-ts/` and bundles
+The plugin runtime is pure TypeScript. Source lives in `git-fs/` and bundles
 to repo-root `dist/` for the plugin to load.
 
 ```
-git-fs-ts/
+git-fs/
 ├── src/
 │   ├── store.ts   git object operations (isomorphic-git)
 │   ├── mcp.ts     stdio JSON-RPC MCP server
@@ -46,5 +46,5 @@ git-fs-ts/
 └── build.mjs      esbuild bundler (emits to ./dist and ../dist)
 ```
 
-Build: `cd git-fs-ts && npm install && npm run build`.
+Build: `cd git-fs && npm install && npm run build`.
 Test:  `npm test`.

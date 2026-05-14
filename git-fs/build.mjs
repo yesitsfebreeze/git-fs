@@ -1,5 +1,5 @@
 // Bundle CLI + MCP entries with esbuild. Cross-platform; works around
-// PowerShell single-quote unfriendliness in the inline npm script.
+// PowerShell single-quote unfriendliness in inline npm scripts.
 
 import { build } from "esbuild";
 
@@ -13,7 +13,7 @@ const banner = {
 };
 
 // Two builds:
-//   1. local: git-fs-ts/dist/{cli,mcp}.js — for `npm run dev` and bench
+//   1. local: git-fs/dist/{cli,mcp}.js — for `npm run dev` and bench
 //   2. plugin: ../dist/{cli,mcp}.js — picked up by the Claude Code plugin
 //      shipped from the repo root.
 for (const outdir of ["dist", "../dist"]) {

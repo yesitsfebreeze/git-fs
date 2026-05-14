@@ -1,9 +1,8 @@
 /**
  * git-fs-mcp — stdio JSON-RPC MCP server.
  *
- * Mirrors git-fs/src/bin/mcp.rs tool surface 1:1. Hand-rolled JSON-RPC
- * loop (no MCP SDK dependency) for parity with the Rust impl which also
- * writes raw frames to stdout.
+ * Exposes the `git_fs_*` tool surface over stdio. Hand-rolled JSON-RPC
+ * loop, no MCP SDK runtime dependency.
  */
 
 import { Store, MergeResult } from "./store.js";
@@ -12,7 +11,7 @@ import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "git-fs-mcp";
-const SERVER_VERSION = "2.0.0-spike.0";
+const SERVER_VERSION = "2.0.0";
 
 const REPO = () => process.env["GIT_FS_REPO"] ?? ".git-fs";
 
@@ -185,7 +184,6 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<strin
 }
 
 function toolSchemas(): unknown {
-  // Verbatim copy of git-fs-mcp tool_list() so existing skill prompts keep working.
   return [
     {
       name: "git_fs_init",
@@ -226,7 +224,7 @@ function toolSchemas(): unknown {
         type: "object",
         properties: {
           branch: { type: "string", description: "Target branch" },
-          path: { type: "string", description: "File path, e.g. src/main.rs" },
+          path: { type: "string", description: "File path, e.g. src/main.ts" },
           content: { type: "string", description: "Full file content" },
           message: { type: "string", description: "Commit message (default: 'write')" },
         },

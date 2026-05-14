@@ -1,15 +1,12 @@
 /**
- * MCP-driven benchmark — fair head-to-head.
+ * MCP-driven benchmark.
  *
- * Spawns a target MCP server (Rust or TS), sends the same 500/500/200/1/1
- * JSON-RPC workload over stdio, measures wall-clock per phase. Both targets
- * pay the same stdio/JSON cost, so the delta is the language/runtime
- * difference, not the IPC layer.
+ * Spawns dist/mcp.js (or a custom command), sends the 500/500/200/1/1
+ * JSON-RPC workload over stdio, prints per-phase wall-clock.
  *
  * Usage:
- *   tsx bench/mcp-driver.ts --target rust
- *   tsx bench/mcp-driver.ts --target ts
- *   tsx bench/mcp-driver.ts --cmd "<custom executable>"
+ *   tsx bench/mcp-driver.ts                # default: node dist/mcp.js
+ *   tsx bench/mcp-driver.ts --cmd "<exe>"  # custom executable
  */
 
 import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
@@ -31,27 +28,19 @@ interface Args {
 
 function parseArgs(): Args {
   const argv = process.argv.slice(2);
-  let target = "ts";
   let custom: string | null = null;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--target") target = argv[++i] ?? "ts";
-    else if (argv[i] === "--cmd") custom = argv[++i] ?? null;
+    if (argv[i] === "--cmd") custom = argv[++i] ?? null;
   }
   const repoBase = fs.mkdtempSync(path.join(os.tmpdir(), "gitfs-mcp-bench-"));
   const repo = path.join(repoBase, "repo");
   process.env["GIT_FS_REPO"] = repo;
 
   if (custom) return { cmd: custom, args: [], label: custom, repo };
-  if (target === "rust") {
-    const exe = process.platform === "win32"
-      ? path.resolve("..", "target", "release", "git-fs-mcp.exe")
-      : path.resolve("..", "target", "release", "git-fs-mcp");
-    return { cmd: exe, args: [], label: "rust git-fs-mcp", repo };
-  }
   return {
     cmd: process.execPath,
     args: [path.resolve("dist", "mcp.js")],
-    label: "ts dist/mcp.js",
+    label: "node dist/mcp.js",
     repo,
   };
 }
@@ -115,7 +104,6 @@ async function main() {
 
   const t0 = performance.now();
 
-  // 500 writes
   const t1 = performance.now();
   for (let i = 0; i < N_FILES; i++) {
     await rpc.tool("git_fs_write", {
@@ -127,7 +115,6 @@ async function main() {
   }
   const t2 = performance.now();
 
-  // 500 replaces
   for (let i = 0; i < N_FILES; i++) {
     await rpc.tool("git_fs_replace", {
       branch: "agent/bench",
@@ -139,7 +126,6 @@ async function main() {
   }
   const t3 = performance.now();
 
-  // 200 reads
   for (let i = 0; i < N_READS; i++) {
     if (i % 2 === 0) {
       await rpc.tool("git_fs_read", { ref: "agent/bench", path: `src/mod_${i}.ts` });
@@ -154,7 +140,6 @@ async function main() {
   }
   const t4 = performance.now();
 
-  // 1 merge
   await rpc.tool("git_fs_merge", {
     ours: "agent/bench",
     theirs: "main",
@@ -164,7 +149,6 @@ async function main() {
   });
   const t5 = performance.now();
 
-  // 1 checkout
   const dest = path.join(path.dirname(repo), "out");
   await rpc.tool("git_fs_checkout", { ref: "main", dest });
   const t6 = performance.now();

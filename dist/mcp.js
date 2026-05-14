@@ -19454,10 +19454,10 @@ Session-Id: ${session}
   }
   // ── merge / log / diff / checkout ─────────────────────────────────────────
   /**
-   * 3-way merge of `base/ours/theirs` commit refs. When a path has changed on
-   * both sides and the contents differ from the base, a conflict is reported.
-   * Otherwise the non-base side wins. Empty `theirs` deletes; empty `ours`
-   * keeps theirs; both sides identical → no-op.
+   * 3-way merge of `base/ours/theirs` commit refs. When both sides diverge
+   * from base on the same blob a line-level diff3 merge is attempted; if
+   * that still has conflicting hunks the path is reported as a conflict and
+   * `ours` is preserved in the tree.
    */
   async merge(baseRef, oursRef, theirsRef, into, msg) {
     const baseCommit = await this.resolveCommitOid(baseRef);
@@ -19573,10 +19573,8 @@ Session-Id: ${session}
     return m;
   }
   /**
-   * 3-way line merge using diff3. Returns clean=true when no conflicting
-   * hunks; false when either side touches the same lines or any side is
-   * non-text. Matches libgit2's behavior of auto-merging non-overlapping
-   * concurrent changes to the same file.
+   * 3-way line merge. clean=true when no hunks overlap; false when either
+   * side touches the same lines or any side is non-text.
    */
   async tryLineMerge(base, ours, theirs) {
     if (!base || !ours || !theirs) return { clean: false };
@@ -19631,7 +19629,11 @@ Session-Id: ${session}
       const full = pathPrefix.length === 0 ? name : `${pathPrefix}/${name}`;
       if (ea && eb && ea.oid === eb.oid) continue;
       if (ea?.type === "tree" || eb?.type === "tree") {
-        out.push(...await this.diffTrees(ea?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904", eb?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904", full));
+        out.push(...await this.diffTrees(
+          ea?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+          eb?.oid ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+          full
+        ));
         continue;
       }
       const aText = ea ? await this.maybeBlobText(ea) : null;
@@ -19806,7 +19808,7 @@ import { Buffer as Buffer3 } from "node:buffer";
 import { createInterface } from "node:readline";
 var PROTOCOL_VERSION = "2024-11-05";
 var SERVER_NAME = "git-fs-mcp";
-var SERVER_VERSION = "2.0.0-spike.0";
+var SERVER_VERSION = "2.0.0";
 var REPO = () => process.env["GIT_FS_REPO"] ?? ".git-fs";
 function err(id, code, message) {
   return JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });
@@ -19991,7 +19993,7 @@ function toolSchemas() {
         type: "object",
         properties: {
           branch: { type: "string", description: "Target branch" },
-          path: { type: "string", description: "File path, e.g. src/main.rs" },
+          path: { type: "string", description: "File path, e.g. src/main.ts" },
           content: { type: "string", description: "Full file content" },
           message: { type: "string", description: "Commit message (default: 'write')" }
         },
