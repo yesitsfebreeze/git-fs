@@ -12,15 +12,21 @@ Virtual filesystem over a bare git repository. Disk is read-only during a sessio
 This skill is for projects that use git-fs as their file backend. Signs:
 
 - `.git-fs/` directory exists at project root.
-- `.mcp.json` contains a `git-fs` server entry.
+- `.mcp.json` or a Claude Code plugin registers a `git-fs` MCP server.
 - Session-start banner mentions `Branch: agent/<session-id>`.
 
-If those signs are absent and the user wants this behavior, follow the install flow at
-https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/install.md.
+If those signs are absent and the user wants this behavior, install the plugin:
+
+```
+/plugin marketplace add yesitsfebreeze/git-fs
+/plugin install git-fs@git-fs
+```
+
+The plugin's SessionStart hook auto-initializes any git repo it lands in.
 
 ## Core rule
 
-**Never use the native Edit or Write tools.** They are denied in `.claude/settings.json` on git-fs projects by design. All edits flow through the MCP tools below. Read is allowed because the PreToolUse hook materializes git-fs content to disk first.
+**Never use the native Edit or Write tools.** They are denied in `.claude/settings.json` on git-fs projects by design (the plugin writes the deny rule on auto-init). All edits flow through the MCP tools below. Read is allowed because the PreToolUse hook materializes git-fs content to disk first.
 
 ## Tool selection
 
@@ -91,15 +97,4 @@ If you see `CONFLICTS.md` referenced in a sibling, that session ended in a merge
 git-fs works across git worktrees in two modes.
 
 - **Per-worktree (default).** Each worktree has its own `.git-fs/`. Sessions are isolated per worktree — `git_fs_branch_list` only shows agents in this worktree.
-- **Shared store.** Every worktree's `.mcp.json` sets `env.GIT_FS_REPO` to one absolute path. All worktrees see the same branch graph; `git_fs_branch_list` returns every active agent across every worktree. The merge lock is global. Stop still materializes `main` into each session's own `cwd`, so disk contents stay per-worktree even though history is shared.
-
-Detect shared mode: read the `git-fs` entry of the project's `.mcp.json`. If `env.GIT_FS_REPO` is an absolute path outside the current worktree, you're in shared mode — siblings may be in other directories.
-
-## Installation
-
-If `git-fs` MCP isn't registered yet on the user's machine, follow:
-https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/install.md
-
-## Updating
-
-https://github.com/yesitsfebreeze/git-fs/blob/main/agents/claude/update.md
+- **Shared store.** Set `GIT_FS_REPO` env var to one absolute path. All worktrees see the same branch graph; `git_fs_branch_list` returns every active agent across every worktree. The merge lock is global. Stop still materializes `main` into each session's own `cwd`, so disk contents stay per-worktree even though history is shared.

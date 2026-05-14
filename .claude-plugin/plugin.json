@@ -1,0 +1,28 @@
+{
+	"$schema": "https://code.claude.com/schemas/plugin.json",
+	"name": "git-fs",
+	"version": "1.1.0",
+	"description": "Virtual filesystem over a bare git object store. Each Claude Code session works on agent/<id> branch; every edit is a commit; Stop hook merges to main and materializes to disk.",
+	"author": {
+		"name": "febreeze",
+		"url": "https://github.com/yesitsfebreeze"
+	},
+	"license": "MIT",
+	"homepage": "https://github.com/yesitsfebreeze/git-fs#readme",
+	"repository": "https://github.com/yesitsfebreeze/git-fs",
+	"keywords": [
+		"git",
+		"filesystem",
+		"mcp",
+		"multi-agent",
+		"branching",
+		"merge"
+	],
+	"mcpServers": {
+		"git-fs": {
+			"command": "node",
+			"args": ["${CLAUDE_PLUGIN_ROOT}/dist/launcher.js", "mcp"],
+			"description": "git-fs MCP server"
+		}
+	}
+}

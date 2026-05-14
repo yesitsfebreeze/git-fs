@@ -1,0 +1,38 @@
+{
+	"hooks": {
+		"SessionStart": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/launcher.js\" hook session-start",
+						"timeout": 60
+					}
+				]
+			}
+		],
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/launcher.js\" hook stop",
+						"timeout": 60
+					}
+				]
+			}
+		],
+		"PreToolUse": [
+			{
+				"matcher": "Read",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/launcher.js\" hook read",
+						"timeout": 10
+					}
+				]
+			}
+		]
+	}
+}

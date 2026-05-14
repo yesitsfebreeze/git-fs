@@ -1,0 +1,17 @@
+{
+	"name": "git-fs",
+	"owner": {
+		"name": "febreeze",
+		"url": "https://github.com/yesitsfebreeze"
+	},
+	"plugins": [
+		{
+			"name": "git-fs",
+			"source": {
+				"source": "github",
+				"repo": "yesitsfebreeze/git-fs"
+			},
+			"description": "Virtual filesystem over a bare git object store. N agents, 1 repo, 0 collisions."
+		}
+	]
+}
