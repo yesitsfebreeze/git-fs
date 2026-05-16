@@ -107,6 +107,63 @@ async function reportSiblingOverlap(
   }
 }
 
+interface AgentMeta {
+  model: string;
+  session: string;
+  base: string;
+}
+
+async function readAgentMeta(store: Store, branch: string): Promise<AgentMeta | null> {
+  try {
+    const bytes = await store.readFile(branch, ".agent");
+    const text = new TextDecoder("utf-8").decode(bytes);
+    const meta: Record<string, string> = {};
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^(\w+):\s*(.*)$/.exec(line);
+      if (m) meta[m[1]!] = m[2]!.trim();
+    }
+    return {
+      model: meta["model"] ?? "unknown",
+      session: meta["session"] ?? "",
+      base: meta["base"] ?? "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeAgentMeta(store: Store, branch: string, meta: AgentMeta, msg: string): Promise<void> {
+  const body = `model: ${meta.model}\nsession: ${meta.session}\nbase: ${meta.base}\n`;
+  await store.writeFile(branch, ".agent", Buffer.from(body, "utf-8"), msg);
+}
+
+/**
+ * Absorb main's commits into the agent branch if main has advanced.
+ * Uses the live merge-base as common ancestor, so a stale `.agent base:`
+ * does not skew the 3-way. On conflicts we log and leave the branch as-is —
+ * the agent's edit still gets committed, and Stop-time merge surfaces the
+ * real conflict via CONFLICTS.md.
+ */
+async function syncFromMain(store: Store, branch: string): Promise<void> {
+  try {
+    const branches = await store.branchList();
+    if (!branches.includes("main") || !branches.includes(branch)) return;
+    if (await store.isMergedInto("main", branch)) return; // already current
+    const base = await store.mergeBase(branch, "main");
+    if (!base) return;
+    const result = await store.merge(base, branch, "main", branch, "sync from main");
+    if (result.kind === "conflicts") {
+      process.stderr.write(
+        `git-fs: sync from main → ${branch} has ${result.conflicts.length} conflict(s); continuing with agent state\n`,
+      );
+    } else if (result.commitOid) {
+      process.stderr.write(`git-fs: synced main → ${branch}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`git-fs: sync from main failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
 async function withMergeLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = path.join(repo, "merge.lock");
   if (!fs.existsSync(lockPath)) fs.writeFileSync(lockPath, "");
@@ -190,6 +247,7 @@ export async function runHook(action: HookAction): Promise<void> {
       const rel = relPath(filePath, cwd);
       if (!rel) return;
       if (!fs.existsSync(filePath)) return;
+      await syncFromMain(store, branch);
       const content = fs.readFileSync(filePath);
       const op = action === "post-write" ? "write" : "edit";
       try {
@@ -206,6 +264,7 @@ export async function runHook(action: HookAction): Promise<void> {
       if (!filePath) return;
       const rel = relPath(filePath, cwd);
       if (!rel) return;
+      await syncFromMain(store, branch);
       try {
         const bytes = await store.readFile(branch, rel);
         const parent = path.dirname(filePath);
@@ -273,6 +332,27 @@ export async function runHook(action: HookAction): Promise<void> {
               process.stderr.write(`git-fs: materialized main → ${cwd}\n`);
             } catch (e) {
               process.stderr.write(`git-fs: checkout failed: ${e instanceof Error ? e.message : String(e)}\n`);
+            }
+            // Reset agent branch → main HEAD. Feature playground restarts from
+            // freshly materialized state; next post-write builds on main, and
+            // subsequent Stops see agent==main (no duplicate merge replay).
+            try {
+              const mainOid = await store.resolveCommit("main");
+              const prior = await readAgentMeta(store, branch);
+              await store.writeBranchRef(branch, mainOid);
+              await writeAgentMeta(
+                store,
+                branch,
+                {
+                  model: prior?.model ?? "unknown",
+                  session: sessionId,
+                  base: mainOid,
+                },
+                "reset to main after merge",
+              );
+              process.stderr.write(`git-fs: reset ${branch} → main (base ${mainOid.slice(0, 7)})\n`);
+            } catch (e) {
+              process.stderr.write(`git-fs: reset ${branch} failed: ${e instanceof Error ? e.message : String(e)}\n`);
             }
           } else {
             let report = `# Conflicts: ${branch} → main\n\n`;

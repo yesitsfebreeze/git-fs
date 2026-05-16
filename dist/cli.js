@@ -23208,6 +23208,53 @@ async function reportSiblingOverlap(store, ours, match) {
 `);
   }
 }
+async function readAgentMeta(store, branch) {
+  try {
+    const bytes = await store.readFile(branch, ".agent");
+    const text = new TextDecoder("utf-8").decode(bytes);
+    const meta = {};
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^(\w+):\s*(.*)$/.exec(line);
+      if (m) meta[m[1]] = m[2].trim();
+    }
+    return {
+      model: meta["model"] ?? "unknown",
+      session: meta["session"] ?? "",
+      base: meta["base"] ?? ""
+    };
+  } catch {
+    return null;
+  }
+}
+async function writeAgentMeta(store, branch, meta, msg) {
+  const body = `model: ${meta.model}
+session: ${meta.session}
+base: ${meta.base}
+`;
+  await store.writeFile(branch, ".agent", Buffer.from(body, "utf-8"), msg);
+}
+async function syncFromMain(store, branch) {
+  try {
+    const branches = await store.branchList();
+    if (!branches.includes("main") || !branches.includes(branch)) return;
+    if (await store.isMergedInto("main", branch)) return;
+    const base = await store.mergeBase(branch, "main");
+    if (!base) return;
+    const result = await store.merge(base, branch, "main", branch, "sync from main");
+    if (result.kind === "conflicts") {
+      process.stderr.write(
+        `git-fs: sync from main \u2192 ${branch} has ${result.conflicts.length} conflict(s); continuing with agent state
+`
+      );
+    } else if (result.commitOid) {
+      process.stderr.write(`git-fs: synced main \u2192 ${branch}
+`);
+    }
+  } catch (e) {
+    process.stderr.write(`git-fs: sync from main failed: ${e instanceof Error ? e.message : String(e)}
+`);
+  }
+}
 async function withMergeLock(repo, fn) {
   const lockPath = path2.join(repo, "merge.lock");
   if (!fs2.existsSync(lockPath)) fs2.writeFileSync(lockPath, "");
@@ -23300,6 +23347,7 @@ Load schemas upfront: ToolSearch select:git_fs_write,git_fs_read,git_fs_replace,
       const rel = relPath(filePath, cwd);
       if (!rel) return;
       if (!fs2.existsSync(filePath)) return;
+      await syncFromMain(store, branch);
       const content = fs2.readFileSync(filePath);
       const op = action === "post-write" ? "write" : "edit";
       try {
@@ -23317,6 +23365,7 @@ Load schemas upfront: ToolSearch select:git_fs_write,git_fs_read,git_fs_replace,
       if (!filePath) return;
       const rel = relPath(filePath, cwd);
       if (!rel) return;
+      await syncFromMain(store, branch);
       try {
         const bytes = await store.readFile(branch, rel);
         const parent = path2.dirname(filePath);
@@ -23384,6 +23433,26 @@ Load schemas upfront: ToolSearch select:git_fs_write,git_fs_read,git_fs_replace,
 `);
             } catch (e) {
               process.stderr.write(`git-fs: checkout failed: ${e instanceof Error ? e.message : String(e)}
+`);
+            }
+            try {
+              const mainOid = await store.resolveCommit("main");
+              const prior = await readAgentMeta(store, branch);
+              await store.writeBranchRef(branch, mainOid);
+              await writeAgentMeta(
+                store,
+                branch,
+                {
+                  model: prior?.model ?? "unknown",
+                  session: sessionId,
+                  base: mainOid
+                },
+                "reset to main after merge"
+              );
+              process.stderr.write(`git-fs: reset ${branch} \u2192 main (base ${mainOid.slice(0, 7)})
+`);
+            } catch (e) {
+              process.stderr.write(`git-fs: reset ${branch} failed: ${e instanceof Error ? e.message : String(e)}
 `);
             }
           } else {

@@ -1,6 +1,6 @@
 {
   "name": "git-fs",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Virtual filesystem over a bare git object store.",
   "license": "MIT",
   "type": "module",
