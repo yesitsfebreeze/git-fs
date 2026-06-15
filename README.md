@@ -44,10 +44,9 @@ see exactly what changed, and you merge it in — or throw it away — on your t
 ## How it works
 
 ```
-                    ┌──────────────────────────────────────────┐
-   agent writes ───▶│  overlay branch  gitfs/<session-id>       │
-                    │  (starts EMPTY — touched files only)      │
-                    └────────────────────┬─────────────────────┘
+
+   agent writes ───▶  overlay branch  gitfs/<session-id>
+                      (starts EMPTY — touched files only)                   
                                          │
    agent reads ──▶  tracked? ──▶ YES ──▶ branch blob (read-your-writes)
                        │
