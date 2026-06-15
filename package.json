@@ -1,6 +1,6 @@
 {
   "name": "git-fs",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Copy-on-write overlay filesystem over the working directory, backed by a dedicated bare git store.",
   "type": "module",
   "bin": {
