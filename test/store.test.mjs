@@ -168,3 +168,60 @@ test("listFiles reports only branch deltas, not the disk tree", () => {
   store.writeFile(BR, "touched.txt", Buffer.from("y\n"), "t");
   assert.deepEqual(store.listFiles(BR, "", true), ["touched.txt"]);
 });
+
+test("currentBranch pointer round-trips", () => {
+  freshSandbox();
+  assert.equal(store.currentBranch(), null, "no pointer before it is set");
+  store.setCurrentBranch("gitfs/abc");
+  assert.equal(store.currentBranch(), "gitfs/abc");
+});
+
+test("checkout is scoped to the .agent base, not the branch root", () => {
+  const { disk } = freshSandbox();
+  store.branchCreate(BR, null);
+  // a prior session's delta, folded into the seed this session starts from
+  store.writeFile(BR, "old.txt", Buffer.from("old\n"), "old delta");
+  const base = store.resolveTip(BR);
+  store.writeFile(BR, ".agent", Buffer.from(`base:${base}\n`), "agent");
+  // this session's own delta
+  store.writeFile(BR, "new.txt", Buffer.from("new\n"), "new delta");
+
+  store.checkout(BR);
+  assert.ok(fs.existsSync(path.join(disk, "new.txt")), "session delta materialized");
+  assert.ok(!fs.existsSync(path.join(disk, "old.txt")), "pre-base delta NOT materialized");
+});
+
+test("clobber guard: refuse to overwrite disk newer than the branch blob", () => {
+  const { disk } = freshSandbox();
+  const seed = store.branchCreate(BR, null);
+  store.writeFile(BR, "g.txt", Buffer.from("branch\n"), "write g");
+
+  const dest = path.join(disk, "g.txt");
+  fs.writeFileSync(dest, "newer on disk\n");
+  const future = Date.now() / 1000 + 3600; // mtime past the commit time
+  fs.utimesSync(dest, future, future);
+
+  const { conflicts } = store.materialize(BR, seed);
+  assert.deepEqual(conflicts, ["g.txt"], "newer disk file reported, not clobbered");
+  assert.equal(fs.readFileSync(dest, "utf8"), "newer on disk\n", "disk content preserved");
+
+  // force overrides the guard
+  const r2 = store.materialize(BR, seed, { force: true });
+  assert.deepEqual(r2.conflicts, []);
+  assert.equal(fs.readFileSync(dest, "utf8"), "branch\n", "force materializes the blob");
+});
+
+test("clobber guard: blob newer than disk materializes normally", () => {
+  const { disk } = freshSandbox();
+  const seed = store.branchCreate(BR, null);
+
+  const dest = path.join(disk, "h.txt");
+  fs.writeFileSync(dest, "old disk\n");
+  const past = Date.now() / 1000 - 3600;
+  fs.utimesSync(dest, past, past);
+
+  store.writeFile(BR, "h.txt", Buffer.from("branch new\n"), "write h");
+  const { conflicts } = store.materialize(BR, seed);
+  assert.deepEqual(conflicts, [], "no conflict when the blob is newer");
+  assert.equal(fs.readFileSync(dest, "utf8"), "branch new\n");
+});

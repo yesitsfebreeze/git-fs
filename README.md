@@ -88,7 +88,9 @@ npm test                                # node --test
 ```
 
 Env: `GIT_FS_REPO` (store dir, default `.git-fs`), `GIT_FS_DISK` (worktree,
-default cwd), `GIT_FS_BRANCH` (default `main`).
+default cwd), `GIT_FS_BRANCH` (override the branch). With no override, the MCP
+server and CLI default to the branch `session-start` pinned for the active
+session (`.git-fs/CURRENT`), falling back to `main` only outside a session.
 
 As a Claude Code plugin, `.claude-plugin/plugin.json` wires the MCP server and the
 four lifecycle hooks. For a standalone MCP config, see `mcp.config.example.json`.
@@ -96,8 +98,9 @@ four lifecycle hooks. For a standalone MCP config, see `mcp.config.example.json`
 ## Good to know
 
 - File-granularity, blob+path — no rename/move tracking, no symlinks.
-- `materialize` is last-write-wins to disk; the overlay assumes the agent is the
-  sole writer of the paths it touches.
+- `materialize` writes branch blobs to disk, but refuses to overwrite a path
+  whose on-disk copy is newer than the blob (the commit that produced it) and
+  reports it as a conflict; pass `force` to override.
 - The write lock is a lightweight per-branch spin lock — sized for a handful of
   concurrent agents, not a high-throughput server.
 

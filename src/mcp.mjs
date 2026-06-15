@@ -9,7 +9,7 @@ const SERVER_INFO = { name: "git-fs", version: "0.1.0" };
 
 // Default branch comes from the session env; tools may override via args.branch.
 function branchOf(args) {
-  return (args && args.branch) || process.env.GIT_FS_BRANCH || "main";
+  return (args && args.branch) || process.env.GIT_FS_BRANCH || store.currentBranch() || "main";
 }
 
 function textResult(text) {
@@ -73,9 +73,16 @@ const TOOLS = {
     run(a) { return textResult(store.merge(a.base, a.ours, a.theirs)); },
   },
   git_fs_checkout: {
-    description: "Materialize a branch's touched files to disk.",
-    schema: { type: "object", properties: { branch: { type: "string" } }, required: [] },
-    run(a) { store.checkout(branchOf(a)); return textResult(`checked out ${branchOf(a)}`); },
+    description: "Materialize the session branch's touched files to disk (scoped to its seed). Refuses to overwrite on-disk content newer than git-fs unless force:true.",
+    schema: { type: "object", properties: { branch: { type: "string" }, force: { type: "boolean" } }, required: [] },
+    run(a) {
+      const br = branchOf(a);
+      const { conflicts } = store.checkout(br, { force: a.force === true });
+      if (conflicts && conflicts.length) {
+        return { content: [{ type: "text", text: `git-fs: REFUSED to overwrite ${conflicts.length} file(s) whose on-disk content is newer than the branch blob (pass force:true to override):\n` + conflicts.map((p) => `  ${p}`).join("\n") }], isError: true };
+      }
+      return textResult(`checked out ${br}`);
+    },
   },
   // ── extras (handy; not in the §10 minimum) ──
   git_fs_init: {

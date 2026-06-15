@@ -11,6 +11,28 @@ import path from "node:path";
 const GITFS = () => process.env.GIT_FS_REPO || ".git-fs";
 const DISK = () => process.env.GIT_FS_DISK || process.cwd();
 
+// Pointer file (inside the bare store) naming the branch the active session
+// owns. session-start writes it; the MCP server and CLI default to it instead
+// of a shared "main", so tool writes and the lifecycle hooks converge on the
+// same gitfs/<sid> branch rather than splitting into two parallel timelines.
+const CURRENT = () => path.join(GITFS(), "CURRENT");
+
+export function setCurrentBranch(branch) {
+  try {
+    fs.mkdirSync(GITFS(), { recursive: true });
+    fs.writeFileSync(CURRENT(), branch + "\n");
+  } catch {}
+}
+
+export function currentBranch() {
+  try {
+    const b = fs.readFileSync(CURRENT(), "utf8").trim();
+    return b || null;
+  } catch {
+    return null;
+  }
+}
+
 // Stable identity so commit-tree works in clean/CI environments.
 const IDENT = {
   GIT_AUTHOR_NAME: "git-fs",
@@ -350,19 +372,60 @@ export function ignored(p) {
   return pats.some((pat) => matchPattern(pat, p));
 }
 
+// The session seed for a branch: the base recorded in .agent, else the branch's
+// own root (empty seed). materialize diffs against THIS, so checkout only ever
+// touches files the session changed — never a cross-session union of a shared
+// branch's whole history.
+export function agentBase(branch) {
+  try {
+    const txt = readText(branch, ".agent");
+    const m = txt.match(/^base:(.+)$/m);
+    if (m) return m[1].trim();
+  } catch {}
+  return rootCommit(branch);
+}
+
+// committer time (epoch seconds) of the last commit on `branch` that touched p.
+function lastCommitTime(branch, p) {
+  try {
+    const t = gitText(["log", "-1", "--format=%ct", branch, "--", p]).trim();
+    return t ? parseInt(t, 10) : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── materialize touched files to disk (§7) ──────────────────────────────────
-export function materialize(branch, base) {
-  const b = base || rootCommit(branch);
+// Returns { conflicts: [path, ...] } — files left untouched because the on-disk
+// copy is newer than the blob we would have written (clobber guard).
+export function materialize(branch, base, opts = {}) {
+  const b = base || agentBase(branch);
+  const conflicts = [];
   for (const [status, p] of diffNameStatus(b, branch)) {
     if (!p || ignored(p)) continue;
+    const dest = path.join(DISK(), p);
     if (status === "D") {
-      try { fs.unlinkSync(path.join(DISK(), p)); } catch {}
+      try { fs.unlinkSync(dest); } catch {}
       continue;
     }
     // A or M → write the BRANCH tree bytes (no overlay fallback: a real tree
     // miss must surface, not be masked by the disk copy).
     const bytes = readBlobFromTree(branch, p);
-    const dest = path.join(DISK(), p);
+    let disk = null;
+    try { disk = fs.readFileSync(dest); } catch {}
+    if (disk && Buffer.compare(disk, bytes) === 0) continue; // already in sync
+    // Clobber guard: refuse to overwrite on-disk content that postdates the
+    // blob we are about to write (e.g. a checkout of a stale or foreign branch
+    // whose blobs are older than committed work already sitting on disk).
+    if (disk && !opts.force) {
+      const blobTime = lastCommitTime(branch, p);
+      let diskTime = 0;
+      try { diskTime = Math.floor(fs.statSync(dest).mtimeMs / 1000); } catch {}
+      if (blobTime != null && diskTime > blobTime) {
+        conflicts.push(p);
+        continue;
+      }
+    }
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, bytes);
   }
@@ -374,8 +437,11 @@ export function materialize(branch, base) {
       try { fs.unlinkSync(path.join(DISK(), line)); } catch {}
     }
   } catch {}
+  return { conflicts };
 }
 
-export function checkout(branch) {
-  return materialize(branch);
+// Materialize the session branch, scoped to its own seed (never the empty root
+// of a shared branch). Pass { force: true } to override the clobber guard.
+export function checkout(branch, opts = {}) {
+  return materialize(branch, agentBase(branch), opts);
 }

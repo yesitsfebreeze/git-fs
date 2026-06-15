@@ -14,7 +14,7 @@ if (sub === "mcp") {
   runHook(rest[0]);
 } else {
   const store = await import(new URL("../src/store.mjs", import.meta.url));
-  const branch = process.env.GIT_FS_BRANCH || "main";
+  const branch = process.env.GIT_FS_BRANCH || store.currentBranch() || "main";
   const out = (v) => process.stdout.write((typeof v === "string" ? v : JSON.stringify(v, null, 2)) + "\n");
   try {
     switch (sub) {

@@ -37,14 +37,8 @@ function relPath(abs) {
   return r.split(path.sep).join("/");
 }
 
-function agentBaseOid(branch) {
-  try {
-    const txt = store.readText(branch, ".agent");
-    const m = txt.match(/^base:(.+)$/m);
-    if (m) return m[1].trim();
-  } catch {}
-  return store.rootCommit(branch);
-}
+// session seed for the branch (delegates to the store's single source of truth)
+const agentBaseOid = (branch) => store.agentBase(branch);
 
 export function runHook(action) {
   const payload = (() => { try { return JSON.parse(readStdin() || "{}"); } catch { return {}; } })();
@@ -62,6 +56,7 @@ export function runHook(action) {
         const model = payload.model || payload.model_id || "unknown";
         const agent = `session:${sid}\nmodel:${model}\nbase:${seed}\ntrack:main\n`;
         store.writeFile(branch, ".agent", Buffer.from(agent, "utf8"), "init .agent");
+        store.setCurrentBranch(branch); // converge MCP tool writes onto this branch
         process.stderr.write(
           `[git-fs] session ${sid} on ${branch}: reads fall back to disk; only touched files are tracked.\n`,
         );
@@ -92,7 +87,12 @@ export function runHook(action) {
       }
       case "stop": {
         if (!store.resolveTip(branch)) return;
-        store.materialize(branch, agentBaseOid(branch));
+        const { conflicts } = store.materialize(branch, agentBaseOid(branch));
+        if (conflicts && conflicts.length) {
+          process.stderr.write(
+            `[git-fs] WARNING: left ${conflicts.length} on-disk file(s) untouched (newer than the branch): ${conflicts.join(", ")}\n`,
+          );
+        }
         break;
       }
       default:
