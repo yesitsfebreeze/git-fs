@@ -1,12 +1,29 @@
 {
-  "name": "git-fs",
-  "version": "0.1.0",
-  "description": "Copy-on-write overlay filesystem over the working directory, backed by a dedicated bare git store. Each session edits on its own branch; only touched files become deltas; Stop materializes them to disk.",
-  "mcpServers": {
-    "git-fs": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/git-fs.mjs", "mcp"]
-    }
-  },
-  "hooks": "./hooks/hooks.json"
+	"$schema": "https://code.claude.com/schemas/plugin.json",
+	"name": "git-fs",
+	"version": "3.0.0",
+	"description": "Copy-on-write overlay filesystem over the working directory, backed by a dedicated bare git store. Each session edits on its own branch; only touched files become deltas; Stop materializes them to disk.",
+	"author": {
+		"name": "febreeze",
+		"url": "https://github.com/yesitsfebreeze"
+	},
+	"license": "MIT",
+	"homepage": "https://github.com/yesitsfebreeze/git-fs#readme",
+	"repository": "https://github.com/yesitsfebreeze/git-fs",
+	"keywords": [
+		"git",
+		"filesystem",
+		"mcp",
+		"multi-agent",
+		"branching",
+		"merge"
+	],
+	"mcpServers": {
+		"git-fs": {
+			"command": "node",
+			"args": ["${CLAUDE_PLUGIN_ROOT}/bin/git-fs.mjs", "mcp"],
+			"description": "git-fs MCP server"
+		}
+	},
+	"hooks": "./hooks/hooks.json"
 }
