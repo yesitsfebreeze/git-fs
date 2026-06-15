@@ -9,7 +9,7 @@
 [![Zero deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)](package.json)
 [![No build](https://img.shields.io/badge/build%20step-none-brightgreen)](package.json)
 [![MCP](https://img.shields.io/badge/MCP-server-7C3AED)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-3.0.1-informational)](package.json)
+[![Version](https://img.shields.io/badge/version-3.0.2-informational)](package.json)
 [![Stars](https://img.shields.io/github/stars/yesitsfebreeze/git-fs?style=social)](https://github.com/yesitsfebreeze/git-fs/stargazers)
 
 </div>
