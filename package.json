@@ -1,0 +1,14 @@
+{
+  "name": "git-fs",
+  "version": "3.0.0",
+  "description": "Copy-on-write overlay filesystem over the working directory, backed by a dedicated bare git store.",
+  "type": "module",
+  "bin": {
+    "git-fs": "bin/git-fs.mjs",
+    "git-fs-mcp": "bin/git-fs.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

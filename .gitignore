@@ -1,0 +1,12 @@
+# git-fs store (publishable separately, not part of source)
+.git-fs/
+
+# local runtime state (LMDB databases, journals, locks)
+.kern/
+.mesh/
+
+# dependencies / build artifacts
+node_modules/
+
+# local settings containing secrets / machine-specific values
+.claude/settings.local.json

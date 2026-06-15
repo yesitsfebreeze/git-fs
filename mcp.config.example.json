@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "git-fs": {
+      "command": "node",
+      "args": ["bin/git-fs.mjs", "mcp"]
+    }
+  }
+}
