@@ -36,8 +36,9 @@ see exactly what changed, and you merge it in — or throw it away — on your t
   merges auto-commit, conflicts come back as a file list.
 - 🧪 **Speculate freely.** "Try this refactor, show me the diff, toss it" —
   without touching disk or polluting your project's git history.
-- 📂 **Edit anywhere.** Reads fall back to live disk, so gitignored files and
-  non-git directories work transparently.
+- 📂 **Edit anywhere.** Reads fall back to live disk for any path your main git
+  tracks. Ignored/untracked files (secrets, deps, build junk) are kept out of the
+  store unless you opt them in with a `.gitfsallow` file at the repo root.
 - 🧾 **Audit everything.** Every edit is a commit tagged with its `Session-Id`.
   Per-session, per-file history of exactly what an agent did, in order.
 
@@ -62,7 +63,9 @@ see exactly what changed, and you merge it in — or throw it away — on your t
 - Each session works on `gitfs/<session-id>`, which **starts empty**.
 - A file enters the branch only when an agent writes/edits it (touched-only deltas).
 - **Reads fall back to the working tree** — touched paths read the branch blob
-  (read-your-writes), untouched paths read current disk bytes. No allowlist.
+  (read-your-writes), untouched paths read current disk bytes. Disk fallback is
+  gated to paths your **main git** already tracks; ignored/untracked content
+  (secrets, build junk, deps) stays out unless re-permitted via `.gitfsallow`.
 - **Stop materializes only touched files** back to disk.
 
 Three-way merges run in memory via `git merge-tree --write-tree` — no worktree,

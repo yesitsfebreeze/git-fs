@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 let store;
 
@@ -40,6 +41,36 @@ test("disk-fallback read: untracked file returns disk bytes", () => {
   assert.equal(store.readText(BR, "untracked.txt"), "from disk\n");
   // still not a delta — reading does not capture
   assert.deepEqual(store.listFiles(BR, "", true), []);
+});
+
+test("disk-read gate: untracked/ignored paths blocked, .gitfsallow re-permits", () => {
+  const { disk } = freshSandbox();
+  store.branchCreate(BR, null);
+  // make the working tree a real main git repo with one tracked file
+  const g = (...a) => execFileSync("git", ["-C", disk, ...a], { stdio: "ignore" });
+  g("init", "-q");
+  g("config", "user.email", "t@t");
+  g("config", "user.name", "t");
+  fs.writeFileSync(path.join(disk, "tracked.txt"), "in git\n");
+  fs.writeFileSync(path.join(disk, ".gitignore"), "secrets/\n");
+  g("add", "tracked.txt", ".gitignore");
+  g("commit", "-qm", "init");
+  // not committed: an untracked file and an ignored one
+  fs.writeFileSync(path.join(disk, "scratch.txt"), "untracked\n");
+  fs.mkdirSync(path.join(disk, "secrets"), { recursive: true });
+  fs.writeFileSync(path.join(disk, "secrets", "key"), "TOPSECRET\n");
+
+  // tracked → readable via disk fallback
+  assert.equal(store.readText(BR, "tracked.txt"), "in git\n");
+  // not committed → blocked as NotFound
+  assert.throws(() => store.readText(BR, "scratch.txt"), /Not found/);
+  assert.throws(() => store.readText(BR, "secrets/key"), /Not found/);
+
+  // .gitfsallow re-permits the ignored dir
+  fs.writeFileSync(path.join(disk, ".gitfsallow"), "secrets/\n");
+  assert.equal(store.readText(BR, "secrets/key"), "TOPSECRET\n");
+  // unlisted untracked file stays blocked
+  assert.throws(() => store.readText(BR, "scratch.txt"), /Not found/);
 });
 
 test("read-your-writes: branch blob wins over disk", () => {

@@ -1,7 +1,7 @@
 # agent.md — git-fs project layer
 
 ## What this project is
-git-fs presents each Claude Code session with a **copy-on-write overlay over the working directory**. The store is a dedicated bare git repo at `.git-fs/` (gitignored, publishable). A session works on branch `gitfs/<session-id>` that **starts empty**; a file enters the branch only when an agent writes/edits it. Reads fall back to the working tree, so any path (even gitignored) is readable/editable with no allowlist. Stop materializes only touched files back to disk. Net effect: `.git-fs` holds **pure deltas**.
+git-fs presents each Claude Code session with a **copy-on-write overlay over the working directory**. The store is a dedicated bare git repo at `.git-fs/` (gitignored, publishable). A session works on branch `gitfs/<session-id>` that **starts empty**; a file enters the branch only when an agent writes/edits it. Reads fall back to the working tree, but the fallback is gated to paths the main git already tracks — ignored/untracked content (secrets, deps, build junk) stays out of the store unless re-permitted by a `.gitfsallow` file at the repo root (gitignore-style dir/suffix/exact patterns). Stop materializes only touched files back to disk. Net effect: `.git-fs` holds **pure deltas**.
 
 ## Project law (binding — as hard as machine law)
 - **D1 — No build step.** Plain ESM `.mjs`, run directly by Node ≥20. No transpile, no bundler, no generated output dir. `bin` points straight at a `.mjs`.

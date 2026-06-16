@@ -119,10 +119,54 @@ export function readBlobFromTree(ref, p) {
   return git(["cat-file", "blob", `${ref}:${p}`]);
 }
 
+// Disk-read gate (§5): on a branch-tree miss we fall back to the working tree,
+// but only for paths the MAIN git already tracks (a git-tree membership query —
+// no .gitignore reimplementation) or that .gitfsallow explicitly re-permits.
+// Keeps ignored/untracked content (secrets, build junk, deps) out of the
+// publishable store. Blocked reads surface as plain NotFound.
+function mainGitTracks(p) {
+  try {
+    execFileSync("git", ["-C", DISK(), "ls-files", "--error-unmatch", "-z", "--", p],
+      { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function insideMainGit() {
+  try {
+    execFileSync("git", ["-C", DISK(), "rev-parse", "--is-inside-work-tree"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function loadAllow() {
+  try {
+    const txt = fs.readFileSync(path.join(DISK(), ".gitfsallow"), "utf8");
+    return txt.split("\n").map((s) => s.trim()).filter((s) => s && !s.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+export function diskReadAllowed(p) {
+  if (mainGitTracks(p)) return true;                                // in the main git tree
+  if (loadAllow().some((pat) => matchPattern(pat, p))) return true; // explicit exception
+  return !insideMainGit();                                          // no main repo → nothing to gate
+}
+
 export function readFile(ref, p) {
   try {
     return readBlobFromTree(ref, p); // tracked → branch wins (read-your-writes)
   } catch {
+    if (!diskReadAllowed(p)) {
+      const e = new Error(`Not found: ${p}`);
+      e.code = "NotFound";
+      throw e;
+    }
     try {
       return fs.readFileSync(path.join(DISK(), p)); // untouched → working tree
     } catch {
