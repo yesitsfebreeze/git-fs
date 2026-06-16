@@ -17,11 +17,14 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "node .claude/hooks/statusline.mjs",
+    "command": "node ~/.claude/hooks/machine-statusline.mjs",
     "refreshInterval": 10
   },
   "enabledPlugins": {
-    "git-fs@git-fs": true
+    "git-fs@git-fs": true,
+    "git-fs@machine": true,
+    "machine@machine": true,
+    "split@machine": true
   },
   "outputStyle": "machine",
   "effortLevel": "medium",

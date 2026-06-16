@@ -18,7 +18,7 @@ The build spec lives in the session brief ("git-fs — overlay filesystem build 
 - Store lives at `.git-fs/` (bare, gitignored, publishable). Override via `GIT_FS_REPO`.
 
 ## Commands
-- **Test / quality gate:** `node --test test/` (must pass with only Node installed — no build, no `node_modules`).
+- **Test / quality gate:** `npm test` (= `node --test`; must pass with only Node installed — no build, no `node_modules`). NB: under Node ≥24 the bare-directory form `node --test test/` errors with `MODULE_NOT_FOUND`; use `npm test` or `node --test test/store.test.mjs`.
 - **Build:** none (D1 — no build step).
 - **Run MCP:** `node bin/git-fs.mjs mcp`
 - **Run hook:** `node bin/git-fs.mjs hook <action>` (reads JSON payload on stdin)
@@ -30,4 +30,4 @@ The build spec lives in the session brief ("git-fs — overlay filesystem build 
 4. End-to-end acceptance checks (spec §12).
 
 ## Status
-Greenfield. Working dir is **not** a git repo. No source files yet — only `.claude/`, `.kern/`, `.mesh/`, `.mcp.json` and this project layer.
+Shipping — published Claude Code plugin, **v3.1.3** (`package.json` + `.claude-plugin/plugin.json` in lockstep, bumped via `just bump`/`just push`). The working dir **is** a git repo (branch `main`). All spec source exists and the suite is green (21 tests): `src/store.mjs` (core), `src/mcp.mjs`, `src/hooks.mjs`, `bin/git-fs.mjs` (single `cli | mcp | hook` entry), `test/store.test.mjs`. Recent: added `mergeLand` — a CAS-guarded recompute+land primitive (`store.mergeLand` / `git_fs_merge_land`) so concurrent landers can't drop each other's work via racy `update-ref`.

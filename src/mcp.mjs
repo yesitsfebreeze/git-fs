@@ -68,9 +68,20 @@ const TOOLS = {
     run() { return textResult(store.branchList()); },
   },
   git_fs_merge: {
-    description: "Merge two commits via git merge-tree; reports a clean commit or the conflicted paths.",
+    description: "Merge two commits via git merge-tree; reports a clean (dangling) commit or the conflicted paths. Does NOT land the result on any ref — use git_fs_merge_land for that.",
     schema: { type: "object", properties: { base: { type: "string" }, ours: { type: "string" }, theirs: { type: "string" } }, required: ["ours", "theirs"] },
     run(a) { return textResult(store.merge(a.base, a.ours, a.theirs)); },
+  },
+  git_fs_merge_land: {
+    description: "Atomically land `theirs` onto a target branch via a recompute+CAS loop — safe under concurrent landers (no racy update-ref). Returns the new commit, or the conflicted paths on a real conflict.",
+    schema: { type: "object", properties: { target: { type: "string" }, theirs: { type: "string" }, base: { type: "string" }, message: { type: "string" } }, required: ["target", "theirs"] },
+    run(a) {
+      const r = store.mergeLand(a.target, a.theirs, { base: a.base, message: a.message });
+      if (!r.clean) {
+        return { content: [{ type: "text", text: `git-fs: merge into ${a.target} CONFLICTED — not landed. Conflicted paths:\n` + r.conflicts.map((p) => `  ${p}`).join("\n") }], isError: true };
+      }
+      return textResult(`landed ${a.theirs} onto ${a.target} @ ${r.commit}${r.fastForward ? " (fast-forward)" : ""}`);
+    },
   },
   git_fs_checkout: {
     description: "Materialize the session branch's touched files to disk (scoped to its seed). Refuses to overwrite on-disk content newer than git-fs unless force:true.",

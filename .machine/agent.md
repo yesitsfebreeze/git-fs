@@ -17,13 +17,13 @@ git-fs presents each Claude Code session with a **copy-on-write overlay over the
 ## Domain idioms
 - Tree edits go through `hash-object -w` → scratch-index `read-tree`/`update-index`/`write-tree` → `commit-tree` → `update-ref`. Never `git add`/`git commit` against a real worktree.
 - `readFile(ref, path)`: branch blob wins (read-your-writes), else disk bytes, else NotFound.
-- Merges use `git merge-tree --write-tree` (git ≥2.38); parse conflict markers on failure.
+- Merges use `git merge-tree --write-tree` (git ≥2.38); parse conflict markers on failure. `merge()` returns a *dangling* commit (no ref moved); `mergeLand(target, theirs)` lands it via a bounded recompute+CAS loop — re-read the target tip, 3-way merge, `commit-tree`, then `update-ref` with the old tip as the CAS guard; recompute on contention. CAS landings stay inside the `.git-fs` store (D3: never the project's real `.git`).
 - `trailer(msg, branch)` appends `Session-Id: <id>` for `gitfs/*` branches; idempotent.
 
 ## Persona panel
 See `.machine/personas.md`. Roster: **Overlay Integrity** (correctness of seed/fallback/materialize), **Git Plumbing** (scratch-index, refs, store isolation), **Zero-Dep Purist** (D1/D2 guard), **Resilience** (degrade-to-noop, locking, concurrency).
 
 ## Build / verify
-- Test: `node --test test/`  (no build, no `node_modules`).
+- Test: `npm test`  (= `node --test`; no build, no `node_modules`). Under Node ≥24 avoid `node --test test/` (bare-dir arg → `MODULE_NOT_FOUND`).
 - MCP: `node bin/git-fs.mjs mcp`   ·   Hook: `node bin/git-fs.mjs hook <action>`
 - Acceptance: spec §12 binary checklist.

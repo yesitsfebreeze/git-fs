@@ -185,6 +185,62 @@ test("merge conflict: overlapping edits report conflicted path", () => {
   assert.deepEqual(r.conflicts, ["c.txt"]);
 });
 
+test("mergeLand: lands a clean merge onto the target ref (CAS update)", () => {
+  freshSandbox();
+  const seed = store.branchCreate("main", null);
+  store.writeFile("main", "base.txt", Buffer.from("base\n"), "base");
+  const tip = store.resolveTip("main");
+  store.branchCreate("feat", tip);
+  store.writeFile("feat", "feat.txt", Buffer.from("feature\n"), "feat");
+
+  const r = store.mergeLand("main", store.resolveTip("feat"));
+  assert.equal(r.clean, true);
+  assert.equal(store.resolveTip("main"), r.commit, "target ref advanced to the merge commit");
+  const files = store.listFiles("main", "", true);
+  assert.ok(files.includes("base.txt") && files.includes("feat.txt"), "both deltas present after landing");
+});
+
+test("mergeLand: two sequential lands both survive (recompute against new tip)", () => {
+  freshSandbox();
+  const seed = store.branchCreate("main", null);
+  store.branchCreate("a1", seed);
+  store.branchCreate("a2", seed);
+  store.writeFile("a1", "one.txt", Buffer.from("1\n"), "a1");
+  store.writeFile("a2", "two.txt", Buffer.from("2\n"), "a2");
+
+  store.mergeLand("main", store.resolveTip("a1"));
+  store.mergeLand("main", store.resolveTip("a2")); // recomputes against a1's landing
+
+  const files = store.listFiles("main", "", true);
+  assert.ok(files.includes("one.txt") && files.includes("two.txt"), "neither session's work is dropped");
+});
+
+test("mergeLand: conflict is reported and the ref is NOT moved", () => {
+  freshSandbox();
+  const seed = store.branchCreate("main", null);
+  store.writeFile("main", "c.txt", Buffer.from("base\n"), "base");
+  const tip = store.resolveTip("main");
+  store.branchCreate("feat", tip);
+  store.writeFile("main", "c.txt", Buffer.from("main edit\n"), "main edit");
+  store.writeFile("feat", "c.txt", Buffer.from("feat edit\n"), "feat edit");
+
+  const before = store.resolveTip("main");
+  const r = store.mergeLand("main", store.resolveTip("feat"));
+  assert.equal(r.clean, false);
+  assert.deepEqual(r.conflicts, ["c.txt"]);
+  assert.equal(store.resolveTip("main"), before, "ref unchanged on conflict");
+});
+
+test("mergeLand: fast-forwards into a non-existent target ref", () => {
+  freshSandbox();
+  const seed = store.branchCreate("feat", null);
+  store.writeFile("feat", "f.txt", Buffer.from("f\n"), "f");
+  const r = store.mergeLand("release", store.resolveTip("feat"));
+  assert.equal(r.clean, true);
+  assert.equal(r.fastForward, true);
+  assert.equal(store.resolveTip("release"), store.resolveTip("feat"), "target created at theirs");
+});
+
 test("non-utf8 read throws a clear error", () => {
   freshSandbox();
   store.branchCreate(BR, null);

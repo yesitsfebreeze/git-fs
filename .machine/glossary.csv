@@ -11,5 +11,6 @@ branch,trailer,"Session-Id: <id> appended to commit messages on gitfs/* branches
 ignore,hard ignore,"paths never materialized: .agent, .git-fs/, CONFLICTS.md"
 ignore,tombstone,"optional record in .git-fs/session/tombstones of an untracked disk file deleted via git_fs_rm; materialize unlinks it"
 merge,merge-tree,"git merge-tree --write-tree (git ≥2.38) used for clean merge / conflict detection"
+merge,merge-land,"mergeLand(target,theirs): atomically land theirs onto a branch via a bounded recompute+CAS loop (update-ref with old-oid); recomputes against the new tip if the ref moved. Safe under concurrent landers vs a hand-rolled update-ref"
 principle,no build step,"D1: plain ESM .mjs run by Node ≥20; no transpile/bundle/output dir"
 principle,zero deps,"D2: no runtime npm deps; shell out to the system git binary"

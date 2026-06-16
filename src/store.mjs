@@ -393,6 +393,69 @@ export function merge(base, ours, theirs) {
   return { clean: false, tree, conflicts: parseMergeConflicts(out) };
 }
 
+const ZERO_OID = "0000000000000000000000000000000000000000";
+
+function mergeBase(a, b) {
+  try { return gitText(["merge-base", a, b]).trim() || null; } catch { return null; }
+}
+
+// Compare-and-swap a branch ref: move it to `newOid` only if it currently holds
+// `expected` (null ⇒ the ref must not exist). Returns false instead of throwing
+// when the ref moved under us, so the caller can recompute and retry.
+function casUpdateRef(branch, newOid, expected) {
+  try {
+    git(["update-ref", "refs/heads/" + branch, newOid, expected || ZERO_OID]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Atomically land `theirs` onto branch `target` via a bounded recompute+CAS
+// loop — the safe alternative to a hand-rolled `update-ref` that races a
+// concurrent lander. Each attempt re-reads `target`'s current tip (`ours`),
+// 3-way-merges `theirs` against the merge-base, commits, then CAS-updates the
+// ref with the old tip as the guard. If the ref moved (another landing won the
+// race), the merge tree is stale, so we discard it and recompute against the new
+// tip — never landing a tree computed against an out-of-date target. A real
+// merge conflict returns immediately. `opts.base` overrides the auto-computed
+// merge-base; `opts.attempts` bounds the retry loop (default 50).
+export function mergeLand(target, theirs, opts = {}) {
+  const attempts = opts.attempts ?? 50;
+  const msg = opts.message || `merge ${theirs} into ${target}`;
+  return withBranchLock(target, () => {
+    for (let i = 0; i < attempts; i++) {
+      const ours = resolveTip(target);
+      // No tip yet: there is nothing to merge into, so the landing is just the
+      // creation of the ref at `theirs` (CAS-guarded against a concurrent create).
+      if (!ours) {
+        if (casUpdateRef(target, theirs, null)) {
+          return { clean: true, commit: theirs, tree: null, fastForward: true };
+        }
+        continue; // someone created it first → loop, now with a real tip
+      }
+      const base = opts.base || mergeBase(ours, theirs);
+      const args = ["merge-tree", "--write-tree"];
+      if (base) args.push("--merge-base=" + base);
+      args.push(ours, theirs);
+      let out;
+      let code = 0;
+      try {
+        out = gitText(args);
+      } catch (e) {
+        code = e.status ?? 1;
+        out = (e.stdout ? e.stdout.toString("utf8") : "");
+      }
+      const tree = (out.split("\n")[0] || "").trim();
+      if (code !== 0) return { clean: false, tree, conflicts: parseMergeConflicts(out) };
+      const commit = gitText(["commit-tree", tree, "-p", ours, "-p", theirs, "-m", msg]).trim();
+      if (casUpdateRef(target, commit, ours)) return { clean: true, tree, commit };
+      // CAS failed: `target` advanced under us; recompute against the new tip.
+    }
+    throw new Error(`mergeLand: ${target} kept moving under concurrent landings after ${attempts} attempts`);
+  });
+}
+
 // ── ignore matcher + tombstones (§8) ────────────────────────────────────────
 const HARD_IGNORE = [".agent", ".git-fs/", "CONFLICTS.md"];
 
