@@ -11,13 +11,6 @@
     "MACHINE_SETTLE_DELAY_MINUTES": "10"
   },
   "includeGitInstructions": true,
-  "permissions": {
-    "defaultMode": "bypassPermissions",
-    "deny": [
-      "Edit",
-      "Write"
-    ]
-  },
   "enableAllProjectMcpServers": false,
   "skillOverrides": {
     "trello": "off"
