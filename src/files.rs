@@ -263,11 +263,6 @@ fn current_bytes(
 		if let Some(change) = branch.store.session_change(session, &branch.rel)? {
 			return Ok(change);
 		}
-		// Trunk, not the shared disk copy: that one carries other sessions'
-		// kept files and the human's unstaged edits, which a write would integrate.
-		if let Some(bytes) = branch.store.trunk_read(&branch.rel)? {
-			return Ok(Some(bytes));
-		}
 	}
 	match fs::read(resolved) {
 		Ok(bytes) => Ok(Some(bytes)),
@@ -365,40 +360,23 @@ fn read(
 			service.mark_read(context, &resolved, Read::Absent)?;
 			return Err(format!("file not found: {}", resolved.display()));
 		}
-		None => match branch
-			.as_ref()
-			.map(|branch| branch.store.trunk_read(&branch.rel))
-			.transpose()?
-			.flatten()
-		{
-			// Trunk first, as `current_bytes` does: read and edit share one base.
-			Some(bytes) => {
-				view = "trunk";
-				bytes
-			}
-			None => {
-				let metadata = match fs::metadata(&resolved) {
-					Ok(metadata) => Some(metadata),
-					Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-					Err(e) => return Err(format!("read failed: {e}")),
-				};
-				match metadata {
-					Some(metadata) => {
-						if metadata.len() > service.config.max_file_bytes as u64 {
-							return Err(format!(
-								"file exceeds {} bytes",
-								service.config.max_file_bytes
-							));
-						}
-						fs::read(&resolved).map_err(|e| format!("read failed: {e}"))?
-					}
-					None => {
-						service.mark_read(context, &resolved, Read::Absent)?;
-						return Err(format!("file not found: {}", resolved.display()));
-					}
+		None => {
+			let metadata = match fs::metadata(&resolved) {
+				Ok(metadata) => metadata,
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+					service.mark_read(context, &resolved, Read::Absent)?;
+					return Err(format!("file not found: {}", resolved.display()));
 				}
+				Err(e) => return Err(format!("read failed: {e}")),
+			};
+			if metadata.len() > service.config.max_file_bytes as u64 {
+				return Err(format!(
+					"file exceeds {} bytes",
+					service.config.max_file_bytes
+				));
 			}
-		},
+			fs::read(&resolved).map_err(|e| format!("read failed: {e}"))?
+		}
 	};
 	if bytes.len() > service.config.max_file_bytes {
 		return Err(format!(
@@ -535,6 +513,15 @@ fn require_disk_agreement(
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
 		Err(e) => return Err(e.to_string()),
 	};
+	// Reads expose local work, but a first write must not silently adopt
+	// somebody else's uncommitted tracked edits (including deletions).
+	let trunk = branch
+		.store
+		.trunk_read(&branch.rel)?
+		.map(|bytes| version(&bytes));
+	if trunk.is_some() && disk != trunk {
+		return Err("disk differs from committed trunk; reconcile local changes before editing; capture applies only to session-owned paths".into());
+	}
 	if disk != selected {
 		return Err("disk differs from the selected revision; commit disk changes to trunk or restore disk, then reread; capture applies only to session-owned paths".into());
 	}

@@ -51,7 +51,7 @@ uploads a ZIP and SHA-256 checksum as a workflow artifact (retained for 14 days)
 Each ZIP contains the executable, license, and `install.txt`.
 
 To publish, set the package version in `Cargo.toml`, update `Cargo.lock`, and
-push a matching tag such as `v4.3.0`. The workflow rejects mismatched tags and
+push a matching tag such as `v4.3.1`. The workflow rejects mismatched tags and
 publishes a GitHub Release with all four ZIPs and `SHA256SUMS` only after every
 platform passes. Release downloads persist beyond workflow artifact retention.
 

@@ -318,12 +318,25 @@ async fn a_session_overlay_under_a_dot_directory_is_searchable() {
 }
 
 #[tokio::test]
-async fn a_session_read_of_a_path_the_worktree_deleted_answers_trunk() {
+async fn a_session_read_respects_a_worktree_deletion() {
 	let (_dir, root, service, _) = fixture(Mode::Git, true);
 	std::fs::remove_file(root.join("a.txt")).unwrap();
 	let read = tool(&service, &root, "read", json!({"path": "a.txt"})).await;
-	assert_eq!(read["error"], false, "{read}");
-	assert!(read["content"].as_str().unwrap().contains("1:one"));
+	assert_eq!(read["error"], true, "{read}");
+	assert!(read["content"].as_str().unwrap().contains("not found"));
+	let listed = tool(&service, &root, "glob", json!({"pattern":"*.txt"})).await;
+	assert_eq!(listed["error"], false, "{listed}");
+	let listed: Value = listed["content"].clone();
+	assert_eq!(listed["items"], json!([]));
+	let recreated = tool(
+		&service,
+		&root,
+		"write",
+		json!({"path":"a.txt","text":"replacement"}),
+	)
+	.await;
+	assert_eq!(recreated["error"], true, "{recreated}");
+	assert!(!root.join("a.txt").exists());
 	// A path trunk never held stays not found.
 	let read = tool(&service, &root, "read", json!({"path": "b.txt"})).await;
 	assert_eq!(read["error"], true, "{read}");
@@ -367,13 +380,13 @@ async fn a_write_under_a_submodule_names_the_submodule_and_the_way_round() {
 }
 
 #[tokio::test]
-async fn a_session_reads_and_edits_trunk_not_the_shared_disk_copy() {
+async fn a_session_reads_local_edits_without_silently_adopting_them() {
 	let (_dir, root, service, _recorded) = fixture(Mode::Git, true);
 	// Another writer's unintegrated bytes sit on disk only.
 	std::fs::write(root.join("a.txt"), "one\nstale disk row\n").unwrap();
 	let read = tool(&service, &root, "read", json!({"path":"a.txt"})).await;
 	assert!(
-		!read["content"].as_str().unwrap().contains("stale disk row"),
+		read["content"].as_str().unwrap().contains("stale disk row"),
 		"{read}"
 	);
 	let edited = tool(
@@ -431,14 +444,14 @@ async fn catchup_through_gitfs_replays_onto_trunk_and_refuses_a_conflict_by_path
 }
 
 #[tokio::test]
-async fn read_identity_exposes_trunk_disk_and_session_divergence() {
+async fn read_identity_exposes_disk_and_session_views() {
 	let (_dir, root, service, _) = fixture(Mode::Git, true);
 	std::fs::write(root.join("a.txt"), "human edit\n").unwrap();
 	let read = tool(&service, &root, "read", json!({"path":"a.txt"})).await;
-	assert_eq!(read["revision"]["view"], "trunk");
-	assert_eq!(read["revision"]["matches_disk"], false);
-	assert!(read["revision"]["commit"].as_str().unwrap().len() == 40);
-	assert!(read["content"].as_str().unwrap().contains("one"));
+	assert_eq!(read["revision"]["view"], "disk");
+	assert_eq!(read["revision"]["matches_disk"], true);
+	assert!(read["revision"].get("commit").is_none());
+	assert!(read["content"].as_str().unwrap().contains("human edit"));
 	let refused = tool(
 		&service,
 		&root,
@@ -471,7 +484,7 @@ async fn read_identity_exposes_trunk_disk_and_session_divergence() {
 		],
 	);
 	let read = tool(&service, &root, "read", json!({"path":"a.txt","raw":true})).await;
-	assert_eq!(read["revision"]["view"], "trunk");
+	assert_eq!(read["revision"]["view"], "disk");
 	assert_eq!(read["revision"]["matches_disk"], true);
 	assert_eq!(read["content"], "human edit\n");
 	let edit = tool(
@@ -488,4 +501,74 @@ async fn read_identity_exposes_trunk_disk_and_session_divergence() {
 	let read = tool(&service, &root, "read", json!({"path":"a.txt","raw":true})).await;
 	assert_eq!(read["revision"]["matches_disk"], true);
 	assert_eq!(read["content"], "two\n");
+}
+
+#[tokio::test]
+async fn fresh_session_reads_materialized_prior_session_changes() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	let edited = tool(
+		&service,
+		&root,
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"updated instructions"}),
+	)
+	.await;
+	assert_eq!(edited["error"], false, "{edited}");
+	let materialized = gitfs(&service, &root, json!({"op":"materialize"})).await;
+	assert_eq!(materialized["error"], false, "{materialized}");
+	assert_eq!(git(&root, &["show", "HEAD:a.txt"]), "one\n");
+	let context = Context {
+		session: "fresh-session".into(),
+		run: "fresh-run".into(),
+		call: "read".into(),
+		cwd: root.to_string_lossy().into_owned(),
+	};
+	let read = service
+		.dispatch(
+			"read",
+			json!({"op":"call","context":context,"input":{"path":"a.txt","raw":true}}),
+		)
+		.await;
+	assert_eq!(read["error"], false, "{read}");
+	assert_eq!(read["content"], "updated instructions\n");
+	assert_eq!(read["revision"]["view"], "disk");
+}
+
+#[tokio::test]
+async fn reads_and_searches_agree_on_staged_and_unstaged_changes() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	for staged in [false, true] {
+		std::fs::write(root.join("a.txt"), "local marker\n").unwrap();
+		std::fs::write(root.join("new.txt"), "local marker\n").unwrap();
+		if staged {
+			git(&root, &["add", "a.txt", "new.txt"]);
+		}
+		for path in ["a.txt", "new.txt"] {
+			let read = tool(&service, &root, "read", json!({"path":path,"raw":true})).await;
+			assert_eq!(read["content"], "local marker\n", "{read}");
+		}
+		for (name, input) in [
+			("grep", json!({"pattern":"local marker"})),
+			(
+				"search",
+				json!({"stages":[{"kind":"grep","pattern":"local marker"}]}),
+			),
+		] {
+			let found = tool(&service, &root, name, input).await;
+			assert_eq!(found["error"], false, "{found}");
+			let found: Value = found["content"].clone();
+			assert_eq!(found["items"].as_array().unwrap().len(), 2, "{found}");
+		}
+	}
+	std::fs::write(root.join("a.txt"), "changed after read\n").unwrap();
+	let edit = tool(
+		&service,
+		&root,
+		"edit",
+		json!({"path":"a.txt","old":"local marker","new":"overwrite"}),
+	)
+	.await;
+	assert_eq!(edit["error"], true, "{edit}");
+	assert!(edit["content"].as_str().unwrap().contains("changed since"));
 }

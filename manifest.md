@@ -425,7 +425,7 @@
     "mode": {
       "type": "string",
       "default": "git",
-      "doc": "Where write and edit publish. git: one commit per change on refs/gitfs/<session>, the worktree untouched until gitfs_materialize; reads and searches prefer the session's changes, then committed trunk, then untracked disk files. Read responses identify their revision and disk divergence. local: write the worktree directly. A workspace outside a Git repository always behaves as local."
+      "doc": "Where write and edit publish. git: one commit per change on refs/gitfs/<session>, the worktree untouched until gitfs_materialize; reads and searches prefer the session's changes, then the working directory, including uncommitted edits and deletions. Read responses identify their revision and disk divergence. local: write the worktree directly. A workspace outside a Git repository always behaves as local."
     },
     "max_read_bytes": {
       "type": "integer",

@@ -67,7 +67,7 @@ pub fn guide(session: &str, owned: usize, mode: Mode) -> String {
 		 - read, not Read, cat or sed -n: answers from the branch before the worktree and records what you read, which is what makes your next edit fresh.\n\
 		 - every tool accepts a single argument object or an items array of up to 32 argument objects. Read/search items can run concurrently (1-8); mutation items run in order and stop on error. Inspect every result and skipped item before continuing.\n\
 		 - edit and write, not Edit, Write or a heredoc: one commit each on the branch; refused when the bytes you last read are no longer current. A native Write or Edit inside the repository is blocked by the pre-tool hook with this reminder.\n\
-		 - grep, glob and search, not Grep, Glob, rg or find: see the branch, then trunk, then untracked disk files. The native ones see the disk only.\n\
+		 - grep, glob and search, not Grep, Glob, rg or find: see the branch, then the working directory, including uncommitted changes. The native ones see the disk only.\n\
 		 - gitfs_materialize before a Bash build or test run: copies owned paths to the worktree (Stop does it too). gitfs_capture pulls disk edits of owned paths back in.\n\
 		 - gitfs_ls and gitfs_diff to review, gitfs_catchup after trunk moved, integrate to commit the session onto trunk, push to publish.\n\
 		 Bash stays for builds, tests, git and everything that is not reading or writing project files.",
@@ -169,7 +169,7 @@ pub fn verdict(tool: &str, input: &Value, rel: Option<&str>, session: &str) -> V
 		},
 		"Grep" | "Glob" => match rel {
 			Some(_) => Verdict::Note(format!(
-				"git-fs {} searches the session branch, then trunk, then untracked disk files; native {tool} sees the disk only and misses unmaterialized changes.",
+				"git-fs {} searches the session branch, then the working directory, including uncommitted changes; native {tool} sees the disk only and misses unmaterialized changes.",
 				tool.to_ascii_lowercase()
 			)),
 			None => Verdict::Allow,
