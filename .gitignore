@@ -4,6 +4,8 @@
 *.log
 
 # Local agent configuration, instructions, and session state
+/.agents/
+/install/codex/
 /.claude/
 /.claude-plugin/
 /.codex/

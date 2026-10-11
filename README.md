@@ -24,33 +24,24 @@ and only changed files are copied back to your working directory.
 
 ## Install
 
-Requires [Rust](https://rustup.rs), [just](https://github.com/casey/just),
-Git and [ripgrep](https://github.com/BurntSushi/ripgrep).
+Give your agent [install.txt](install.txt). It explains how to build git-fs,
+connect any stdio MCP host, and use it without plugins or host-specific hooks.
+
+Requires [Rust](https://rustup.rs), Git and
+[ripgrep](https://github.com/BurntSushi/ripgrep).
 
 ```sh
 git clone https://github.com/yesitsfebreeze/git-fs.git
 cd git-fs
+cargo install --path . --locked
 ```
 
-**Claude Code**
-
-```sh
-just install
-```
-
-**Codex**
-
-```sh
-just install-codex
-```
-
-Start a new session after installing. In Codex, enable hooks if needed
-(`[features] hooks = true` in your Codex config), then review and trust git-fs in `/hooks`.
+Follow [install.txt](install.txt) to configure the MCP connection and persistent
+agent instructions. Host-specific configuration is kept locally and ignored by Git.
 
 ## Use it
 
-Work with your agent as usual. The plugin's hooks guide it to git-fs for reading,
-searching and editing files. Try:
+Once configured, the agent uses git-fs for reading, searching and editing files. Try:
 
 > Refactor this module, then show me the git-fs diff.
 
@@ -59,8 +50,8 @@ searching and editing files. Try:
 > Roll back the last git-fs edit.
 
 Edits stay on the session branch until **materialize** copies them to disk.
-The agent materializes before builds and tests; the Stop hook also does this
-when a turn ends. Existing disk changes are checked before anything is overwritten.
+The agent must materialize before builds and tests and before finishing work.
+Existing disk changes are checked before anything is overwritten.
 
 Materializing updates files, while **integrate** commits the reviewed session
 changes onto your working branch. **Push** publishes them to your remote.
