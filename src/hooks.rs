@@ -1,4 +1,4 @@
-//! Claude Code lifecycle hooks. `session-start` pins the session the MCP
+//! Claude Code and Codex lifecycle hooks. `session-start` pins the session the MCP
 //! server serves and hands the model a short guide to the git-fs tools;
 //! `pre-tool` steers a native file tool to its git-fs counterpart (a `Write`
 //! or `Edit` inside the repository is refused with the reason, a `Read`,
@@ -65,6 +65,7 @@ pub fn guide(session: &str, owned: usize, mode: Mode) -> String {
 	text.push_str(
 		"Use the git-fs tools (mcp__plugin_git-fs_git-fs__*) for files in this repository, not the native ones:\n\
 		 - read, not Read, cat or sed -n: answers from the branch before the worktree and records what you read, which is what makes your next edit fresh.\n\
+		 - batch independent read, glob, grep and search requests in one call for parallel execution (up to 32 requests, concurrency 1-8). Inspect every result; await the batch before dependent edits or searches.\n\
 		 - edit and write, not Edit, Write or a heredoc: one commit each on the branch; refused when the bytes you last read are no longer current. A native Write or Edit inside the repository is blocked by the pre-tool hook with this reminder.\n\
 		 - grep, glob and search, not Grep, Glob, rg or find: see the branch, then trunk, then untracked disk files. The native ones see the disk only.\n\
 		 - gitfs_materialize before a Bash build or test run: copies owned paths to the worktree (Stop does it too). gitfs_capture pulls disk edits of owned paths back in.\n\
@@ -144,7 +145,7 @@ pub fn bash_redirect(command: &str) -> Option<(&'static str, &'static str)> {
 /// the caller passes the repository itself when no path is given).
 pub fn verdict(tool: &str, input: &Value, rel: Option<&str>, session: &str) -> Verdict {
 	match tool {
-		"Write" | "Edit" | "MultiEdit" => match rel {
+		"Write" | "Edit" | "MultiEdit" | "apply_patch" => match rel {
 			Some(rel) => Verdict::Deny(format!(
 				"git-fs session {session} is on. Use the git-fs edit or write tool for {rel}, after a git-fs read of it: \
 				 that commits to refs/gitfs/{session} and refuses a stale edit; native {tool} skips the guard. \
@@ -186,13 +187,26 @@ pub fn verdict(tool: &str, input: &Value, rel: Option<&str>, session: &str) -> V
 	}
 }
 
-fn run_inner(action: &str) -> Result<(), String> {
+fn run_inner(action: &str, codex: bool) -> Result<(), String> {
 	let payload = payload();
 	let session = payload["session_id"]
 		.as_str()
 		.filter(|s| crate::provenance::valid_session(s))
 		.ok_or("no session_id in the hook payload")?
 		.to_owned();
+	// Codex's tool hook supplies the context for this exact MCP call. Never
+	// route it through the checkout-global CURRENT file: another thread can
+	// change that file while this one is still running.
+	if codex && action == "pre-tool" && crate::codex::is_own_tool(&payload) {
+		emit(
+			"PreToolUse",
+			json!({
+				"permissionDecision": "allow",
+				"updatedInput": crate::codex::routed_input(&payload, &session)?
+			}),
+		);
+		return Ok(());
+	}
 	let env = crate::env_config()?;
 	let mode = crate::service::Config::parse(env.clone())?.mode;
 	let tool = payload["tool_name"].as_str().unwrap_or("").to_owned();
@@ -217,39 +231,47 @@ fn run_inner(action: &str) -> Result<(), String> {
 	let root = store.root().to_path_buf();
 	let rel_of = |payload: &Value| -> Option<String> {
 		let path = file_path(payload)?;
-		let rel = relative(&root, &path)?;
-		(!rel.starts_with(config.directory())).then_some(rel)
+		let abs = if path.is_absolute() {
+			path
+		} else {
+			cwd.join(path)
+		};
+		let rel = relative(&root, &abs)?;
+		(!Path::new(&rel).starts_with(config.directory())).then_some(rel)
 	};
 	match action {
 		"session-start" => {
-			std::fs::write(
-				root.join(config.directory()).join("CURRENT"),
-				format!("{session}\n"),
-			)
-			.map_err(|e| format!("cannot pin the session: {e}"))?;
+			if !codex {
+				std::fs::write(
+					root.join(config.directory()).join("CURRENT"),
+					format!("{session}\n"),
+				)
+				.map_err(|e| format!("cannot pin the session: {e}"))?;
+			}
 			let owned = store.owned_paths(&session)?.len();
 			emit(
 				"SessionStart",
-				json!({"additionalContext": guide(&session, owned, mode)}),
+				json!({"additionalContext": if codex { crate::codex::guide(&session, owned, mode) } else { guide(&session, owned, mode) }}),
 			);
+		}
+		"post-edit" if codex && tool == "apply_patch" => {
+			for rel in crate::codex::patch_paths(&payload, &root, &cwd, config.directory()) {
+				mirror(&store, &session, &root, &rel)?;
+			}
 		}
 		"post-edit" => {
 			let Some(rel) = rel_of(&payload) else {
 				return Ok(());
 			};
-			let bytes = match std::fs::read(root.join(&rel)) {
-				Ok(bytes) => bytes,
-				Err(_) => return Ok(()), // gone again: nothing to mirror
-			};
-			let file_mode = store.mode_for(&session, Path::new(&rel))?;
-			if store.read(&session, Path::new(&rel))?.as_deref() == Some(bytes.as_slice()) {
-				return Ok(());
-			}
-			store.write_blob(&session, Path::new(&rel), &bytes, &file_mode)?;
-			store.note_materialized(&session, &rel)?;
+			mirror(&store, &session, &root, &rel)?;
 		}
 		"pre-tool" | "read" => {
 			let rel = match tool.as_str() {
+				"apply_patch" if codex => {
+					crate::codex::patch_paths(&payload, &root, &cwd, config.directory())
+						.into_iter()
+						.next()
+				}
 				"Grep" | "Glob" if file_path(&payload).is_none() => Some(".".to_owned()),
 				"Bash" => None,
 				_ => rel_of(&payload),
@@ -295,6 +317,24 @@ fn run_inner(action: &str) -> Result<(), String> {
 	Ok(())
 }
 
+fn mirror(
+	store: &crate::store::Store,
+	session: &str,
+	root: &Path,
+	rel: &str,
+) -> Result<(), String> {
+	let bytes = match std::fs::read(root.join(rel)) {
+		Ok(bytes) => bytes,
+		Err(_) => return Ok(()), // A deletion has no bytes to mirror.
+	};
+	let file_mode = store.mode_for(session, Path::new(rel))?;
+	if store.read(session, Path::new(rel))?.as_deref() != Some(bytes.as_slice()) {
+		store.write_blob(session, Path::new(rel), &bytes, &file_mode)?;
+		store.note_materialized(session, rel)?;
+	}
+	Ok(())
+}
+
 /// A path the session owns whose disk copy differs from the branch goes onto
 /// disk before the native Read sees it stale.
 fn materialize_stale(
@@ -328,7 +368,11 @@ fn materialize_stale(
 }
 
 pub fn run(action: &str) -> i32 {
-	if let Err(e) = run_inner(action) {
+	run_host(action, false)
+}
+
+pub fn run_host(action: &str, codex: bool) -> i32 {
+	if let Err(e) = run_inner(action, codex) {
 		note(&format!("hook {action}: {e}"));
 	}
 	0

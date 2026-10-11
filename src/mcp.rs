@@ -62,11 +62,14 @@ pub fn context(run: &str, call: u64) -> Result<Context, String> {
 	Ok(context)
 }
 
-fn tools() -> Vec<Value> {
+fn tools(codex: bool) -> Vec<Value> {
 	crate::TOOLS
 		.iter()
 		.filter_map(|tool| crate::describe(tool).ok())
-		.map(|d| {
+		.map(|mut d| {
+			if codex {
+				crate::codex::describe_context(&mut d["input_schema"]);
+			}
 			json!({
 				"name": d["name"],
 				"description": d["description"],
@@ -91,7 +94,7 @@ fn tool_result(answer: Value) -> Value {
 	json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
 
-async fn dispatch(message: Value, calls: &AtomicU64) -> Option<Value> {
+async fn dispatch(message: Value, calls: &AtomicU64, codex: bool) -> Option<Value> {
 	let id = message.get("id").cloned();
 	let method = message["method"].as_str().unwrap_or_default().to_owned();
 	let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -106,15 +109,20 @@ async fn dispatch(message: Value, calls: &AtomicU64) -> Option<Value> {
 			"serverInfo": {"name": "git-fs", "version": env!("CARGO_PKG_VERSION")},
 		})),
 		"ping" => reply(json!({})),
-		"tools/list" => reply(json!({"tools": tools()})),
+		"tools/list" => reply(json!({"tools": tools(codex)})),
 		"tools/call" => {
 			let name = params["name"].as_str().unwrap_or_default().to_owned();
-			let input = match params.get("arguments").cloned() {
+			let mut input = match params.get("arguments").cloned() {
 				Some(Value::Object(map)) => Value::Object(map),
 				_ => json!({}),
 			};
 			let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
-			let answer = match context("mcp", n) {
+			let call_context = if codex {
+				crate::codex::take_context(&mut input, n)
+			} else {
+				context("mcp", n)
+			};
+			let answer = match call_context {
 				Ok(context) => crate::call(&name, input, &context).await,
 				Err(e) => Err(e),
 			};
@@ -130,8 +138,9 @@ async fn dispatch(message: Value, calls: &AtomicU64) -> Option<Value> {
 
 /// Serve until stdin closes. Requests run one at a time, in arrival order:
 /// a client that sends a read and then an edit gets the read registered
-/// before the edit is judged, and parallel tool calls serialize here.
-pub fn serve() -> i32 {
+/// before the edit is judged. Explicit `batch` calls parallelize independent
+/// reads internally; other tool calls still serialize here.
+pub fn serve(codex: bool) -> i32 {
 	let runtime = runtime();
 	if let Err(e) = crate::env_config().and_then(crate::start) {
 		eprintln!("git-fs: {e}");
@@ -187,7 +196,7 @@ pub fn serve() -> i32 {
 		let Ok(message) = serde_json::from_str::<Value>(&body) else {
 			continue;
 		};
-		if let Some(reply) = runtime.block_on(dispatch(message, &calls)) {
+		if let Some(reply) = runtime.block_on(dispatch(message, &calls, codex)) {
 			let _ = tx.send(reply);
 		}
 	}

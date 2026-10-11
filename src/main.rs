@@ -11,7 +11,10 @@ fn main() {
 	}
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	let code = match args.first().map(String::as_str) {
-		Some("mcp") => gitfs::mcp::serve(),
+		Some("mcp") => gitfs::mcp::serve(args.get(1).is_some_and(|host| host == "codex")),
+		Some("hook-codex") => {
+			gitfs::hooks::run_host(args.get(1).map(String::as_str).unwrap_or(""), true)
+		}
 		Some("hook") => gitfs::hooks::run(args.get(1).map(String::as_str).unwrap_or("")),
 		Some("call") => call(
 			args.get(1).map(String::as_str),
@@ -24,7 +27,7 @@ fn main() {
 			0
 		}
 		_ => {
-			eprintln!("usage: git-fs mcp | hook <session-start|pre-tool|post-edit|stop> | call <tool> [json] | tools");
+			eprintln!("usage: git-fs mcp [codex] | hook[-codex] <session-start|pre-tool|post-edit|stop> | call <tool> [json] | tools");
 			2
 		}
 	};
