@@ -1,0 +1,165 @@
+git-fs: installation and integration instructions for any agent
+
+Give this file to the agent that will install git-fs. Adapt the configuration
+to that agent's host; no plugin, marketplace, skill, or vendor-specific hook
+is required. The host needs to launch a persistent stdio MCP server and expose
+its tools to the agent. A host without MCP support needs an MCP client adapter.
+
+WHY INTEGRATE IT
+
+git-fs gives an agent a Git session branch for file work. Each write or edit
+is a commit on refs/gitfs/<session>. Reads and searches see that session's
+changes before the worktree. Edits to existing files require a prior git-fs
+read and refuse stale bytes, helping prevent accidental overwrites.
+
+Changes stay on the session branch until explicitly materialized to disk.
+The agent can inspect its diff, undo session changes, and decide when builds
+and tests should see them. Integration into the project's branch and pushing
+are separate operations. Session branches do not isolate running builds:
+agents sharing a worktree still share the materialized files. Use separate
+checkouts when independent builds or concurrent disk changes are needed.
+
+INSTALL THE BINARY
+
+1. Check prerequisites:
+   - Rust and Cargo, with Rust 1.89 or newer, to build from source.
+   - Git and ripgrep (the rg executable) available to the server at runtime.
+   - A Git repository with an initial commit for branch-backed operation.
+
+2. Obtain and install the source using a shell:
+
+   git clone https://github.com/yesitsfebreeze/git-fs.git
+   cd git-fs
+   cargo install --path . --locked
+
+   If the source is already available, run the cargo install command from
+   that checkout. This builds for the local machine and installs git-fs into
+   Cargo's bin directory (normally ~/.cargo/bin). Resolve its absolute path
+   for the host configuration. No just command or plugin installer is needed.
+
+3. Verify that the executable runs:
+
+   git-fs tools
+
+   This lists tool names. It does not start the MCP connection.
+
+CONNECT THE AGENT
+
+Register a stdio MCP server with these launch settings:
+
+   command: /absolute/path/to/git-fs
+   arguments: ["mcp"]
+   environment:
+     GIT_FS_DISK: /absolute/path/to/the/project
+     GIT_FS_SESSION: a-unique-session-id
+
+A common JSON configuration shape is shown below. Translate it to the host's
+actual configuration format and location; the outer keys are not universal.
+
+{
+  "mcpServers": {
+    "git-fs": {
+      "command": "/absolute/path/to/git-fs",
+      "args": ["mcp"],
+      "env": {
+        "GIT_FS_DISK": "/absolute/path/to/the/project",
+        "GIT_FS_SESSION": "replace-with-a-unique-session-id"
+      }
+    }
+  }
+}
+
+Use real absolute paths, not a literal tilde or an assumed shell expansion.
+Choose a unique ID for each independent agent session, such as a UUID. Keep
+the ID when resuming that same work. Launch one persistent server per workspace
+and session, and keep its connection alive across reads and edits. If the host
+uses static configuration, update the ID before starting independent work;
+do not let every agent reuse the example value.
+
+Set both environment variables explicitly. Otherwise the workspace defaults
+to the server's launch directory, and the session falls back to a shared
+.git-fs/CURRENT marker or "main". Those defaults can mix independent sessions.
+
+Reconnect or restart the host's MCP connection after changing the launch
+settings. Discover tools with MCP tools/list and use the schemas it returns.
+Hosts may prefix tool names; use the names exposed by that host.
+
+For a custom host, launch the same process with pipes, perform the MCP
+initialize handshake, send notifications/initialized, then use tools/list and
+tools/call over the persistent connection. The server accepts newline-delimited
+JSON-RPC on stdin and returns JSON-RPC on stdout. Surface tool errors and
+revision information to the agent.
+
+Do not implement read/edit workflows by repeatedly invoking "git-fs call".
+Each invocation is a new process; a read in one does not establish freshness
+for an edit in another. The persistent MCP connection retains that state.
+
+ADD THESE WORKFLOW INSTRUCTIONS TO THE AGENT
+
+Put the following instructions in the host's persistent agent instructions
+or equivalent system configuration, so they are present in every session:
+
+  Use git-fs for repository text files:
+  - read to inspect files; glob, grep, and search to discover content.
+  - Read an existing file before changing it. Use edit for exact replacements
+    and write for new files or whole-file replacements.
+  - Use paths relative to the configured workspace. For large files, read
+    bounded ranges or search for the relevant text.
+  - If an edit is refused as stale, read again and reassess the change.
+  - Native file tools and shell searches see disk, not unpublished session
+    changes. Route repository reads and writes through git-fs.
+  - Before builds, tests, formatters, or other commands that need the edited
+    files on disk, call gitfs_materialize and check that it succeeded.
+  - After a formatter or another external tool changes owned files on disk,
+    call gitfs_capture before continuing branch-based work. Capture only
+    imports paths already owned by the session; create new source files
+    through write.
+  - Inspect gitfs_ls and gitfs_diff to review the session. Use gitfs_rollback
+    to undo a session commit or restore a path when appropriate.
+  - If the project's branch moved, use gitfs_catchup and resolve any reported
+    conflicts before continuing.
+  - Before ending work, call gitfs_materialize and report any refused paths.
+    Do not force an overwrite merely to make an error disappear.
+  - Materialization makes files available on disk; it does not integrate or
+    push them. Use integrate and push only within the user's authorized
+    scope, following their preview/revision workflow and returned schemas.
+
+Without host hooks, these are agent workflow instructions, not enforcement
+against native tools or shell writes. If the host supports tool routing,
+route repository file operations to git-fs there as well. The host should
+materialize before closing the server on normal session completion and report
+failures. If it cannot do that automatically, the agent must do it explicitly.
+Closing the MCP process alone does not materialize changes.
+
+VERIFY THE INTEGRATION
+
+Use a disposable Git repository with an initial commit and its own session ID.
+Through the connected MCP tools:
+
+1. Call gitfs_ls with {} and confirm the intended session.
+2. Create a scratch file with write:
+   {"path":"git-fs-smoke.txt","text":"before\n"}
+3. Read it with read:
+   {"path":"git-fs-smoke.txt"}
+4. Change it with edit:
+   {"path":"git-fs-smoke.txt","old":"before","new":"after"}
+5. Read it again and confirm "after". Inspect gitfs_diff.
+6. Confirm the scratch file is absent from disk before materialization.
+7. Call gitfs_materialize with {} and confirm disk now contains "after".
+
+Keep read and edit on the same connection. Check isError and the returned
+content for every call. Run this smoke check in the disposable repository,
+not in a user's active project.
+
+OPERATING NOTES
+
+The default Git mode stores session refs in the project's .git and session
+metadata in .git-fs/, which is added to .git/info/exclude. Outside a Git
+repository, git-fs operates in local mode and writes directly to disk.
+GIT_FS_CONFIG can override defaults with a JSON object; do not set
+{"mode":"local"} if session branch isolation is the intended behavior.
+
+For configuration defaults and operation contracts, consult manifest.md in
+the source checkout. The running server's tool schemas are the reference for
+call arguments. This installation does not require host-specific packages;
+existing plugin integrations are optional automation around this workflow.

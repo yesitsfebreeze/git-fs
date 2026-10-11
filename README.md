@@ -45,6 +45,10 @@ records and the materialize ledger).
 
 ## Install
 
+For an agent-neutral installation, give your agent [install.txt](install.txt).
+It covers building the binary, connecting any stdio MCP host, and the agent
+workflow needed without plugins or host-specific hooks.
+
 Needs `cargo` to build and `git` and `rg` (ripgrep) at runtime.
 
 ```sh
