@@ -7,13 +7,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7C3AED)](https://modelcontextprotocol.io)
-[![Claude Code](https://img.shields.io/badge/Claude_Code-D97757)](#install)
-[![Codex](https://img.shields.io/badge/Codex-000000)](#install)
 [![Stars](https://img.shields.io/github/stars/yesitsfebreeze/git-fs?style=social)](https://github.com/yesitsfebreeze/git-fs/stargazers)
 
 </div>
 
-An agent's edits belong on its own branch. git-fs gives Claude Code and Codex a
+An agent's edits belong on its own branch. git-fs gives any MCP-capable agent a
 Git-backed file layer: every edit is a commit, reads see the agent's changes,
 and only changed files are copied back to your working directory.
 
