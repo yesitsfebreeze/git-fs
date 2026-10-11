@@ -1,40 +1,27 @@
-# git-fs — release helpers
-# Run `just` with no args to list recipes.
+# git-fs: Rust, one binary. `just build` is what the plugin needs.
 
-set shell := ["bash", "-uc"]
+# Release build into bin/git-fs (the path plugin.json and hooks.json call).
+build:
+	env -u CARGO_TARGET_DIR cargo build --release --locked
+	mkdir -p bin
+	cp target/release/git-fs bin/git-fs.new && mv bin/git-fs.new bin/git-fs
 
-plugin := ".claude-plugin/plugin.json"
-package := "package.json"
+# Debug build into bin/, for quick iteration.
+build-debug:
+	env -u CARGO_TARGET_DIR cargo build --locked
+	mkdir -p bin
+	cp target/debug/git-fs bin/git-fs.new && mv bin/git-fs.new bin/git-fs
 
-# Default: show available recipes.
-default:
-    @just --list
+test:
+	env -u CARGO_TARGET_DIR cargo test --locked
 
-# Bump every version field by 0.0.1 (patch), with odometer turnover at 10
-# (x.x.9 -> x.(x+1).0, x.9.9 -> (x+1).0.0). Prints "OLD -> NEW".
-bump:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cur=$(grep -m1 '"version"' "{{plugin}}" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-    IFS=. read -r major minor patch <<< "$cur"
-    patch=$((patch + 1))
-    if (( patch >= 10 )); then patch=0; minor=$((minor + 1)); fi
-    if (( minor >= 10 )); then minor=0; major=$((major + 1)); fi
-    new="${major}.${minor}.${patch}"
-    # Replace the exact current version string in both manifests (keeps the
-    # plugin + package entries in lockstep).
-    sed -i "s/\"version\"\([[:space:]]*\):\([[:space:]]*\)\"${cur}\"/\"version\"\1:\2\"${new}\"/g" "{{plugin}}" "{{package}}"
-    node -e 'JSON.parse(require("fs").readFileSync("{{plugin}}"));JSON.parse(require("fs").readFileSync("{{package}}"))'
-    echo "${cur} -> ${new}"
+check:
+	env -u CARGO_TARGET_DIR cargo fmt --all -- --check
+	env -u CARGO_TARGET_DIR cargo clippy --all-targets --locked -- -D warnings
+	env -u CARGO_TARGET_DIR cargo test --locked
 
-# Bump versions, commit everything, and push to the current branch.
-push message="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    line=$(just bump)
-    new="${line##*-> }"
-    msg="${message:-chore(release): v${new}}"
-    git add -A
-    git commit -q -m "$msg" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-    git push origin "$(git rev-parse --abbrev-ref HEAD)"
-    echo "pushed v${new}"
+# Register this checkout as a marketplace and install the plugin into the
+# current Claude account ($CLAUDE_CONFIG_DIR).
+install: build
+	claude plugin marketplace add {{justfile_directory()}} 2>/dev/null || claude plugin marketplace update git-fs
+	claude plugin install git-fs@git-fs --scope user

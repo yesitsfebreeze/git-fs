@@ -1,28 +1,21 @@
 {
 	"$schema": "https://code.claude.com/schemas/plugin.json",
 	"name": "git-fs",
-	"version": "3.1.4",
-	"description": "Copy-on-write overlay filesystem over the working directory, backed by a dedicated bare git store. Each session edits on its own branch; only touched files become deltas; Stop materializes them to disk.",
+	"version": "4.0.0",
+	"description": "Git session branches for AI agents. Every write and edit through the git-fs tools is one commit on refs/gitfs/<session>; reads, globs and greps see the branch before the worktree; writes are refused unless the bytes last read are still current; materialize copies owned paths to disk with overwrite guards; catchup rebases onto moved trunk; integrate, push, undo and scan publish with review. Native Write/Edit are mirrored onto the branch by hooks; Stop materializes.",
 	"author": {
-		"name": "febreeze",
+		"name": "Stefan Hoevelmanns",
 		"url": "https://github.com/yesitsfebreeze"
 	},
 	"license": "MIT",
 	"homepage": "https://github.com/yesitsfebreeze/git-fs#readme",
 	"repository": "https://github.com/yesitsfebreeze/git-fs",
-	"keywords": [
-		"git",
-		"filesystem",
-		"mcp",
-		"multi-agent",
-		"branching",
-		"merge"
-	],
+	"keywords": ["git", "filesystem", "mcp", "multi-agent", "branching", "rust"],
 	"mcpServers": {
 		"git-fs": {
-			"command": "node",
-			"args": ["${CLAUDE_PLUGIN_ROOT}/bin/git-fs.mjs", "mcp"],
-			"description": "git-fs MCP server"
+			"command": "${CLAUDE_PLUGIN_ROOT}/bin/git-fs",
+			"args": ["mcp"],
+			"description": "git-fs tools: read, write, edit, glob, grep, search, gitfs_*, integrate, push, undo, scan"
 		}
 	}
 }

@@ -1,121 +1,106 @@
-<div align="center">
+# git-fs
 
-# 🗂️ git-fs
+**Git session branches for AI agents.** One Rust binary, one MCP server, four
+Claude Code hooks. Every write an agent makes is a commit on its own branch
+`refs/gitfs/<session>`; the worktree changes only when a materialize says so.
 
-**git worktrees for AI agents — invisible, disposable, and dependency-free.**
+v4 is the kern `fs` extension pulled out of [kern](https://github.com/yesitsfebreeze/kern)
+and unified with the v3 hooks. It replaces the Node implementation.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A520-339933?logo=node.js&logoColor=white)](https://nodejs.org)
-[![Zero deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)](package.json)
-[![No build](https://img.shields.io/badge/build%20step-none-brightgreen)](package.json)
-[![MCP](https://img.shields.io/badge/MCP-server-7C3AED)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-3.0.2-informational)](package.json)
-[![Stars](https://img.shields.io/github/stars/yesitsfebreeze/git-fs?style=social)](https://github.com/yesitsfebreeze/git-fs/stargazers)
+## What you get
 
-</div>
+- **Guarded writes.** `write` and `edit` are refused unless the bytes the
+  session last read are still current. A whole-file read of more than 350 lines
+  is refused; read a range or grep. `edit` replaces one exact unique match, all
+  matches with `all`, or an `edits` array in one all-or-nothing commit.
+- **Branch-first reads and search.** `read`, `glob`, `grep` and `search`
+  (typed ripgrep stages with cursors) see the session's changes before the
+  worktree, so an agent searches what it wrote without materializing.
+- **The session branch.** `gitfs_ls`, `gitfs_diff`, `gitfs_rollback` (one
+  commit, or one path back to session start), `gitfs_catchup` (rebase onto
+  moved trunk after checking which owned paths trunk changed under you),
+  `gitfs_materialize` (copy owned paths to disk, refusing files newer on disk or
+  modified since the last materialize, `force` to override), `gitfs_capture`
+  (pull disk edits of owned paths back in).
+- **Publication.** `integrate` previews and commits the session onto trunk
+  with a secret scan, `push` runs a guarded push with `operation_id`
+  idempotency and a private pre-push hook, `undo` reverts the last integrated
+  change, `scan` checks files for secrets.
+- **Native tools covered by hooks.** A Claude `Write` or `Edit` is mirrored
+  onto the branch (`post-edit`); a `Read` of a path the branch changed gets that
+  path onto disk first (`read`); `Stop` materializes every owned path and
+  reports what it left alone. `SessionStart` pins the session the MCP server
+  serves.
 
----
+Nothing touches your project's `.git` except `refs/gitfs/*`, and `.git/info/exclude`
+gets one line for the store directory `.git-fs/` (session indexes, read
+records and the materialize ledger).
 
-A copy-on-write overlay over your working directory, backed by a dedicated bare
-git store. Agents edit inside the overlay; nothing touches your real files until
-you accept it — and even then, only the files they actually changed.
+## Install
 
-Plain ESM `.mjs`, Node ≥20. **No build step. Zero runtime npm dependencies** —
-every object/ref/tree/merge op shells out to the system `git` binary.
+Needs `cargo` to build and `git` and `rg` (ripgrep) at runtime.
 
-## Why
-
-Letting an agent loose on a repo usually means trusting it not to scribble
-everywhere. git-fs removes the trust: edits land in a per-session git branch, you
-see exactly what changed, and you merge it in — or throw it away — on your terms.
-
-- 🛡️ **Sandbox agents.** Edits live in an overlay branch. Your real files only
-  change on `stop`, and only the touched ones. Don't like it? Delete the branch.
-- 🌿 **Run agents in parallel.** Each session is its own branch in one shared
-  store. Fan out N agents on one checkout, then `merge` the winners — clean
-  merges auto-commit, conflicts come back as a file list.
-- 🧪 **Speculate freely.** "Try this refactor, show me the diff, toss it" —
-  without touching disk or polluting your project's git history.
-- 📂 **Edit anywhere.** Reads fall back to live disk for any path your main git
-  tracks. Ignored/untracked files (secrets, deps, build junk) are kept out of the
-  store unless you opt them in with a `.gitfsallow` file at the repo root.
-- 🧾 **Audit everything.** Every edit is a commit tagged with its `Session-Id`.
-  Per-session, per-file history of exactly what an agent did, in order.
-
-## How it works
-
+```sh
+just build                       # release build into bin/git-fs
+claude plugin marketplace add ~/dev/claude-plugins/git-fs
+claude plugin install git-fs@git-fs --scope user
 ```
 
-   agent writes ───▶  overlay branch  gitfs/<session-id>
-                      (starts EMPTY — touched files only)                   
-                                         │
-   agent reads ──▶  tracked? ──▶ YES ──▶ branch blob (read-your-writes)
-                       │
-                       └──────▶ NO  ──▶  live disk bytes (fallback)
-                                         │
-   on stop ─────────────────────────────▼─────────────────────
-                    materialize touched files ──▶  working dir
-                    (your project's .git is NEVER written)
+Or `just install`, which does all three. `just check` runs fmt, clippy and the
+136 tests.
+
+Standalone MCP config:
+
+```json
+{ "mcpServers": { "git-fs": { "command": "/path/to/git-fs", "args": ["mcp"] } } }
 ```
 
-- The store is a bare repo at `.git-fs/` (gitignored, publishable as a subrepo).
-  Your project's own `.git` is **never** written.
-- Each session works on `gitfs/<session-id>`, which **starts empty**.
-- A file enters the branch only when an agent writes/edits it (touched-only deltas).
-- **Reads fall back to the working tree** — touched paths read the branch blob
-  (read-your-writes), untouched paths read current disk bytes. Disk fallback is
-  gated to paths your **main git** already tracks; ignored/untracked content
-  (secrets, build junk, deps) stays out unless re-permitted via `.gitfsallow`.
-- **Stop materializes only touched files** back to disk.
+## Shell
 
-Three-way merges run in memory via `git merge-tree --write-tree` — no worktree,
-no checkout. git-fs never hard-fails a session: no `git` on PATH ⇒ silent no-op.
+```sh
+git-fs call read '{"path":"src/main.rs","limit":40}'
+git-fs call gitfs_ls
+git-fs call gitfs_materialize '{"paths":["src/main.rs"]}'
+git-fs tools
+```
+
+Each `call` is its own process, so a read in one call does not make the next
+call's edit fresh; the MCP server keeps that state for the whole session.
+
+## Environment
+
+| Variable | Meaning |
+| --- | --- |
+| `GIT_FS_SESSION` | The session (branch name) to serve. Default: the one `session-start` pinned in `.git-fs/CURRENT`, else `main`. |
+| `GIT_FS_DISK` | The workspace. Default: the directory the server was launched in. |
+| `GIT_FS_CONFIG` | A JSON object laid over the defaults in `manifest.md` (`mode`, read and search caps, `integrate.*`, `store_dir`). |
+| `GIT_FS_GATE_URL`, `GIT_FS_GATE_KEY` | An OpenAI-compatible endpoint `integrate` asks to review a diff when `integrate.gate_model` is set. No URL, no gate. |
+
+`mode: "local"` writes the worktree directly; a workspace outside a Git
+repository always behaves as local.
+
+## Known ceilings
+
+- Two Claude sessions in one checkout share `.git-fs/CURRENT`; the later
+  `session-start` wins for both MCP servers. Set `GIT_FS_SESSION` per server to
+  keep them apart.
+- Native `Grep`, `Glob` and `Bash` see the disk, not the branch. Call
+  `gitfs_materialize` before building or testing, or use the git-fs `grep`.
+- File granularity, no rename tracking, no symlinks, no submodule content
+  (a path inside a submodule is refused with the checkout to edit instead).
 
 ## Layout
 
-| File | Role |
+| Path | Role |
 | --- | --- |
-| `bin/git-fs.mjs` | single entry; `argv[2]` selects `mcp \| hook <action> \| <cli>` |
-| `src/store.mjs` | git wrapper + overlay primitives (the core; `readFile` is the choke point) |
-| `src/mcp.mjs` | hand-rolled stdio JSON-RPC MCP server |
-| `src/hooks.mjs` | session-start / post-edit / read / stop |
-| `test/store.test.mjs` | `node --test` |
-
-## Usage
-
-```sh
-node bin/git-fs.mjs mcp                 # run the MCP server (stdio)
-node bin/git-fs.mjs hook <action>       # session-start | post-edit | read | stop (JSON on stdin)
-node bin/git-fs.mjs ls|read|log|init    # tiny CLI over the store
-npm test                                # node --test
-```
-
-Env: `GIT_FS_REPO` (store dir, default `.git-fs`), `GIT_FS_DISK` (worktree,
-default cwd), `GIT_FS_BRANCH` (override the branch). With no override, the MCP
-server and CLI default to the branch `session-start` pinned for the active
-session (`.git-fs/CURRENT`), falling back to `main` only outside a session.
-
-As a Claude Code plugin, `.claude-plugin/plugin.json` wires the MCP server and the
-four lifecycle hooks. For a standalone MCP config, see `mcp.config.example.json`.
-
-## Good to know
-
-- File-granularity, blob+path — no rename/move tracking, no symlinks.
-- `materialize` writes branch blobs to disk, but refuses to overwrite a path
-  whose on-disk copy is newer than the blob (the commit that produced it) and
-  reports it as a conflict; pass `force` to override.
-- The write lock is a lightweight per-branch spin lock — sized for a handful of
-  concurrent agents, not a high-throughput server.
-
-## Star map
-
-[![Star History Chart](https://api.star-history.com/svg?repos=yesitsfebreeze/git-fs&type=Date)](https://star-history.com/#yesitsfebreeze/git-fs&Date)
-
-<div align="center">
-
-If git-fs saved you from an agent gone rogue, drop a ⭐ — it helps.
-
-</div>
+| `src/main.rs` | `mcp`, `hook <action>`, `call <tool> [json]`, `tools`; answers as the pre-push hook when git runs it under that name |
+| `src/mcp.rs` | stdio JSON-RPC server, requests in arrival order |
+| `src/hooks.rs` | session-start, post-edit, read, stop |
+| `src/store.rs` | the session branch over git plumbing, materialize ledger, catchup, integrate trees |
+| `src/files.rs`, `src/search.rs` | bounded reads, guarded writes and edits, ripgrep stages |
+| `src/overlay.rs`, `src/integrate.rs`, `src/push.rs` | the gitfs and integrate operations |
+| `manifest.md` | the declared configuration defaults and operation contracts |
+| `tests/unit/` | the suite, mounted by `#[path]` from each module |
 
 ## License
 
