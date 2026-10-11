@@ -46,8 +46,12 @@ claude plugin marketplace add ~/dev/claude-plugins/git-fs
 claude plugin install git-fs@git-fs --scope user
 ```
 
-Or `just install`, which does all three. `just check` runs fmt, clippy and the
-136 tests.
+Or `just install`, which does all three. A directory marketplace runs the
+plugin from this folder, so a new `bin/git-fs` takes effect at the next
+session start or `/reload-plugins`. The build tree goes to
+`~/.cache/git-fs/target`, not into the checkout, because the install also
+snapshots the whole directory. `just check` runs fmt, clippy and the 136
+tests.
 
 Standalone MCP config:
 
