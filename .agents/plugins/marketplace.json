@@ -1,0 +1,10 @@
+{
+  "name": "git-fs",
+  "interface": { "displayName": "git-fs" },
+  "plugins": [{
+    "name": "git-fs",
+    "source": { "source": "local", "path": "./" },
+    "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+    "category": "Productivity"
+  }]
+}

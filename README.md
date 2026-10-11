@@ -1,7 +1,7 @@
 # git-fs
 
-**Git session branches for AI agents.** One Rust binary, one MCP server, four
-Claude Code hook events. Every write an agent makes is a commit on its own branch
+**Git session branches for AI agents.** One Rust binary, one MCP server, native
+Claude Code and Codex hooks. Every write through git-fs is a commit on its own branch
 `refs/gitfs/<session>`; the worktree changes only when a materialize says so.
 
 v4 is the kern `fs` extension pulled out of [kern](https://github.com/yesitsfebreeze/kern)
@@ -57,8 +57,52 @@ Or `just install`, which does all three. A directory marketplace runs the
 plugin from this folder, so a new `bin/git-fs` takes effect at the next
 session start or `/reload-plugins`. The build tree goes to
 `~/.cache/git-fs/target`, not into the checkout, because the install also
-snapshots the whole directory. `just check` runs fmt, clippy and the 143
-tests.
+snapshots the whole directory. `just check` runs fmt, clippy and the Rust tests.
+
+### Codex
+
+From a clone of this repository, run:
+
+```sh
+just install-codex
+```
+
+This builds the binary, registers the local `git-fs` marketplace and installs
+`git-fs@git-fs`. Start a new Codex session and review/trust its hooks in `/hooks`.
+Enable `[features] hooks = true` in Codex config if hooks are disabled. Installation
+does not grant hook trust. Re-run the command after pulling source updates.
+
+Codex selects `.codex-plugin/plugin.json`; Claude keeps its existing manifest.
+Both hosts use the same Rust storage, freshness checks and materialization guards.
+The Codex adapter provides:
+
+- `SessionStart` guidance, including on resume and after compaction.
+- `PreToolUse` denial of `apply_patch` touching repository paths, including
+  multi-file patches, deletions and move destinations. Outside-repository patches
+  and local mode pass through. Shell reads/writes receive the same advisory
+  guidance as Claude; builds, tests and Git commands remain available.
+- `PostToolUse` capture of files from native patches that ran in local mode.
+- `Stop` and `SessionEnd` materialization of the session's owned paths, with
+  conflict protection.
+- Per-call MCP routing: the hook supplies the originating session and workspace,
+  replacing any model-supplied routing. Concurrent Codex sessions do not share
+  `CURRENT`, and the MCP process's launch directory does not select the workspace.
+  Codex reports parent session IDs for subagent hooks, so those calls share the
+  parent's git-fs branch.
+
+The Codex MCP command is `git-fs mcp codex`. It refuses calls missing hook routing
+with an actionable `/hooks` message instead of falling back to `main`. Use the
+plugin for Codex rather than registering that command as a standalone MCP server.
+The optional host tests exercise the installed Codex binary against a local,
+deterministic model fixture, without an API key or a live model request:
+
+```sh
+python3 tests/codex_host.py
+python3 tests/codex_host.py --code-mode
+```
+
+Hooks also apply to nested tool calls in Codex code mode. They are workflow
+guardrails, not a sandbox for arbitrary shell programs.
 
 Standalone MCP config:
 
@@ -110,7 +154,9 @@ a workspace outside a Git repository always behaves as local.
 | --- | --- |
 | `src/main.rs` | `mcp`, `hook <session-start|pre-tool|post-edit|stop>`, `call <tool> [json]`, `tools`; answers as the pre-push hook when git runs it under that name |
 | `src/mcp.rs` | stdio JSON-RPC server, requests in arrival order |
-| `src/hooks.rs` | session-start (guide), pre-tool (redirect, stale-read materialize), post-edit, stop |
+| `src/hooks.rs` | shared session-start (guide), pre-tool (redirect, stale-read materialize), post-edit, stop |
+| `src/codex.rs` | Codex patch targets, host guidance and per-call MCP session/workspace routing |
+| `install/codex/` | Codex hook and MCP configuration |
 | `src/store.rs` | the session branch over git plumbing, materialize ledger, catchup, integrate trees |
 | `src/files.rs`, `src/search.rs` | bounded reads, guarded writes and edits, ripgrep stages |
 | `src/overlay.rs`, `src/integrate.rs`, `src/push.rs` | the gitfs and integrate operations |

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "git-fs": {
+      "command": "./bin/git-fs",
+      "args": ["mcp", "codex"],
+      "cwd": "."
+    }
+  }
+}

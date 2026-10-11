@@ -9,6 +9,7 @@
 
 pub mod bridge;
 mod change_record;
+pub mod codex;
 mod config;
 mod files;
 pub mod hook;

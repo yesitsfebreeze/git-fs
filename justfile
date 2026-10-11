@@ -35,3 +35,8 @@ check:
 install: build
 	claude plugin marketplace add {{justfile_directory()}} 2>/dev/null || claude plugin marketplace update git-fs
 	claude plugin install git-fs@git-fs --scope user 2>/dev/null || claude plugin update git-fs@git-fs
+
+# Build and install the Codex adapter from this local marketplace.
+install-codex: build
+	codex plugin marketplace add {{quote(justfile_directory())}}
+	codex plugin add git-fs@git-fs
