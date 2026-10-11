@@ -138,8 +138,8 @@ async fn dispatch(message: Value, calls: &AtomicU64, codex: bool) -> Option<Valu
 
 /// Serve until stdin closes. Requests run one at a time, in arrival order:
 /// a client that sends a read and then an edit gets the read registered
-/// before the edit is judged. Explicit `batch` calls parallelize independent
-/// reads internally; other tool calls still serialize here.
+/// before the edit is judged. Read/search tools parallelize their own `items`
+/// internally; mutations and other tool calls still serialize here.
 pub fn serve(codex: bool) -> i32 {
 	let runtime = runtime();
 	if let Err(e) = crate::env_config().and_then(crate::start) {

@@ -75,40 +75,64 @@ Standalone MCP config:
 { "mcpServers": { "git-fs": { "command": "/path/to/git-fs", "args": ["mcp"] } } }
 ```
 
-## Parallel reads and searches
+## One or multiple items per tool
 
-Use `batch` for independent reads/searches in Claude or Codex. One MCP call
-avoids repeated host hook round trips and runs up to eight operations concurrently
-(four by default, at most 32 requests). For example:
+Every tool accepts its existing single-item arguments or an `items` array of
+1–32 argument objects for that same tool. There is no separate `batch` tool.
+
+Call `read` for either one file:
 
 ```json
-{
-  "requests": [
-    {"tool": "read", "arguments": {"path": "Cargo.toml"}},
-    {"tool": "read", "arguments": {"path": "src/main.rs", "limit": 80}},
-    {"tool": "grep", "arguments": {"pattern": "TODO", "glob": "src/**"}}
-  ],
-  "concurrency": 4
-}
+{"path": "Cargo.toml"}
 ```
 
-Results stay in request order. Each entry contains `index`, `tool`, and the
-ordinary tool `result` (`content`, `error`, and any `revision`). `failed` counts
-errors; the outer tool reports an error if any entry failed, while retaining all
-successful results. Inspect every entry instead of retrying the entire batch.
-Malformed batch envelopes, forbidden tools and child routing overrides reject
-the whole batch before it runs; ordinary tool argument/runtime errors are per-entry.
+or several:
 
-Only `read`, `glob`, `grep`, and `search` are accepted. All inherit the caller's
-session/workspace, with the existing optional peer `session` selector preserved.
-Read freshness is retained for subsequent edits in the same MCP process.
-Writes, nested batches and per-entry host routing are refused. Search refs and
-cursors must come from a completed earlier call, not another entry in the same
-batch. Results are independent views, not an atomic multi-file snapshot.
+```json
+{"items": [{"path": "Cargo.toml"}, {"path": "src/main.rs", "limit": 80}], "concurrency": 4}
+```
 
-Await a batch before dependent operations. Other MCP calls retain arrival order,
-so an edit cannot overtake the preceding batch. Sending separate MCP calls through
-`Promise.all` still serializes at the server; use `batch` for server-side concurrency.
+After reading the files, call `edit` once for several edits:
+
+```json
+{"items": [
+  {"path": "a.txt", "old": "before", "new": "after"},
+  {"path": "b.txt", "edits": [{"old": "before", "new": "after"}]}
+]}
+```
+
+Each item is one normal operation. `edit.edits` still applies several replacements
+atomically within one file; `edit.items` performs separate edit operations,
+including ordered edits to the same file. The whole call is not a transaction.
+
+`gitfs_materialize` accepts `{"paths":["a.txt","b.txt"]}` for one operation on
+several paths, or `{"items":[{"paths":["a.txt"]},{"paths":["b.txt"]}]}` for two
+ordered operations. Integration, push, rollback, capture, inspection and all other
+tools accept the same `items` form, using their usual argument objects.
+
+Results stay in item order. Each entry contains `index` and the ordinary tool
+`result` (`content`, `error`, and any `revision`). The outer content also reports
+`failed` (executed items with errors) and `skipped`. The outer MCP `isError` is
+true if an item failed. Single-item calls keep their original response shape;
+even a one-element `items` array returns the multiple-item response.
+
+`read`, `glob`, `grep` and `search` run independent items concurrently (four by
+default; `concurrency` may be 1–8). They continue after individual errors.
+Every other tool executes items sequentially and stops at the first error;
+remaining entries have `skipped: true`. Successful earlier operations remain
+applied. Inspect every result and retry only what is needed.
+
+All items inherit the caller's workspace and session. Existing read-only peer
+`session` selectors still work. Nested items, per-item routing overrides, mixing
+single-item fields with `items`, and `concurrency` on mutations are refused before
+any item executes. Ordinary argument/runtime errors belong to individual results.
+
+Read freshness is retained on the same MCP connection. Await reads before edits.
+Search refs/cursors and integration/push review revisions must come from an
+earlier completed call; there is no result substitution between items. In
+particular, a preview followed by a commit requires two calls, and a mutation
+may invalidate a later item's previously reviewed revision. All normal guards
+still apply. Multiple-item reads are independent views, not an atomic snapshot.
 
 ## Shell
 
@@ -154,7 +178,7 @@ a workspace outside a Git repository always behaves as local.
 | --- | --- |
 | `src/main.rs` | `mcp`, `hook <session-start|pre-tool|post-edit|stop>`, `call <tool> [json]`, `tools`; answers as the pre-push hook when git runs it under that name |
 | `src/mcp.rs` | stdio JSON-RPC server, requests in arrival order |
-| `src/batch.rs` | bounded parallel read/search batches, ordered results and per-entry errors |
+| `src/batch.rs` | shared per-tool items handling, bounded parallel reads, ordered mutations and per-item results |
 | `src/hooks.rs` | shared session-start (guide), pre-tool (redirect, stale-read materialize), post-edit, stop |
 | `src/codex.rs` | Codex patch targets, host guidance and per-call MCP session/workspace routing |
 | `install/codex/` | Codex hook and MCP configuration |

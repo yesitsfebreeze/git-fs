@@ -1,74 +1,104 @@
-//! Explicit independent read batches. The MCP transport remains sequential,
-//! so a following mutation cannot overtake the reads that establish freshness.
+//! Per-tool multiple-item calls. Read-only file operations may run concurrently;
+//! mutations run in order and stop after the first failure.
 use crate::service::Context;
 use futures::{stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-const MAX_REQUESTS: usize = 32;
+const MAX_ITEMS: usize = 32;
 const MAX_CONCURRENCY: usize = 8;
-const READ_TOOLS: [&str; 4] = ["read", "glob", "grep", "search"];
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Request {
-	tool: String,
-	arguments: serde_json::Map<String, Value>,
+fn parallel(tool: &str) -> bool {
+	matches!(tool, "read" | "glob" | "grep" | "search")
+}
+
+/// Keep the ordinary schema at the root for host compatibility, and describe
+/// the mutually exclusive single-item and multiple-item forms.
+pub fn describe(tool: &str, mut description: Value) -> Value {
+	let item = description["input_schema"].clone();
+	let mut properties = item["properties"].as_object().cloned().unwrap_or_default();
+	let single_keys: Vec<Value> = properties
+		.keys()
+		.map(|key| json!({"required": [key]}))
+		.collect();
+	properties.insert("items".into(), json!({
+		"type": "array", "minItems": 1, "maxItems": MAX_ITEMS, "items": item,
+		"description": "One or more argument objects for this tool. Do not mix with single-item fields or include routing context."
+	}));
+	if parallel(tool) {
+		properties.insert(
+			"concurrency".into(),
+			json!({
+				"type": "integer", "minimum": 1, "maximum": MAX_CONCURRENCY, "default": 4
+			}),
+		);
+	}
+	let mut single = item.clone();
+	let single_object = single.as_object_mut().expect("tool input schema");
+	single_object.remove("properties");
+	single_object.remove("additionalProperties");
+	single_object.insert(
+		"not".into(),
+		json!({"anyOf": [
+			{"required": ["items"]}, {"required": ["concurrency"]}
+		]}),
+	);
+	let mut multiple = json!({"required": ["items"]});
+	if !single_keys.is_empty() {
+		multiple["not"] = json!({"anyOf": single_keys});
+	}
+	description["input_schema"] = json!({
+		"type": "object", "properties": properties, "additionalProperties": false,
+		"oneOf": [single, multiple]
+	});
+	let behavior = if parallel(tool) {
+		"Items run concurrently (default 4, maximum 8); results stay in input order."
+	} else {
+		"Items run sequentially and stop on the first error; remaining items are reported as skipped."
+	};
+	description["description"] = json!(format!(
+		"{} Accepts ordinary single-item arguments or {{items: [arguments, ...]}} (1-32 items). {behavior} Each result retains its error and revision. Not atomic; completed changes are not rolled back. All items inherit the caller's workspace and session.",
+		description["description"].as_str().unwrap_or_default()
+	));
+	description
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-	requests: Vec<Request>,
-	#[serde(default = "default_concurrency")]
-	concurrency: usize,
+	items: Vec<serde_json::Map<String, Value>>,
+	concurrency: Option<usize>,
 }
 
-fn default_concurrency() -> usize {
-	4
-}
-
-pub fn describe() -> Value {
-	json!({
-		"name": "batch", "reads": true,
-		"description": "Run independent read, glob, grep or search requests concurrently in one call. Results stay in input order, each with its own error and revision. Reads establish freshness for later edits. No writes or nested batches. Search refs/cursors must come from an earlier completed call; batch entries cannot depend on each other. All entries inherit the caller's workspace and session (a read may select a peer session). Not an atomic snapshot.",
-		"input_schema": {
-			"type": "object", "additionalProperties": false, "required": ["requests"],
-			"properties": {
-				"requests": {"type": "array", "minItems": 1, "maxItems": MAX_REQUESTS,
-					"items": {"type": "object", "additionalProperties": false,
-						"required": ["tool", "arguments"], "properties": {
-							"tool": {"type": "string", "enum": READ_TOOLS},
-							"arguments": {"type": "object", "description": "Arguments of the selected tool; omit host routing/context fields."}
-						}}},
-				"concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_CONCURRENCY, "default": default_concurrency()}
-			}
-		}
-	})
-}
-
-fn parse(input: Value) -> Result<Input, String> {
-	let input: Input = serde_json::from_value(input).map_err(|e| format!("invalid batch: {e}"))?;
-	if input.requests.is_empty() || input.requests.len() > MAX_REQUESTS {
-		return Err(format!("batch requires 1..={MAX_REQUESTS} requests"));
+fn parse(tool: &str, input: Value) -> Result<Input, String> {
+	let input: Input = serde_json::from_value(input).map_err(|e| format!("invalid items: {e}"))?;
+	if input.items.is_empty() || input.items.len() > MAX_ITEMS {
+		return Err(format!("items requires 1..={MAX_ITEMS} argument objects"));
 	}
-	if !(1..=MAX_CONCURRENCY).contains(&input.concurrency) {
-		return Err(format!("batch concurrency must be 1..={MAX_CONCURRENCY}"));
-	}
-	// Validate the entire envelope before starting any child: mutations, nested
-	// batches and per-child routing must never slip through a shared hook call.
-	for (index, request) in input.requests.iter().enumerate() {
-		if !READ_TOOLS.contains(&request.tool.as_str()) {
-			return Err(format!(
-				"batch request {index}: only read, glob, grep and search are allowed"
-			));
+	if let Some(concurrency) = input.concurrency {
+		if !parallel(tool) {
+			return Err("concurrency is only supported by read, glob, grep and search".into());
 		}
-		if ["_git_fs", "context", "cwd", "run", "call"]
-			.iter()
-			.any(|key| request.arguments.contains_key(*key))
+		if !(1..=MAX_CONCURRENCY).contains(&concurrency) {
+			return Err(format!("concurrency must be 1..={MAX_CONCURRENCY}"));
+		}
+	}
+	// Reject invalid envelopes before any item can change state.
+	for (index, arguments) in input.items.iter().enumerate() {
+		if [
+			"items",
+			"concurrency",
+			"_git_fs",
+			"context",
+			"cwd",
+			"run",
+			"call",
+		]
+		.iter()
+		.any(|key| arguments.contains_key(*key))
 		{
 			return Err(format!(
-				"batch request {index}: routing context is inherited from the caller"
+				"item {index}: nested items and routing overrides are not allowed"
 			));
 		}
 	}
@@ -82,34 +112,50 @@ async fn collect<F: std::future::Future<Output = Value>>(
 	stream::iter(jobs).buffered(concurrency).collect().await
 }
 
-pub async fn run(input: Value, context: &Context) -> Result<Value, String> {
+pub async fn run(tool: &str, input: Value, context: &Context) -> Result<Value, String> {
 	context.validate()?;
-	let input = parse(input)?;
-	let jobs = input
-		.requests
-		.into_iter()
-		.enumerate()
-		.map(|(index, request)| {
-			let mut child = context.clone();
-			child.call = format!("{}:batch:{index}", context.call);
-			async move {
-				let answer = match child.validate() {
-					Ok(()) => {
-						crate::call_single(&request.tool, Value::Object(request.arguments), &child)
-							.await
-					}
-					Err(error) => Err(error),
-				}
-				.unwrap_or_else(|error| json!({"content": error, "error": true}));
-				json!({"index": index, "tool": request.tool, "result": answer})
+	let input = parse(tool, input)?;
+	// Validate every child context up front, including the bounded call ID.
+	let mut children = Vec::with_capacity(input.items.len());
+	for index in 0..input.items.len() {
+		let mut child = context.clone();
+		child.call = format!("{}:items:{index}", context.call);
+		child.validate()?;
+		children.push(child);
+	}
+	let jobs = input.items.into_iter().zip(children).enumerate().map(
+		|(index, (arguments, child))| async move {
+			let result = crate::call_single(tool, Value::Object(arguments), &child)
+				.await
+				.unwrap_or_else(crate::tool_result::failure);
+			json!({"index": index, "result": result})
+		},
+	);
+	let results = if parallel(tool) {
+		collect(jobs, input.concurrency.unwrap_or(4)).await
+	} else {
+		let mut stopped = false;
+		let mut results = Vec::new();
+		for (index, job) in jobs.enumerate() {
+			if stopped {
+				results.push(json!({"index": index, "skipped": true,
+					"result": {"error": true, "content": "skipped after an earlier item failed"}}));
+			} else {
+				let result = job.await;
+				stopped = result["result"]["error"] == true;
+				results.push(result);
 			}
-		});
-	let results = collect(jobs, input.concurrency).await;
+		}
+		results
+	};
 	let failed = results
 		.iter()
-		.filter(|r| r["result"]["error"] == true)
+		.filter(|r| r["skipped"] != true && r["result"]["error"] == true)
 		.count();
-	Ok(json!({"content": {"results": results, "failed": failed}, "error": failed > 0}))
+	let skipped = results.iter().filter(|r| r["skipped"] == true).count();
+	Ok(
+		json!({"content": {"results": results, "failed": failed, "skipped": skipped}, "error": failed > 0}),
+	)
 }
 
 #[cfg(test)]
@@ -146,22 +192,44 @@ mod tests {
 	}
 
 	#[test]
-	fn refuses_mutations_recursion_context_overrides_and_invalid_bounds() {
-		for tool in ["write", "edit", "integrate", "batch", "unknown"] {
-			assert!(parse(json!({"requests":[{"tool":tool,"arguments":{}}]})).is_err());
+	fn rejects_invalid_envelopes_before_execution() {
+		for value in [
+			json!({"items": []}),
+			json!({"items": vec![json!({}); 33]}),
+			json!({"items": [null]}),
+			json!({"items": [{"path": "a"}], "path": "b"}),
+			json!({"items": [{}], "concurrency": 0}),
+			json!({"items": [{}], "concurrency": 9}),
+		] {
+			assert!(parse("read", value).is_err());
 		}
-		for args in [json!({"_git_fs":{}}), json!({"cwd":"/elsewhere"})] {
-			assert!(parse(json!({"requests":[{"tool":"read","arguments":args}]})).is_err());
+		for key in [
+			"items",
+			"concurrency",
+			"_git_fs",
+			"context",
+			"cwd",
+			"run",
+			"call",
+		] {
+			assert!(parse("write", json!({"items": [{(key): {}}]})).is_err());
 		}
-		for concurrency in [0, 9] {
-			assert!(parse(
-				json!({"requests":[{"tool":"glob","arguments":{}}],"concurrency":concurrency})
-			)
-			.is_err());
-		}
-		for n in [0, 33] {
-			assert!(
-				parse(json!({"requests":vec![json!({"tool":"glob","arguments":{}}); n]})).is_err()
+		assert!(parse("edit", json!({"items": [{}], "concurrency": 1})).is_err());
+	}
+
+	#[test]
+	fn every_tool_describes_both_forms_and_no_batch_tool_remains() {
+		assert!(!crate::TOOLS.contains(&"batch"));
+		assert!(crate::describe("batch").is_err());
+		for tool in crate::TOOLS {
+			let description = crate::describe(tool).unwrap();
+			let schema = &description["input_schema"];
+			assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2, "{tool}");
+			assert_eq!(schema["properties"]["items"]["maxItems"], MAX_ITEMS);
+			assert_eq!(schema["properties"]["items"]["items"]["type"], "object");
+			assert_eq!(
+				schema["properties"].get("concurrency").is_some(),
+				parallel(tool)
 			);
 		}
 	}

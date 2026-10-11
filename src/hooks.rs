@@ -65,7 +65,7 @@ pub fn guide(session: &str, owned: usize, mode: Mode) -> String {
 	text.push_str(
 		"Use the git-fs tools (mcp__plugin_git-fs_git-fs__*) for files in this repository, not the native ones:\n\
 		 - read, not Read, cat or sed -n: answers from the branch before the worktree and records what you read, which is what makes your next edit fresh.\n\
-		 - batch independent read, glob, grep and search requests in one call for parallel execution (up to 32 requests, concurrency 1-8). Inspect every result; await the batch before dependent edits or searches.\n\
+		 - every tool accepts a single argument object or an items array of up to 32 argument objects. Read/search items can run concurrently (1-8); mutation items run in order and stop on error. Inspect every result and skipped item before continuing.\n\
 		 - edit and write, not Edit, Write or a heredoc: one commit each on the branch; refused when the bytes you last read are no longer current. A native Write or Edit inside the repository is blocked by the pre-tool hook with this reminder.\n\
 		 - grep, glob and search, not Grep, Glob, rg or find: see the branch, then trunk, then untracked disk files. The native ones see the disk only.\n\
 		 - gitfs_materialize before a Bash build or test run: copies owned paths to the worktree (Stop does it too). gitfs_capture pulls disk edits of owned paths back in.\n\

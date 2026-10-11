@@ -18,7 +18,7 @@ and only changed files are copied back to your working directory.
 - **Keep changes separate.** Each session works on its own branch.
 - **Prevent stale edits.** Writes check that the file still matches what the agent read.
 - **Review and undo.** Inspect a session's diff or roll back an edit.
-- **Read in parallel.** Batch independent file reads and searches in one call.
+- **One or many.** Every tool accepts one item or an `items` array. Reads and searches can run in parallel; mutations run in order.
 
 ## Install
 

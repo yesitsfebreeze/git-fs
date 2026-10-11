@@ -138,6 +138,18 @@ or equivalent system configuration, so they are present in every session:
 
   Use git-fs for repository text files:
   - read to inspect files; glob, grep, and search to discover content.
+  - Every tool accepts its usual arguments for one item, or {"items":[...]}
+    for 1-32 argument objects of that same tool. There is no batch tool.
+    Example read: {"items":[{"path":"a.txt"},{"path":"b.txt"}]}.
+    Example edit: {"items":[{"path":"a.txt","old":"before","new":"after"},
+                            {"path":"b.txt","old":"before","new":"after"}]}.
+    Read/search items run concurrently (default 4; concurrency may be 1-8).
+    Other tools run items in order, stopping after the first error. Inspect
+    results, failed and skipped; completed changes are not rolled back.
+    All items use the current workspace/session. Nested items and per-item
+    routing overrides are refused. Do not mix single-item fields with items.
+    Integration and push still require a completed preview and its revision
+    before committing; an items array does not bypass review guards.
   - Read an existing file before changing it. Use edit for exact replacements
     and write for new files or whole-file replacements.
   - Use paths relative to the configured workspace. For large files, read
