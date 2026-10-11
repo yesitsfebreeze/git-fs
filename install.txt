@@ -22,26 +22,63 @@ checkouts when independent builds or concurrent disk changes are needed.
 INSTALL THE BINARY
 
 1. Check prerequisites:
-   - Rust and Cargo, with Rust 1.89 or newer, to build from source.
    - Git and ripgrep (the rg executable) available to the server at runtime.
    - A Git repository with an initial commit for branch-backed operation.
+   - No Rust compiler or source checkout is needed for the prebuilt binary.
 
-2. Obtain and install the source using a shell:
+2. Download a ZIP and SHA256SUMS from a published release:
+   https://github.com/yesitsfebreeze/git-fs/releases/latest
+
+   Choose the archive matching the operating system and CPU (uname -s -m):
+   - macOS Apple Silicon (Darwin arm64): aarch64-apple-darwin
+   - macOS Intel (Darwin x86_64): x86_64-apple-darwin
+   - Linux ARM64 (Linux aarch64): aarch64-unknown-linux-gnu
+   - Linux Intel/AMD 64-bit (Linux x86_64): x86_64-unknown-linux-gnu
+
+   Names follow git-fs-VERSION-TARGET.zip. Linux binaries are built on
+   Ubuntu 22.04 and require glibc 2.35 or newer; Alpine/musl is not supported.
+   macOS binaries are built on macOS 15. Native Windows is not packaged;
+   use the matching Linux binary inside WSL.
+   Each ZIP contains git-fs, LICENSE and this install.txt.
+
+3. Verify the download before extracting. In the download directory, set
+   archive to the exact ZIP filename you downloaded, then run:
+
+   archive=git-fs-VERSION-TARGET.zip
+   grep -F "  $archive" SHA256SUMS > selected.sha256
+   test "$(wc -l < selected.sha256 | tr -d ' ')" = 1
+   shasum -a 256 -c selected.sha256
+   unzip "$archive" -d git-fs-install
+
+   Stop if verification fails. Replace VERSION and TARGET; do not execute
+   the example filename literally.
+
+4. Install once for use from any project, without administrator access:
+
+   mkdir -p "$HOME/.local/bin"
+   install -m 755 git-fs-install/git-fs "$HOME/.local/bin/git-fs"
+   export PATH="$HOME/.local/bin:$PATH"
+   git-fs tools
+
+   Add the PATH export to your shell profile to persist it. GUI agent hosts
+   may not inherit that PATH: configure the absolute executable path, e.g.
+   /Users/yourname/.local/bin/git-fs or /home/yourname/.local/bin/git-fs.
+   For a machine-wide install, an administrator can instead install the
+   binary in /usr/local/bin with mode 755.
+   "git-fs tools" lists tool names; it does not start the MCP connection.
+   To upgrade, repeat with a newer release and restart the MCP host.
+
+SOURCE BUILD (OPTIONAL)
+
+If a release is not yet published or your platform is not packaged, install
+Rust and Cargo (Rust 1.89 or newer) and build from source:
 
    git clone https://github.com/yesitsfebreeze/git-fs.git
    cd git-fs
    cargo install --path . --locked
 
-   If the source is already available, run the cargo install command from
-   that checkout. This builds for the local machine and installs git-fs into
-   Cargo's bin directory (normally ~/.cargo/bin). Resolve its absolute path
-   for the host configuration. No just command or plugin installer is needed.
-
-3. Verify that the executable runs:
-
-   git-fs tools
-
-   This lists tool names. It does not start the MCP connection.
+This installs git-fs into Cargo's bin directory, normally ~/.cargo/bin.
+No just command or plugin installer is needed.
 
 CONNECT THE AGENT
 

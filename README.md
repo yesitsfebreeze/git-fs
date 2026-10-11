@@ -24,20 +24,38 @@ and only changed files are copied back to your working directory.
 
 ## Install
 
-Give your agent [install.txt](install.txt). It explains how to build git-fs,
+Give your agent [install.txt](install.txt). It explains how to install git-fs,
 connect any stdio MCP host, and use it without plugins or host-specific hooks.
 
-Requires [Rust](https://rustup.rs), Git and
-[ripgrep](https://github.com/BurntSushi/ripgrep).
+Download the ZIP for your platform from [Releases](https://github.com/yesitsfebreeze/git-fs/releases):
+macOS or Linux, Intel/AMD or ARM64. Verify it against the release's
+`SHA256SUMS`, extract it, then install the binary for use from any project:
 
 ```sh
-git clone https://github.com/yesitsfebreeze/git-fs.git
-cd git-fs
-cargo install --path . --locked
+mkdir -p "$HOME/.local/bin"
+install -m 755 git-fs "$HOME/.local/bin/git-fs"
+export PATH="$HOME/.local/bin:$PATH"
+git-fs tools
 ```
 
-Follow [install.txt](install.txt) to configure the MCP connection and persistent
-agent instructions. Host-specific configuration is kept locally and ignored by Git.
+Requires Git and [ripgrep](https://github.com/BurntSushi/ripgrep) at runtime.
+No Rust compiler is needed. Linux downloads require glibc 2.35 or newer.
+See [install.txt](install.txt) for platform selection, checksum verification,
+persistent PATH setup, source builds, and MCP configuration. Until the first
+binary release is published, use its source-build instructions.
+Host-specific configuration is kept locally and ignored by Git.
+
+## Binary releases
+
+[Build binaries](.github/workflows/build.yml) tests and builds all four platforms
+on pushes to `main`, pull requests, and manual runs. Each successful build
+uploads a ZIP and SHA-256 checksum as a workflow artifact (retained for 14 days).
+Each ZIP contains the executable, license, and `install.txt`.
+
+To publish, set the package version in `Cargo.toml`, update `Cargo.lock`, and
+push a matching tag such as `v4.3.0`. The workflow rejects mismatched tags and
+publishes a GitHub Release with all four ZIPs and `SHA256SUMS` only after every
+platform passes. Release downloads persist beyond workflow artifact retention.
 
 ## Use it
 
