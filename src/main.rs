@@ -24,7 +24,7 @@ fn main() {
 			0
 		}
 		_ => {
-			eprintln!("usage: git-fs mcp | hook <session-start|post-edit|read|stop> | call <tool> [json] | tools");
+			eprintln!("usage: git-fs mcp | hook <session-start|pre-tool|post-edit|stop> | call <tool> [json] | tools");
 			2
 		}
 	};

@@ -4,7 +4,7 @@
 			{ "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/git-fs hook session-start" }] }
 		],
 		"PreToolUse": [
-			{ "matcher": "Read", "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/git-fs hook read" }] }
+			{ "matcher": "Read|Write|Edit|MultiEdit|Grep|Glob|Bash", "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/git-fs hook pre-tool" }] }
 		],
 		"PostToolUse": [
 			{ "matcher": "Write|Edit|MultiEdit", "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/git-fs hook post-edit" }] }
