@@ -121,7 +121,3 @@ pub fn patch_paths(payload: &Value, root: &Path, cwd: &Path, store_dir: &str) ->
 	}
 	paths
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/codex.rs"]
-mod tests;

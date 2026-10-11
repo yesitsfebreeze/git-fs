@@ -46,7 +46,7 @@ jobs:
         run: |
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y ripgrep
+            sudo apt-get install -y ripgrep jq zip unzip
           elif ! command -v rg >/dev/null; then
             brew install ripgrep
           fi
@@ -60,7 +60,7 @@ jobs:
       - name: Determine version and validate release tag
         id: version
         run: |
-          version="$(cargo metadata --no-deps --format-version 1 --locked | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version')"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             [[ "$GITHUB_REF_NAME" == "v$version" ]] || { echo "Tag must match Cargo.toml: v$version"; exit 1; }
           else
@@ -74,7 +74,7 @@ jobs:
       - name: Package and smoke-test ZIP
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: python3 scripts/package-release.py "$CARGO_TARGET_DIR/$TARGET/release/git-fs" "$TARGET" "$VERSION" dist
+        run: bash scripts/package-release.sh "$CARGO_TARGET_DIR/$TARGET/release/git-fs" "$TARGET" "$VERSION" dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: git-fs-${{ matrix.target }}

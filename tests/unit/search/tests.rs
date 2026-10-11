@@ -706,16 +706,15 @@ async fn active_search_cancellation_reaps_the_backend() {
 
 #[tokio::test]
 async fn a_dot_directory_is_searched_and_the_git_store_is_not() {
-	// This workspace keeps its memo record, its hooks, its tests and its
-	// harness settings under dot-directories. A search that cannot reach them
+	// This workspace keeps scripts and settings under dot-directories. A search that cannot reach them
 	// answers a false empty, which reads exactly like a true one. `.git/` is
 	// the one place still excluded: with submodules nested here its object
 	// store would outnumber every real result.
 	let (service, dir) = service(Config::default());
 	let cwd = dir.path();
 	for (path, text) in [
-		(".kern/hooks/request-assessment.ts", "the marker\n"),
-		(".claude/settings.json", "{\"marker\": true}\n"),
+		(".config/scripts/check.ts", "the marker\n"),
+		(".settings/config.json", "{\"marker\": true}\n"),
 		(".git/objects/loose", "the marker\n"),
 		("plain.txt", "nothing here\n"),
 	] {
@@ -735,11 +734,8 @@ async fn a_dot_directory_is_searched_and_the_git_store_is_not() {
 		.iter()
 		.map(|item| item.as_str().unwrap())
 		.collect();
-	assert!(
-		paths.contains(&".kern/hooks/request-assessment.ts"),
-		"{paths:?}"
-	);
-	assert!(paths.contains(&".claude/settings.json"), "{paths:?}");
+	assert!(paths.contains(&".config/scripts/check.ts"), "{paths:?}");
+	assert!(paths.contains(&".settings/config.json"), "{paths:?}");
 	assert!(
 		!paths.iter().any(|path| path.starts_with(".git/")),
 		"{paths:?}"
@@ -756,11 +752,8 @@ async fn a_dot_directory_is_searched_and_the_git_store_is_not() {
 		.iter()
 		.map(|item| item["path"].as_str().unwrap())
 		.collect();
-	assert!(
-		hits.contains(&".kern/hooks/request-assessment.ts"),
-		"{hits:?}"
-	);
-	assert!(hits.contains(&".claude/settings.json"), "{hits:?}");
+	assert!(hits.contains(&".config/scripts/check.ts"), "{hits:?}");
+	assert!(hits.contains(&".settings/config.json"), "{hits:?}");
 	assert!(
 		!hits.iter().any(|path| path.starts_with(".git/")),
 		"{hits:?}"

@@ -298,22 +298,22 @@ async fn a_session_overlay_under_a_dot_directory_is_searchable() {
 		&service,
 		&root,
 		"write",
-		json!({"path":".kern/hooks/fresh.md","text":"the overlay marker\n"}),
+		json!({"path":".config/notes/fresh.md","text":"the overlay marker\n"}),
 	)
 	.await;
 	assert_eq!(written["error"], false, "{written}");
 	// Git mode leaves the worktree alone, so only the branch has this file.
-	assert!(!root.join(".kern/hooks/fresh.md").exists());
+	assert!(!root.join(".config/notes/fresh.md").exists());
 
 	let glob = tool(&service, &root, "glob", json!({"pattern":"*.md"})).await;
 	let glob: Value = glob["content"].clone();
-	assert_eq!(glob["items"], json!([".kern/hooks/fresh.md"]));
+	assert_eq!(glob["items"], json!([".config/notes/fresh.md"]));
 
 	let grep = tool(&service, &root, "grep", json!({"pattern":"overlay marker"})).await;
 	let grep: Value = grep["content"].clone();
 	assert_eq!(
 		grep["items"],
-		json!([{"path":".kern/hooks/fresh.md","line":1,"text":"the overlay marker"}])
+		json!([{"path":".config/notes/fresh.md","line":1,"text":"the overlay marker"}])
 	);
 }
 

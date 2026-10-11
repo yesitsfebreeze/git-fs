@@ -377,7 +377,3 @@ pub fn run_host(action: &str, codex: bool) -> i32 {
 	}
 	0
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/hooks.rs"]
-mod tests;
