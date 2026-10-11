@@ -1,6 +1,0 @@
-{
-	"name": "git-fs",
-	"owner": { "name": "Stefan Hoevelmanns" },
-	"description": "git-fs: Git session branches for AI agents, from ~/dev/claude-plugins/git-fs.",
-	"plugins": [{ "name": "git-fs", "source": "./" }]
-}
