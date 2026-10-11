@@ -36,13 +36,19 @@ fn repo() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn invoke(root: &Path, args: &[&str], input: &str, local: bool) -> String {
+	invoke_config(
+		root,
+		args,
+		input,
+		if local { r#"{"mode":"local"}"# } else { "{}" },
+	)
+}
+
+fn invoke_config(root: &Path, args: &[&str], input: &str, config: &str) -> String {
 	let mut child = Command::new(env!("CARGO_BIN_EXE_git-fs"))
 		.args(args)
 		.current_dir(root)
-		.env(
-			"GIT_FS_CONFIG",
-			if local { r#"{"mode":"local"}"# } else { "{}" },
-		)
+		.env("GIT_FS_CONFIG", config)
 		.env_remove("GIT_FS_DISK")
 		.env_remove("GIT_FS_SESSION")
 		.stdin(Stdio::piped())
@@ -249,4 +255,159 @@ fn shell_guidance_and_non_repository_calls_preserve_existing_behavior() {
 	.is_null());
 	let outside = tempfile::tempdir().unwrap();
 	assert!(hook(outside.path(), "session-start", "s", "", json!({}), false).is_null());
+}
+
+#[test]
+fn batch_preserves_errors_freshness_and_session_routing() {
+	let (_temp, root) = repo();
+	let answers = mcp(
+		&root,
+		vec![
+			request(
+				&root,
+				"first",
+				"batch",
+				json!({"requests":[
+					{"tool":"read","arguments":{"path":"a.txt"}},
+					{"tool":"read","arguments":{"path":"a.txt","offset":0}},
+					{"tool":"glob","arguments":{"pattern":"*.txt"}}
+				]}),
+				1,
+			),
+			request(
+				&root,
+				"first",
+				"write",
+				json!({"path":"a.txt","text":"first\n"}),
+				2,
+			),
+			request(
+				&root,
+				"second",
+				"write",
+				json!({"path":"a.txt","text":"unauthorized\n"}),
+				3,
+			),
+			request(
+				&root,
+				"first",
+				"batch",
+				json!({"requests":[
+					{"tool":"read","arguments":{"path":"a.txt","raw":true}},
+					{"tool":"read","arguments":{"path":"a.txt","raw":true,"session":"second"}}
+				]}),
+				4,
+			),
+		],
+	);
+	let content = |i: usize| -> Value {
+		serde_json::from_str(answers[i]["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+	};
+	let first = content(0);
+	assert_eq!(first["failed"], 1, "{first}");
+	assert_eq!(first["results"][0]["result"]["error"], false);
+	assert!(!first["results"][0]["result"]["revision"].is_null());
+	assert_eq!(first["results"][1]["result"]["error"], true);
+	assert_eq!(first["results"][2]["result"]["error"], false);
+	assert_eq!(answers[0]["result"]["isError"], true);
+	assert_eq!(answers[1]["result"]["isError"], false, "{}", answers[1]);
+	assert_eq!(
+		answers[2]["result"]["isError"], true,
+		"another session cannot borrow freshness"
+	);
+	let views = content(3);
+	assert_eq!(views["failed"], 0, "{views}");
+	assert_eq!(views["results"][0]["result"]["content"], "first\n");
+	assert_eq!(views["results"][1]["result"]["content"], "base\n");
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"base\n"
+	);
+}
+
+#[test]
+fn rejected_batch_runs_no_children_and_claude_mcp_supports_batches() {
+	let (_temp, root) = repo();
+	let answers = mcp(
+		&root,
+		vec![
+			request(
+				&root,
+				"s",
+				"batch",
+				json!({"requests":[
+					{"tool":"read","arguments":{"path":"a.txt"}},
+					{"tool":"write","arguments":{"path":"b.txt","text":"bad"}}
+				]}),
+				1,
+			),
+			request(&root, "s", "write", json!({"path":"a.txt","text":"bad"}), 2),
+		],
+	);
+	assert!(answers.iter().all(|a| a["result"]["isError"] == true));
+	assert!(!root.join("b.txt").exists());
+	let output = invoke(
+		&root,
+		&["mcp"],
+		&format!(
+			"{}\n{}\n",
+			json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"batch","arguments":{"requests":[{"tool":"read","arguments":{"path":"a.txt"}}]}}}),
+			json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write","arguments":{"path":"a.txt","text":"claude\n"}}})
+		),
+		false,
+	);
+	for line in output.lines() {
+		let answer: Value = serde_json::from_str(line).unwrap();
+		assert_eq!(answer["result"]["isError"], false, "{answer}");
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_actually_overlaps_search_workers() {
+	use std::os::unix::fs::PermissionsExt;
+	let (_temp, root) = repo();
+	let script = root.join("rg-barrier");
+	// Each backend waits for a second backend to start. A sequential batch
+	// would time out and fail; no elapsed-time speed assertion is necessary.
+	std::fs::write(
+		&script,
+		r#"#!/bin/sh
+barrier="$(dirname "$0")/barrier"
+mkdir -p "$barrier"
+touch "$barrier/$$"
+i=0
+while [ "$(ls -1 "$barrier" | wc -l)" -lt 2 ]; do
+  i=$((i + 1))
+  [ "$i" -lt 100 ] || exit 99
+  sleep 0.02
+done
+exec rg "$@"
+"#,
+	)
+	.unwrap();
+	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+	let req = request(
+		&root,
+		"parallel",
+		"batch",
+		json!({"concurrency":2,"requests":[
+			{"tool":"grep","arguments":{"pattern":"base","glob":"*.txt"}},
+			{"tool":"grep","arguments":{"pattern":"base","glob":"*.txt"}}
+		]}),
+		1,
+	);
+	let output = invoke_config(
+		&root,
+		&["mcp", "codex"],
+		&format!("{req}\n"),
+		&json!({"rg_program":script}).to_string(),
+	);
+	let answer: Value = serde_json::from_str(output.trim()).unwrap();
+	assert_eq!(answer["result"]["isError"], false, "{answer}");
+	let content: Value =
+		serde_json::from_str(answer["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+	for entry in content["results"].as_array().unwrap() {
+		assert_eq!(entry["result"]["content"]["count"], 1, "{entry}");
+	}
 }

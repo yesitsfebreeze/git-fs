@@ -18,11 +18,30 @@ REQUESTS = []
 ERRORS = []
 
 
+def decoded_objects(value):
+    """Unwrap tool JSON, including the extra text envelope in code mode."""
+    if isinstance(value, str):
+        try:
+            yield from decoded_objects(json.loads(value))
+        except (ValueError, TypeError):
+            pass
+    elif isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from decoded_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from decoded_objects(child)
+
+
 def response_item(step, body):
     patch = '*** Begin Patch\n*** Update File: a.txt\n@@\n-base\n+bypass\n*** End Patch'
     actions = [
         ('apply_patch', patch),
-        ('mcp__git-fs__read', {'path': 'a.txt'}),
+        ('mcp__git-fs__batch', {'requests': [
+            {'tool': 'read', 'arguments': {'path': 'a.txt'}},
+            {'tool': 'glob', 'arguments': {'pattern': '*.txt'}},
+        ]}),
         ('mcp__git-fs__write', {'path': 'a.txt', 'text': 'overlay\n'}),
         ('exec_command', {'cmd': 'cat a.txt', 'max_output_tokens': 100}),
         ('mcp__git-fs__read', {'path': 'a.txt'}),
@@ -119,10 +138,12 @@ supports_websockets = false
             assert 'git-fs read' in history, 'Shell guidance missing'
             assert 'overlay' in history, 'MCP read/write did not execute'
             assert 'routing is missing' not in history, 'MCP context injection failed'
+            assert any(v.get('failed') == 0 and len(v.get('results', [])) == 2
+                       for v in decoded_objects(REQUESTS[-1]['input'])), 'Successful batch result missing'
             assert (workspace / 'a.txt').read_text() == 'overlay\n', 'Stop did not materialize'
             refs = run(['git', 'for-each-ref', '--format=%(refname)', 'refs/gitfs/']).stdout.splitlines()
             assert len(refs) == 1 and refs[0] != 'refs/gitfs/main', refs
-            print('PASS Codex host (' + ('code mode' if CODE_MODE else 'direct') + '): plugin startup, session guide, patch denial, MCP routing/read/write, shell guidance, Stop materialization')
+            print('PASS Codex host (' + ('code mode' if CODE_MODE else 'direct') + '): plugin startup, session guide, patch denial, MCP routing/batch/read/write, shell guidance, Stop materialization')
     finally:
         server.shutdown()
         server.server_close()

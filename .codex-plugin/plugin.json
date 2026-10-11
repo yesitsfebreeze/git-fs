@@ -1,6 +1,6 @@
 {
   "name": "git-fs",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "description": "Guarded Git session branches for Codex: branch-aware file tools, native patch interception, session guidance and automatic materialization.",
   "mcpServers": "./install/codex/mcp.json",
   "hooks": "./install/codex/hooks.json"

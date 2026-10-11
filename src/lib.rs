@@ -7,6 +7,7 @@
 //! the Claude Code lifecycle hooks (`git-fs hook <action>`), a one-shot CLI
 //! (`git-fs call <tool> <json>`), and the private pre-push hook.
 
+mod batch;
 pub mod bridge;
 mod change_record;
 pub mod codex;
@@ -36,7 +37,8 @@ use std::sync::{Arc, OnceLock};
 pub(crate) type Result<T, E = String> = std::result::Result<T, E>;
 
 /// Every tool the MCP server lists, by the name an agent calls it.
-pub const TOOLS: [&str; 16] = [
+pub const TOOLS: [&str; 17] = [
+	"batch",
 	"read",
 	"write",
 	"edit",
@@ -105,6 +107,9 @@ pub fn env_config() -> Result<Value> {
 
 /// The MCP-facing description of one tool: name, description, input schema.
 pub fn describe(tool: &str) -> Result<Value> {
+	if tool == "batch" {
+		return Ok(batch::describe());
+	}
 	if let Some((family, operation)) = dotted(tool) {
 		let event = format!("tool.{family}.{operation}");
 		let document = manifest();
@@ -150,6 +155,13 @@ fn dotted(tool: &str) -> Option<(&'static str, &'static str)> {
 /// caller names, in the workspace `cwd`. Answers `{content, error}`, with a
 /// `revision` on reads and writes.
 pub async fn call(tool: &str, input: Value, context: &service::Context) -> Result<Value> {
+	if tool == "batch" {
+		return batch::run(input, context).await;
+	}
+	call_single(tool, input, context).await
+}
+
+async fn call_single(tool: &str, input: Value, context: &service::Context) -> Result<Value> {
 	let fs = fs()?;
 	let envelope = json!({"op": "call", "input": input, "context": context});
 	if let Some((family, operation)) = dotted(tool) {
