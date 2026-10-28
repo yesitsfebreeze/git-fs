@@ -126,7 +126,10 @@ impl StoreConfig {
 	pub fn at_readonly(&self, cwd: &Path) -> Result<Store> {
 		let s = run(cwd, &["rev-parse", "--show-toplevel"], None, None)
 			.map_err(|_| "not inside a git repository".to_string())?;
-		let root = PathBuf::from(String::from_utf8_lossy(&s).trim());
+		// Git prints `/` separators on Windows; rebuild in native form.
+		let root: PathBuf = Path::new(String::from_utf8_lossy(&s).trim())
+			.components()
+			.collect();
 		if root.as_os_str().is_empty() {
 			return Err("not inside a git repository".into());
 		}
@@ -1847,7 +1850,9 @@ mod tests;
 /// The repository's git directory, absolute, for a checkout root.
 pub fn git_dir(root: &Path) -> Result<PathBuf> {
 	let out = run(root, &["rev-parse", "--absolute-git-dir"], None, None)?;
-	let dir = PathBuf::from(String::from_utf8_lossy(&out).trim());
+	let dir: PathBuf = Path::new(String::from_utf8_lossy(&out).trim())
+		.components()
+		.collect();
 	if dir.as_os_str().is_empty() {
 		return Err("git directory unknown".into());
 	}
