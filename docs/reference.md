@@ -153,10 +153,63 @@ call's edit fresh; the MCP server keeps that state for the whole session.
 | `GIT_FS_SESSION` | The session (branch name) to serve. Default: the one `session-start` pinned in `.git-fs/CURRENT`, else `main`. |
 | `GIT_FS_DISK` | The workspace. Default: the directory the server was launched in. |
 | `GIT_FS_CONFIG` | A JSON object laid over the defaults in `manifest.md` (`mode`, read and search caps, `integrate.*`, `store_dir`). |
-| `GIT_FS_GATE_URL`, `GIT_FS_GATE_KEY` | An OpenAI-compatible endpoint `integrate` asks to review a diff when `integrate.gate_model` is set. No URL, no gate. |
+| `GIT_FS_GATE_URL`, `GIT_FS_GATE_KEY` | An OpenAI-compatible endpoint `integrate` asks to review a diff when `integrate.gate_model` is set. A configured model with a missing endpoint or key blocks integration. |
 
 `mode: "local"` writes the worktree directly and turns the hook redirects off;
 a workspace outside a Git repository always behaves as local.
+
+## Repository review gate
+
+Set a command in **local Git configuration** to require an independent review
+before this repository's session changes integrate. Other repositories keep
+their existing behavior. The command is an argv array, executed directly without
+a shell; use absolute executable and script paths:
+
+```sh
+git config --local gitfs.reviewCommand '["/usr/bin/python3","/absolute/git-fs/scripts/codex-review.py","/absolute/bin/codex"]'
+git config --local gitfs.reviewTimeoutMs 300000
+```
+
+The command receives one JSON object on stdin:
+`{schema:"gitfs-review-request/v1", repo, session, base, tree, review_revision,
+diff, intent}`. It returns one JSON object on stdout:
+`{approved:boolean, summary:string, findings:[{id,severity,path,line,evidence}]}`.
+Finding IDs must be unique; paths are repository-relative and lines start at 1.
+`blocker`, `high` and `medium` findings block approval; `low` is advisory. A failed
+command, timeout, malformed response or incomplete input cannot approve a change.
+Timeout defaults to five minutes, capped at one hour; diff input is capped at
+4 MiB and each output stream at 128 KiB. The bundled Codex runner reviews an
+isolated candidate snapshot and loads review guidance from the base revision.
+
+Use the optional third argument to pin the Codex executable as part of the
+policy. The preview binds the candidate and base, repository identity, session, command
+argv, timeout and the bytes of absolute file arguments (including the executable
+and reviewer script). Fingerprints stream files up to 512 MiB each. Changing any
+of those requires another preview and review.
+Policy and candidate are rechecked before publication. Review verdicts and
+bindings stay in `.git/gitfs-review/`; no report is added to source control.
+The review is code inspection and does **not** attest that tests were executed.
+
+Every newly pushed commit must have a matching approved receipt under current
+policy. Git-fs checks before push and again in its private pre-push hook. A native
+Git pre-push hook can call `git-fs review-check <full-commit-oid> --repo <path>`
+for each outgoing commit. Native commits without integration receipts are held;
+use the session integration workflow. Initial pushes or pending older commits
+without receipts need an explicit migration plan; enabling the gate does not
+retroactively approve them. A push is limited to 256 new commits.
+
+After three held verdicts in one session, review stops for reassessment.
+Infrastructure errors do not consume rounds. After reconsidering the approach,
+start another cycle with `git-fs review-reset <session> --reason '<what changed>'
+--repo <path>`; the reason and held revisions remain in local history. Successful
+integration review clears the consecutive hold count. The gate is a local
+workflow control: a process allowed to edit `.git` or bypass hooks can change
+policy or evidence. It is not an adversarial sandbox or a replacement for remote
+branch protection.
+
+Run `just check` for the Rust policy, integration and private push-hook checks;
+run `python3 -m unittest discover -s tests -p codex_review_test.py` for the bundled
+reviewer's snapshot and response validation checks.
 
 ## Known ceilings
 

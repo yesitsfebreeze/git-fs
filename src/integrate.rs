@@ -424,7 +424,11 @@ async fn integrate(
 		return err("invalid or secret-bearing commit subject");
 	}
 	let force = input["force_secrets"].as_bool().unwrap_or(false) || cfg.force_secrets;
-	let tree = preview_tree(cfg, &review, session, &subject, force)?;
+	let command_review = crate::review::policy(store.root())?;
+	let mut tree = preview_tree(cfg, &review, session, &subject, force)?;
+	if let Some(policy) = &command_review {
+		tree["command_review"] = serde_json::to_value(policy).map_err(|e| e.to_string())?;
+	}
 	let revision = format!(
 		"{:x}",
 		Sha256::digest(serde_json::to_vec(&tree).map_err(|e| e.to_string())?)
@@ -458,6 +462,17 @@ async fn integrate(
 		.await
 		.map_err(|_| "required gate timed out; no commit published".to_string())??;
 	}
+	if let Some(policy) = &command_review {
+		crate::review::run(
+			store.root(),
+			policy,
+			&tree,
+			&revision,
+			&diff,
+			cancel.clone(),
+		)
+		.await?;
+	}
 	let store = store.clone();
 	let result_session = session.to_owned();
 	let session = session.to_owned();
@@ -469,6 +484,9 @@ async fn integrate(
 	let consumed = review.overlay.clone();
 	let message = format!("{subject}\n\n{}", receipt(&session, &revision, &consumed));
 	let (commit, worktree) = tokio::task::spawn_blocking(move || -> Result<_> {
+		if crate::review::policy(store.root())? != command_review {
+			return Err("review policy changed before publication; preview again".into());
+		}
 		let commit = store.commit_reviewed(&session, &review, &message, &name, &email, &cancel)?;
 		// The commit is on the ref; a sync that fails leaves the paths in `kept`.
 		let worktree = store

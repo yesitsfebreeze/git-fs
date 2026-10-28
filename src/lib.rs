@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod overlay;
 mod provenance;
 mod push;
+pub mod review;
 mod search;
 mod secrets;
 pub mod service;

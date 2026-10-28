@@ -20,6 +20,50 @@ fn main() {
 			args.get(1).map(String::as_str),
 			args.get(2).map(String::as_str),
 		),
+		Some("review-check") => {
+			let root = match args.as_slice() {
+				[_, _] => std::env::current_dir().ok(),
+				[_, _, option, root] if option == "--repo" => Some(root.into()),
+				_ => None,
+			};
+			match root {
+				Some(root) => match gitfs::review::check_commit(&root, &args[1]) {
+					Ok(()) => 0,
+					Err(error) => {
+						eprintln!("{error}");
+						1
+					}
+				},
+				None => {
+					eprintln!("usage: git-fs review-check <commit> [--repo <path>]");
+					2
+				}
+			}
+		}
+		Some("review-reset") => {
+			let root = match args.as_slice() {
+				[_, _, flag, _] if flag == "--reason" => std::env::current_dir().ok(),
+				[_, _, flag, _, option, root] if flag == "--reason" && option == "--repo" => {
+					Some(root.into())
+				}
+				_ => None,
+			};
+			match root {
+				Some(root) => match gitfs::review::reset_rounds(&root, &args[1], &args[3]) {
+					Ok(()) => 0,
+					Err(error) => {
+						eprintln!("{error}");
+						1
+					}
+				},
+				None => {
+					eprintln!(
+						"usage: git-fs review-reset <session> --reason <text> [--repo <path>]"
+					);
+					2
+				}
+			}
+		}
 		Some("tools") => {
 			for tool in gitfs::TOOLS {
 				println!("{tool}");
@@ -27,7 +71,7 @@ fn main() {
 			0
 		}
 		_ => {
-			eprintln!("usage: git-fs mcp [codex] | hook[-codex] <session-start|pre-tool|post-edit|stop> | call <tool> [json] | tools");
+			eprintln!("usage: git-fs mcp [codex] | hook[-codex] <session-start|pre-tool|post-edit|stop> | call <tool> [json] | review-check <commit> [--repo <path>] | review-reset <session> --reason <text> [--repo <path>] | tools");
 			2
 		}
 	};

@@ -1333,7 +1333,7 @@ impl Store {
 	}
 
 	#[cfg(unix)]
-	fn repository_identity(&self) -> Result<String> {
+	pub(crate) fn repository_identity(&self) -> Result<String> {
 		use std::os::unix::fs::MetadataExt;
 		let root = self.root.canonicalize().map_err(|e| e.to_string())?;
 		let git_dir = PathBuf::from(self.git_str(&["rev-parse", "--absolute-git-dir"])?.trim())
@@ -1357,7 +1357,7 @@ impl Store {
 		))
 	}
 	#[cfg(not(unix))]
-	fn repository_identity(&self) -> Result<String> {
+	pub(crate) fn repository_identity(&self) -> Result<String> {
 		Err("reviewed repository identity requires a supported macOS/Linux filesystem".into())
 	}
 

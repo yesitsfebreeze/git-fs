@@ -50,7 +50,17 @@ pub fn hook_entry() -> Option<i32> {
 		let old = std::env::var("GITFS_PUSH_OLD").map_err(|_| "hook old missing")?;
 		let new = std::env::var("GITFS_PUSH_NEW").map_err(|_| "hook new missing")?;
 		let reference = std::env::var("GITFS_PUSH_REF").map_err(|_| "hook ref missing")?;
-		let valid = hook_valid(&bytes, &old, &new, &reference);
+		let mut valid = hook_valid(&bytes, &old, &new, &reference);
+		if valid {
+			let root = std::env::var_os("GITFS_REVIEW_ROOT")
+				.map(PathBuf::from)
+				.or_else(|| std::env::current_dir().ok())
+				.ok_or("review repository unavailable")?;
+			if let Err(error) = crate::review::check_range(&root, &old, &new) {
+				eprintln!("{error}");
+				valid = false;
+			}
+		}
 		let path = std::env::var_os("GITFS_PUSH_RESULT").ok_or("hook result missing")?;
 		atomic_write(
 			Path::new(&path),

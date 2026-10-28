@@ -666,6 +666,14 @@ pub fn execute(
 		input
 	};
 	let (binding, url) = cx.binding(session, input, timeout_ms)?;
+	crate::review::check_range(
+		&cx.root,
+		binding
+			.expected_remote_head
+			.as_deref()
+			.unwrap_or(&"0".repeat(binding.commit.len())),
+		&binding.commit,
+	)?;
 	let revision = revision(&binding);
 	let remote = cx.remote_head(&url, &binding.reference)?;
 	if remote != binding.expected_remote_head {
@@ -757,6 +765,7 @@ pub fn execute(
 					.unwrap_or_else(|| "0".repeat(record.binding.commit.len())),
 			)
 			.env("GITFS_PUSH_REF", &record.binding.reference)
+			.env("GITFS_REVIEW_ROOT", &cx.root)
 			.env("GITFS_PUSH_RESULT", dir.join("hook-result"));
 		cx.run(command)
 	})();
