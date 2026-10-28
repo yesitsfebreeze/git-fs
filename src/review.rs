@@ -214,11 +214,13 @@ impl RoundLock {
 			.write(true)
 			.open(dir.join(format!("rounds-{key}.lock")))
 			.map_err(|_| "review lock unavailable")?;
-		#[cfg(unix)]
-		{
-			use std::os::fd::AsRawFd;
-			if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-				return Err("a review is already running for this session".into());
+		match file.try_lock() {
+			Ok(()) => {}
+			Err(std::fs::TryLockError::WouldBlock) => {
+				return Err("a review is already running for this session".into())
+			}
+			Err(std::fs::TryLockError::Error(e)) => {
+				return Err(format!("review lock unavailable: {e}"))
 			}
 		}
 		let path = dir.join(format!("rounds-{key}.json"));

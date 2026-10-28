@@ -1337,33 +1337,27 @@ impl Store {
 		Ok(self.root.join(path.trim()))
 	}
 
-	#[cfg(unix)]
 	pub(crate) fn repository_identity(&self) -> Result<String> {
-		use std::os::unix::fs::MetadataExt;
 		let root = self.root.canonicalize().map_err(|e| e.to_string())?;
 		let git_dir = PathBuf::from(self.git_str(&["rev-parse", "--absolute-git-dir"])?.trim())
 			.canonicalize()
 			.map_err(|e| e.to_string())?;
-		let root_meta = std::fs::metadata(&root).map_err(|e| e.to_string())?;
-		let git_meta = std::fs::metadata(&git_dir).map_err(|e| e.to_string())?;
+		let (root_device, root_file) = file_id(&root)?;
+		let (git_device, git_file) = file_id(&git_dir)?;
 		Ok(format!(
 			"{:x}",
 			Sha256::digest(
 				serde_json::to_vec(&json!([
 					root,
 					git_dir,
-					root_meta.dev(),
-					root_meta.ino(),
-					git_meta.dev(),
-					git_meta.ino()
+					root_device,
+					root_file,
+					git_device,
+					git_file
 				]))
 				.unwrap()
 			)
 		))
-	}
-	#[cfg(not(unix))]
-	pub(crate) fn repository_identity(&self) -> Result<String> {
-		Err("reviewed repository identity requires a supported macOS/Linux filesystem".into())
 	}
 
 	fn reviewed_tree_locked(&self, session: &str) -> Result<ReviewedTree> {
@@ -1818,6 +1812,45 @@ fn fs_mtime(path: &Path) -> Option<u64> {
 /// A pathspec that matches exactly this path, with no glob or magic.
 fn literal(rel: &Path) -> String {
 	format!(":(literal){}", printable(rel))
+}
+
+/// The (device, file) number pair naming the filesystem object behind `path`, so the reviewed
+/// repository identity changes when a path is replaced by a different directory.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Result<(u64, u64)> {
+	use std::os::unix::fs::MetadataExt;
+	let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+	Ok((meta.dev(), meta.ino()))
+}
+#[cfg(windows)]
+fn file_id(path: &Path) -> Result<(u64, u64)> {
+	use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+	use windows_sys::Win32::Storage::FileSystem::{
+		GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+	};
+	// A directory opens only with backup semantics; access 0 reads its attributes without
+	// holding any data access.
+	let file = std::fs::OpenOptions::new()
+		.access_mode(0)
+		.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+		.open(path)
+		.map_err(|e| format!("file identity unavailable for {}: {e}", path.display()))?;
+	let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+	if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+		return Err(format!(
+			"file identity unavailable for {}: {}",
+			path.display(),
+			std::io::Error::last_os_error()
+		));
+	}
+	Ok((
+		u64::from(info.dwVolumeSerialNumber),
+		(u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+	))
+}
+#[cfg(not(any(unix, windows)))]
+fn file_id(_: &Path) -> Result<(u64, u64)> {
+	Err("reviewed repository identity requires file ids (macOS, Linux or Windows)".into())
 }
 
 fn var_str(s: String) -> Result<String> {
