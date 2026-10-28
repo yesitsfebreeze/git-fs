@@ -130,12 +130,15 @@ pub(crate) fn preimage(path: &Path) -> Result<Version> {
 	if !initial.is_file() || initial.len() > cap {
 		return Err("unsafe or oversized attribution preimage".into());
 	}
-	use std::os::unix::fs::OpenOptionsExt;
-	let mut file = std::fs::OpenOptions::new()
-		.read(true)
-		.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-		.open(path)
-		.map_err(|e| e.to_string())?;
+	let mut options = std::fs::OpenOptions::new();
+	options.read(true);
+	// POSIX-only hardening: no blocking on a FIFO, no following a symlink.
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+	}
+	let mut file = options.open(path).map_err(|e| e.to_string())?;
 	let metadata = file.metadata().map_err(|e| e.to_string())?;
 	if !metadata.is_file() || metadata.len() > cap {
 		return Err("unsafe or oversized attribution preimage".into());

@@ -72,6 +72,7 @@ fn fs() -> Result<&'static Fs> {
 /// The executable a push links as the repository's private pre-push hook:
 /// this program itself, which answers as the hook when git invokes it under
 /// that name (see `hook::hook_entry`).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn hook_program() -> Result<PathBuf> {
 	std::env::current_exe().map_err(|e| format!("own executable unknown: {e}"))
 }

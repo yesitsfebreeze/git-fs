@@ -107,15 +107,14 @@ fn bounded(value: &str, cap: usize) -> bool {
 }
 fn normalized(value: &str) -> bool {
 	let path = Path::new(value);
+	// Compared as paths, component-wise: git prints `/` on Windows, native
+	// separators are `\`, and an os_str compare would reject every workspace.
+	let rebuilt: std::path::PathBuf = path.components().collect();
 	path.is_absolute()
 		&& !path
 			.components()
 			.any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-		&& path
-			.components()
-			.collect::<std::path::PathBuf>()
-			.as_os_str()
-			== path.as_os_str()
+		&& rebuilt.as_path() == path
 }
 impl Evidence {
 	pub fn validate(&self, session: &str) -> Result<(), String> {

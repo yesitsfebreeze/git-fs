@@ -105,6 +105,28 @@ fn roundtrip_and_noop() {
 }
 
 #[test]
+fn a_nested_path_roundtrip_uses_forward_slashes_in_git() {
+	let (_dir, store) = new_repo();
+	let session = "nested";
+	let rel = Path::new("src/geom.odin");
+	store
+		.write_blob(session, rel, b"package geom\n", "100644")
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		store.owned_paths(session).unwrap(),
+		vec![('A', "src/geom.odin".to_owned())]
+	);
+	let r = store.materialize(session, None, false).unwrap();
+	assert!(r.conflicts.is_empty());
+	assert_eq!(r.applied, vec!["src/geom.odin".to_owned()]);
+	assert_eq!(
+		std::fs::read_to_string(store.root().join(rel)).unwrap(),
+		"package geom\n"
+	);
+}
+
+#[test]
 fn materialize_guard() {
 	let (_dir, store) = new_repo();
 	let session = "s2";

@@ -160,8 +160,10 @@ fn trimmed_opt(s: String) -> Option<String> {
 	}
 }
 
+/// Git takes repository-relative paths with `/` separators on every platform:
+/// `git update-index --cacheinfo` rejects a `\` path as an invalid path on Windows.
 fn printable(p: &Path) -> String {
-	p.to_string_lossy().into_owned()
+	p.to_string_lossy().replace('\\', "/")
 }
 
 /// Base git command: fixed identity, hooks disabled, optional private index.
@@ -1725,6 +1727,8 @@ impl Store {
 		}
 		std::fs::write(disk, content).map_err(|e| e.to_string())?;
 		if mode == "100755" {
+			// Executable bit is POSIX-only; Windows has no equivalent to set.
+			#[cfg(unix)]
 			if let Err(e) =
 				std::fs::set_permissions(disk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
 			{

@@ -6,8 +6,11 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +21,7 @@ fn capacity() -> usize {
 fn record_limit() -> usize {
 	crate::limits::limits().push_record_bytes
 }
+#[cfg_attr(not(unix), allow(dead_code))]
 fn output_limit() -> usize {
 	crate::limits::limits().push_output_bytes
 }
@@ -732,6 +736,9 @@ pub fn execute(
 		cx.save(&dir, &record)?;
 		return Ok(record.value());
 	}
+	// On Windows the not(unix) arm returns first, leaving the Unix dispatch
+	// body unreachable; the code stays for the platforms that run it.
+	#[cfg_attr(not(unix), allow(unreachable_code))]
 	let dispatch = (|| -> Result<Output> {
 		let hooks = dir.join("hooks");
 		private_dir(&hooks)?;
