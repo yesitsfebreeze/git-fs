@@ -483,7 +483,12 @@ async fn enumerate(
 	if !raw.is_empty() && !raw.ends_with('\0') {
 		return Err("malformed rg output: expected NUL-delimited paths".into());
 	}
-	let mut lines: Vec<String> = raw.split_terminator('\0').map(str::to_owned).collect();
+	// rg prints native separators on Windows and `/` everywhere else; results,
+	// glob matching and session paths all speak `/`.
+	let mut lines: Vec<String> = raw
+		.split_terminator('\0')
+		.map(|p| p.replace('\\', "/"))
+		.collect();
 	for change in session_changes(service, context, cwd)? {
 		lines.retain(|line| line != &change.path);
 		if change.content.is_some() && glob_matches(&change.path, Some(pattern)) {
@@ -551,6 +556,9 @@ pub async fn grep_paths(
 				.strip_prefix(cwd)
 				.unwrap_or(Path::new(path))
 				.to_string_lossy()
+				// rg on Windows prints `.\a.txt`; every other result speaks
+				// `a.txt`, and a session overlay is matched against it.
+				.replace('\\', "/")
 				.trim_start_matches("./")
 				.to_string(),
 			line: line_number,
@@ -622,7 +630,10 @@ fn session_changes(
 			_ => store.read(&context.session, Path::new(&rel))?,
 		};
 		changes.push(Change {
-			path: path.to_string_lossy().into_owned(),
+			// Results, glob matching and rg's own output all speak `/`; a
+			// Windows `\` here made a session-added file unmatchable and kept
+			// the disk copy of an overlay in the list twice.
+			path: path.to_string_lossy().replace('\\', "/"),
 			content,
 		});
 	}
@@ -741,6 +752,7 @@ async fn read_bounded(
 	Ok(bytes)
 }
 
-#[cfg(test)]
+// The search tests drive fake ripgrep shell scripts.
+#[cfg(all(test, unix))]
 #[path = "../tests/unit/search/tests.rs"]
 mod tests;

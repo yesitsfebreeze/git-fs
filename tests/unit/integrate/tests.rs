@@ -131,6 +131,7 @@ fn repo() -> (tempfile::TempDir, std::path::PathBuf, Config) {
 	(dir, root, cfg)
 }
 
+#[cfg(unix)]
 fn command_policy(root: &std::path::Path, script: &str, timeout: u64) {
 	let path = root.join("reviewer.sh");
 	std::fs::write(&path, format!("#!/bin/sh\ncat >/dev/null\n{script}\n")).unwrap();
@@ -148,10 +149,12 @@ fn command_policy(root: &std::path::Path, script: &str, timeout: u64) {
 	}
 }
 
+#[cfg(unix)]
 fn passing_command() -> &'static str {
 	"printf '%s' '{\"approved\":true,\"summary\":\"No blocking findings\",\"findings\":[]}'"
 }
 
+#[cfg(unix)]
 async fn command_preview(root: &std::path::Path, cfg: &Config) -> Value {
 	let store = cfg.store.at(root).unwrap();
 	if store.tip("s1").unwrap().is_none() {
@@ -172,6 +175,7 @@ async fn command_preview(root: &std::path::Path, cfg: &Config) -> Value {
 		.clone()
 }
 
+#[cfg(unix)]
 async fn command_commit(root: &std::path::Path, cfg: &Config, preview: &Value) -> Result<Value> {
 	let result = integrate(
 		Ctx,
@@ -192,6 +196,7 @@ async fn command_commit(root: &std::path::Path, cfg: &Config, preview: &Value) -
 	}
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn command_review_passes_exact_candidate_and_requires_receipt_at_push() {
 	let (_dir, root, cfg) = repo();
@@ -237,6 +242,7 @@ async fn command_review_passes_exact_candidate_and_requires_receipt_at_push() {
 		.contains("evidence unavailable"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn command_review_blocks_timeout_failure_malformed_and_inconsistent_approval() {
 	for (script, expected, timeout) in [
@@ -259,6 +265,7 @@ async fn command_review_blocks_timeout_failure_malformed_and_inconsistent_approv
 	}
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn command_review_invalidates_changed_policy_executable_and_candidate() {
 	let (_dir, root, cfg) = repo();
@@ -303,6 +310,7 @@ async fn command_review_invalidates_changed_policy_executable_and_candidate() {
 	assert_eq!(cfg.store.at(&root).unwrap().head().unwrap(), head);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn command_review_caps_held_rounds_and_retains_explicit_reassessment() {
 	let (_dir, root, cfg) = repo();

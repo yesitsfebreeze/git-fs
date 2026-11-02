@@ -45,41 +45,16 @@ fn publication_failure(
 	}
 }
 
-/// How long integrate waits for `.git/index.lock` held by someone else. Git's own
-/// readers (`git status` from an editor, a prompt or the buffer git provider)
-/// take the lock for a few milliseconds to refresh stat data; a single
-/// `create_new` attempt refused a integrate whenever one of them was mid-refresh.
+/// How long a shared-index update waits for `.git/index.lock` held by someone
+/// else. Git's own readers (`git status` from an editor, a prompt or the buffer
+/// git provider) take the lock for a few milliseconds to refresh stat data, so
+/// a single attempt refuses whenever one of them is mid-refresh. Git-fs never
+/// holds this lock itself: the integrate commit is built from a tree, not the
+/// index, so the index is only touched by the post-integrate sync, briefly.
 const INDEX_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
-
-struct IndexLock(PathBuf);
-impl IndexLock {
-	/// Create the lock file, retrying while another process holds it, for at
-	/// most `patience`. A lock held longer is a real writer: refuse.
-	fn take(lock: PathBuf, patience: std::time::Duration) -> Result<IndexLock> {
-		let start = std::time::Instant::now();
-		loop {
-			match std::fs::OpenOptions::new()
-				.write(true)
-				.create_new(true)
-				.open(&lock)
-			{
-				Ok(_) => return Ok(IndexLock(lock)),
-				Err(e)
-					if e.kind() == std::io::ErrorKind::AlreadyExists
-						&& start.elapsed() < patience =>
-				{
-					std::thread::sleep(std::time::Duration::from_millis(10));
-				}
-				Err(e) => return Err(format!("shared index busy; preview again: {e}")),
-			}
-		}
-	}
-}
-impl Drop for IndexLock {
-	fn drop(&mut self) {
-		let _ = std::fs::remove_file(&self.0);
-	}
-}
+/// Attempts at a shared-index update: a lock held longer is a real writer, and
+/// the path stays in `kept` instead of blocking every other agent.
+const INDEX_ATTEMPTS: usize = 20;
 
 /// File locks coordinate threads and kern processes. Session indexes are
 /// independent; only working-tree and trunk changes share the repository lock.
@@ -89,6 +64,9 @@ impl Drop for MutationLock {
 		let _ = self.0.unlock();
 	}
 }
+
+/// How many session branches a `known_revision` check reads before giving up.
+const MAX_KNOWN_REVISIONS: usize = 64;
 
 const IDENT_NAME: &str = "kern gitfs";
 const IDENT_EMAIL: &str = "gitfs@kern.local";
@@ -138,8 +116,12 @@ impl StoreConfig {
 	}
 }
 
+#[derive(Debug)]
 pub struct Materialize {
 	pub applied: Vec<String>,
+	/// Paths whose disk copy and session copy were merged three-way before
+	/// landing; they are also in `applied`.
+	pub merged: Vec<String>,
 	pub conflicts: Vec<(String, String)>,
 	pub errors: Vec<String>,
 }
@@ -148,6 +130,7 @@ impl Materialize {
 	pub fn to_value(&self) -> Value {
 		json!({
 			"applied": self.applied,
+			"merged": self.merged,
 			"conflicts": self.conflicts.iter().map(|(p, r)| json!({"path": p, "reason": r})).collect::<Vec<_>>(),
 			"errors": self.errors,
 		})
@@ -170,6 +153,9 @@ fn printable(p: &Path) -> String {
 }
 
 /// Base git command: fixed identity, hooks disabled, optional private index.
+/// No porcelain checkout runs here: blobs are staged by sha and written to disk
+/// as their exact bytes, so `core.autocrlf` and attribute filters never rewrite
+/// content behind the branch's back.
 fn git_cmd(root: &Path, args: &[&str], index: Option<&Path>) -> Command {
 	let mut cmd = Command::new("git");
 	cmd.arg("-C")
@@ -345,6 +331,29 @@ impl Store {
 		Ok(self
 			.git(&["cat-file", "blob", &format!("{head}:{}", printable(rel))])
 			.ok())
+	}
+
+	/// Whether `content` is one of the repository's own revisions of `rel`:
+	/// trunk's copy, or the copy on another agent's gitfs session branch. A
+	/// shared worktree materializes a sibling's branch content before trunk
+	/// moves, so an edit that finds fresher bytes may rebase onto them when
+	/// they are such a revision. `exclude` is the asking session, whose own
+	/// branch never counts as a newer revision. An unknown hand edit on disk is
+	/// not one, and still refuses.
+	pub fn known_revision(&self, exclude: &str, rel: &Path, content: &[u8]) -> Result<bool> {
+		if self.trunk_read(rel)?.as_deref() == Some(content) {
+			return Ok(true);
+		}
+		let refs = self.git_str(&["for-each-ref", "--format=%(refname)", "refs/gitfs/"])?;
+		for name in refs.lines().take(MAX_KNOWN_REVISIONS) {
+			let Some(session) = name.strip_prefix("refs/gitfs/") else {
+				continue;
+			};
+			if session != exclude && self.read(session, rel)?.as_deref() == Some(content) {
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	/// The merge base of the session branch and trunk, if the session wrote
@@ -564,16 +573,18 @@ impl Store {
 	/// Move a session onto trunk. Each owned path trunk did not touch since the
 	/// session's base is replayed onto the current head; a path trunk moved to
 	/// exactly the session's content (a change trunk already holds, e.g. an
-	/// earlier integrate) is dropped; a path trunk moved to anything else refuses
-	/// the whole catchup, naming every such path and the way out, with nothing
-	/// written. When nothing is left to replay the session ref is deleted and
-	/// the session starts empty at trunk.
+	/// earlier integrate) is dropped; a path both sides changed is merged
+	/// three-way and replayed when the changes do not overlap (another
+	/// agent's append to the same file lands with yours). Only overlapping
+	/// changes refuse the whole catchup, naming every such path and the way
+	/// out, with nothing written. When nothing is left to replay the session
+	/// ref is deleted and the session starts empty at trunk.
 	pub(crate) fn catchup_captured(&self, session: &str, capture: &mut Capture) -> Result<Value> {
 		capture.check_session(session)?;
 		let _repo = self.mutation_lock("repository")?;
 		let _session = self.mutation_lock(&format!("session:{session}"))?;
 		let head = self.head()?.ok_or("catchup: trunk has no commit yet")?;
-		let at_trunk = |base: Option<&str>| json!({"caught_up":true,"base":base,"head":head,"replayed":[],"dropped":[],"ref_deleted":false});
+		let at_trunk = |base: Option<&str>| json!({"caught_up":true,"base":base,"head":head,"replayed":[],"merged":[],"dropped":[],"ref_deleted":false});
 		let Some(tip) = self.tip(session)? else {
 			return Ok(at_trunk(None));
 		};
@@ -584,15 +595,9 @@ impl Store {
 		if base == head {
 			return Ok(at_trunk(Some(&base)));
 		}
-		let entry = |rev: &str, rel: &str| -> Result<Option<(String, String)>> {
-			let listing = self.git_str(&["ls-tree", rev, "--", &literal(Path::new(rel))])?;
-			let mut cols = listing.split_whitespace();
-			Ok(match (cols.next(), cols.next(), cols.next()) {
-				(Some(mode), Some("blob"), Some(sha)) => Some((mode.to_owned(), sha.to_owned())),
-				_ => None,
-			})
-		};
-		let (mut replay, mut dropped, mut conflicts) = (Vec::new(), Vec::new(), Vec::new());
+		let entry = |rev: &str, rel: &str| self.entry_at(rev, Path::new(rel));
+		let (mut replay, mut merged, mut dropped, mut conflicts) =
+			(Vec::new(), Vec::new(), Vec::new(), Vec::new());
 		for (_, rel) in self.owned_paths(session)? {
 			let moved = self.git(&[
 				"diff",
@@ -605,17 +610,37 @@ impl Store {
 				&literal(Path::new(&rel)),
 			])?;
 			let mine = entry(&tip, &rel)?;
+			let theirs = entry(&head, &rel)?;
 			if moved.is_empty() {
 				replay.push((rel, mine));
-			} else if mine == entry(&head, &rel)? {
+				continue;
+			}
+			if mine == theirs {
 				dropped.push(rel);
-			} else {
-				conflicts.push(rel);
+				continue;
+			}
+			match self.merge_revision(&base, &head, &rel, mine.as_ref())? {
+				Some(blob) if theirs.as_ref().is_some_and(|(_, sha)| sha == &blob) => {
+					dropped.push(rel)
+				}
+				Some(blob) => {
+					let mode = mine
+						.map(|(mode, _)| mode)
+						.unwrap_or_else(|| "100644".into());
+					replay.push((rel.clone(), Some((mode, blob))));
+					merged.push(rel);
+				}
+				None => conflicts.push(rel),
 			}
 		}
 		if !conflicts.is_empty() {
+			let merged = if merged.is_empty() {
+				String::new()
+			} else {
+				format!(" ({} merged cleanly: {})", merged.len(), merged.join(", "))
+			};
 			return Err(format!(
-				"catchup: trunk changed {} since this session's base {base} and the session holds other content; for each: tool.gitfs.rollback {{path}}, tool.read it again, rewrite on top of trunk, then catchup",
+				"catchup: trunk changed {} since this session's base {base} and the two revisions edit the same lines{merged}; for each: tool.gitfs.rollback {{path}}, tool.read it again, rewrite on top of trunk, then catchup",
 				conflicts.join(", ")
 			));
 		}
@@ -630,7 +655,7 @@ impl Store {
 			reads.clear();
 			self.save_json(&name, &reads)?;
 			return Ok(
-				json!({"caught_up":true,"base":base,"head":head,"replayed":[],"dropped":dropped,"ref_deleted":true}),
+				json!({"caught_up":true,"base":base,"head":head,"replayed":[],"merged":[],"dropped":dropped,"ref_deleted":true}),
 			);
 		}
 		let (mut parent, mut tree) = (head.clone(), self.tree_of(&head)?);
@@ -660,7 +685,7 @@ impl Store {
 		self.save_json(&name, &reads)?;
 		let replayed: Vec<&String> = replay.iter().map(|(rel, _)| rel).collect();
 		Ok(
-			json!({"caught_up":true,"base":base,"head":head,"tip":parent,"replayed":replayed,"dropped":dropped,"ref_deleted":false,"worktree":"materialize again to copy the caught-up paths in"}),
+			json!({"caught_up":true,"base":base,"head":head,"tip":parent,"replayed":replayed,"merged":merged,"dropped":dropped,"ref_deleted":false,"worktree":"materialize again to copy the caught-up paths in"}),
 		)
 	}
 
@@ -834,6 +859,22 @@ impl Store {
 	) -> Result<Option<String>> {
 		capture.check_session(session)?;
 		let _g = self.mutation_lock(&format!("session:{session}"))?;
+		self.commit_path_locked(session, rel, content, capture, op, subject)
+	}
+
+	/// `commit_path_captured` under a session lock the caller already holds.
+	/// `materialize` commits a clean three-way merge while its own mutation
+	/// locks are held, so it calls this body instead of deadlocking on a
+	/// second lock of the same session.
+	fn commit_path_locked(
+		&self,
+		session: &str,
+		rel: &Path,
+		content: Option<(&[u8], &str)>,
+		capture: &mut Capture,
+		op: Operation,
+		subject: &str,
+	) -> Result<Option<String>> {
 		let branch = self.branch(session);
 		let prev = self.tip(session)?;
 		let head = self.head()?;
@@ -903,6 +944,51 @@ impl Store {
 		Ok(Some(commit))
 	}
 
+	/// Merge one materialize conflict. The shared worktree holds a revision
+	/// another agent put there; when that revision was committed (trunk or a
+	/// gitfs session branch) it is safe to merge with this session's copy
+	/// three-way. The merged bytes are committed onto this session branch, so
+	/// branch and worktree agree after the write. `None` leaves the caller's
+	/// refusal in place for an unknown hand edit, an overlapping change, or no
+	/// common base.
+	fn merge_disk_revision(
+		&self,
+		session: &str,
+		rel: &str,
+		ours: &[u8],
+		mode: &str,
+		disk: &[u8],
+	) -> Result<Option<Vec<u8>>> {
+		let path = Path::new(rel);
+		if !self.known_revision(session, path, disk)? {
+			return Ok(None);
+		}
+		// The trunk snapshot both branches diverged from. Our last
+		// materialize ledger entry is not a base: it is our own content, and
+		// merging onto it would quietly drop this session's change.
+		let base = match self.merge_base(session)? {
+			Some(base) => self
+				.entry_at(&base, path)?
+				.and_then(|(_, sha)| self.git(&["cat-file", "blob", &sha]).ok()),
+			None => None,
+		};
+		let Some(base) = base else {
+			return Ok(None);
+		};
+		let Some(merged) = crate::merge::merge3(&base, ours, disk)? else {
+			return Ok(None);
+		};
+		self.commit_path_locked(
+			session,
+			path,
+			Some((&merged, mode)),
+			&mut Capture::default(),
+			Operation::Materialize,
+			&format!("merge the shared worktree copy of {rel}"),
+		)?;
+		Ok(Some(merged))
+	}
+
 	/// Copy the session's owned paths into the working tree, refusing to
 	/// overwrite on-disk files newer than the copy it would install. Returns
 	/// what landed, what conflicted and why. `paths` narrows the operation.
@@ -928,6 +1014,7 @@ impl Store {
 		let mut ledger = self.load_ledger(session).unwrap_or_default();
 		let mut result = Materialize {
 			applied: vec![],
+			merged: vec![],
 			conflicts: vec![],
 			errors: vec![],
 		};
@@ -948,7 +1035,7 @@ impl Store {
 			let disk_mtime = fs_mtime(&disk);
 			match status {
 				'M' | 'A' => {
-					let (sha, mode) = match self.blob_for(session, Path::new(&rel)) {
+					let (mut sha, mut mode) = match self.blob_for(session, Path::new(&rel)) {
 						Ok(Some(v)) => v,
 						Ok(None) => continue,
 						Err(e) => {
@@ -956,7 +1043,7 @@ impl Store {
 							continue;
 						}
 					};
-					let content = match self.read(session, Path::new(&rel)) {
+					let mut content = match self.read(session, Path::new(&rel)) {
 						Ok(Some(v)) => v,
 						Ok(None) => continue,
 						Err(e) => {
@@ -1004,8 +1091,39 @@ impl Store {
 						_ => None,
 					};
 					if let Some(reason) = conflict {
-						result.conflicts.push((rel.clone(), reason));
-						continue;
+						let disk_bytes = if disk_mtime.is_some() {
+							std::fs::read(&disk).ok()
+						} else {
+							None
+						};
+						let merged = match disk_bytes.as_deref() {
+							Some(theirs) => {
+								self.merge_disk_revision(session, &rel, &content, &mode, theirs)
+							}
+							None => Ok(None),
+						};
+						match merged {
+							Ok(Some(bytes)) => {
+								content = bytes;
+								if let Ok(Some((blob, merged_mode))) =
+									self.blob_for(session, Path::new(&rel))
+								{
+									sha = blob;
+									mode = merged_mode;
+								}
+								result.merged.push(rel.clone());
+							}
+							Ok(None) => {
+								result.conflicts.push((rel.clone(), reason));
+								continue;
+							}
+							Err(e) => {
+								result
+									.errors
+									.push(format!("{rel}: merge of the on-disk copy failed: {e}"));
+								continue;
+							}
+						}
 					}
 					let mut evidence = match capture.reserve(
 						self,
@@ -1261,7 +1379,7 @@ impl Store {
 		let stale = self.stale_paths(session, &head)?;
 		if !stale.is_empty() {
 			return Err(format!(
-				"read revision behind trunk in {}: trunk moved after this session read them, so the write is not a merge to make; tool.gitfs.rollback your commits on each path, tool.read it again, write on top of what trunk now holds and ship again",
+				"stale read revision in {}: trunk moved after this session read them; call tool.gitfs_catchup (clean changes merge, overlapping ones are named there), then ship again",
 				stale.join(", ")
 			));
 		}
@@ -1433,11 +1551,9 @@ impl Store {
 		use std::io::Write;
 		let _repo = self.mutation_lock("repository")?;
 		let _session = self.mutation_lock(&format!("session:{session}"))?;
-		let index = self.shared_index()?;
-		let _index = IndexLock::take(
-			PathBuf::from(format!("{}.lock", index.display())),
-			INDEX_PATIENCE,
-		)?;
+		// The shared index is read, never locked: the commit comes from the
+		// reviewed tree, so holding `.git/index.lock` only made every other
+		// agent's git command fail for the length of this publication.
 		if cancel.load(Ordering::SeqCst) {
 			return Err("cancelled before publication".into());
 		}
@@ -1561,12 +1677,14 @@ impl Store {
 		Ok(commit)
 	}
 
-	/// After a integrate, bring the shared index and working tree up to the commit
-	/// on every owned path they still hold as the parent held it, so `git
-	/// status` stops showing the integrated change as reverted and a later plain
-	/// `git commit -a` cannot undo it. A path somebody changed on disk or in
-	/// the index since the parent — or an untracked file in the way — is left
-	/// alone and named in `kept`.
+	/// After an integrate, bring the shared index and working tree up to the
+	/// commit on every owned path they still hold as the parent held it, so
+	/// `git status` stops showing the integrated change as reverted and a later
+	/// plain `git commit` cannot undo it. The blob's bytes are written exactly
+	/// as stored — a checkout would apply `core.autocrlf` and the attributes
+	/// filters, turning the worktree copy into something the branch never held.
+	/// A path somebody changed on disk or in the index since the parent, or an
+	/// untracked file in the way, is left alone and named in `kept`.
 	pub fn sync_integrated(&self, parent: &str, commit: &str, owned: &[Owned]) -> Result<Value> {
 		let _repo = self.mutation_lock("repository")?;
 		let mut synced = Vec::new();
@@ -1578,30 +1696,7 @@ impl Store {
 				&& self
 					.git(&["diff", "--cached", "--quiet", parent, "--", &spec])
 					.is_ok() && (*status != 'A' || !self.root.join(path).exists());
-			// The shared index is locked for a few ms at a time by other
-			// readers (`git status` pollers): retry briefly, or the integrated
-			// path stays in the index as the parent had it, a staged revert.
-			// ponytail: fixed 2 s of retries; a real long-held lock still keeps the path.
-			let done = untouched
-				&& (0..20).any(|attempt| {
-					if attempt > 0 {
-						std::thread::sleep(std::time::Duration::from_millis(100));
-					}
-					if *status == 'D' {
-						self.git(&["rm", "-q", "--cached", "--", &spec]).is_ok()
-					} else {
-						self.git(&[
-							"restore",
-							"--source",
-							commit,
-							"--staged",
-							"--worktree",
-							"--",
-							&spec,
-						])
-						.is_ok()
-					}
-				}) && (*status != 'D' || std::fs::remove_file(self.root.join(path)).is_ok());
+			let done = untouched && self.sync_path(commit, *status, path);
 			if done {
 				synced.push(rel.clone());
 			} else {
@@ -1609,6 +1704,89 @@ impl Store {
 			}
 		}
 		Ok(json!({"synced": synced, "kept": kept}))
+	}
+
+	/// Put one integrated path on disk and in the shared index. Deletion removes
+	/// the index record first and then the file; anything else writes the blob's
+	/// exact bytes and stages that blob by sha, never by re-reading the worktree.
+	fn sync_path(&self, commit: &str, status: char, path: &Path) -> bool {
+		let spec = printable(path);
+		if status == 'D' {
+			return self.index_update(&["update-index", "--force-remove", "--", &spec])
+				&& match std::fs::remove_file(self.root.join(path)) {
+					Ok(()) => true,
+					Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+				};
+		}
+		let Some((mode, sha)) = self.entry_at(commit, path).ok().flatten() else {
+			return false;
+		};
+		let Ok(content) = self.git(&["cat-file", "blob", &sha]) else {
+			return false;
+		};
+		if self
+			.write_disk(&self.root.join(path), &content, &mode)
+			.is_err()
+		{
+			return false;
+		}
+		self.index_update(&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("{mode},{sha},{spec}"),
+		])
+	}
+
+	/// Update the shared index through plumbing, retrying while another git
+	/// process holds `.git/index.lock` for a few milliseconds. Failing leaves
+	/// the path in `kept`; it never blocks another agent's git command.
+	fn index_update(&self, args: &[&str]) -> bool {
+		let pause = INDEX_PATIENCE / INDEX_ATTEMPTS as u32;
+		(0..INDEX_ATTEMPTS).any(|attempt| {
+			if attempt > 0 {
+				std::thread::sleep(pause);
+			}
+			self.git(args).is_ok()
+		})
+	}
+
+	/// The (mode, blob) a revision holds for a path.
+	fn entry_at(&self, rev: &str, rel: &Path) -> Result<Option<(String, String)>> {
+		let listing = self.git_str(&["ls-tree", rev, "--", &literal(rel)])?;
+		let mut cols = listing.split_whitespace();
+		Ok(match (cols.next(), cols.next(), cols.next()) {
+			(Some(mode), Some("blob"), Some(sha)) => Some((mode.to_owned(), sha.to_owned())),
+			_ => None,
+		})
+	}
+
+	/// The merged blob when `base`, `tip` and `head` all hold a text revision
+	/// of `rel` and the two changes do not overlap. `None` leaves the path to
+	/// the caller's refusal: an added or deleted side has no text to merge.
+	fn merge_revision(
+		&self,
+		base: &str,
+		head: &str,
+		rel: &str,
+		ours: Option<&(String, String)>,
+	) -> Result<Option<String>> {
+		let Some((_, ours_sha)) = ours else {
+			return Ok(None);
+		};
+		let Some((_, base_sha)) = self.entry_at(base, Path::new(rel))? else {
+			return Ok(None);
+		};
+		let Some((_, theirs_sha)) = self.entry_at(head, Path::new(rel))? else {
+			return Ok(None);
+		};
+		let read = |sha: &str| self.git(&["cat-file", "blob", sha]);
+		let merged =
+			crate::merge::merge3(&read(&base_sha)?, &read(ours_sha)?, &read(&theirs_sha)?)?;
+		match merged {
+			Some(bytes) => Ok(Some(self.hash_object(&bytes)?)),
+			None => Ok(None),
+		}
 	}
 
 	/// Whether the branch head commit carries the `Integrated-by: gitfs` trailer.
@@ -1722,7 +1900,12 @@ impl Store {
 		if let Some(parent) = disk.parent() {
 			std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
 		}
-		std::fs::write(disk, content).map_err(|e| e.to_string())?;
+		write_file_retrying(disk, content).map_err(|e| {
+			format!(
+				"write failed after {} attempts: {e}; on Windows a running executable holds its file against replacement, stop it or rename it, then materialize again",
+				LOCK_ATTEMPTS
+			)
+		})?;
 		if mode == "100755" {
 			// Executable bit is POSIX-only; Windows has no equivalent to set.
 			#[cfg(unix)]
@@ -1799,6 +1982,37 @@ fn now_ms() -> u64 {
 		.duration_since(std::time::UNIX_EPOCH)
 		.map(|d| d.as_millis() as u64)
 		.unwrap_or(0)
+}
+
+/// Attempts at a worktree write while a Windows process holds the file open,
+/// and the pause between them (~1 s in all).
+const LOCK_ATTEMPTS: usize = 20;
+const LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Write `content` to `path`, retrying the sharing and lock violations a
+/// running executable (a build artifact, a test binary) raises while it holds
+/// the file open. Every other error returns at once.
+fn write_file_retrying(path: &Path, content: &[u8]) -> std::io::Result<()> {
+	let mut attempt = 0;
+	loop {
+		match std::fs::write(path, content) {
+			Err(e) if transient_lock(&e) && attempt + 1 < LOCK_ATTEMPTS => {
+				attempt += 1;
+				std::thread::sleep(LOCK_PAUSE);
+			}
+			other => return other,
+		}
+	}
+}
+
+#[cfg(windows)]
+fn transient_lock(error: &std::io::Error) -> bool {
+	// ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33).
+	matches!(error.raw_os_error(), Some(32 | 33))
+}
+#[cfg(not(windows))]
+fn transient_lock(_: &std::io::Error) -> bool {
+	false
 }
 
 fn fs_mtime(path: &Path) -> Option<u64> {

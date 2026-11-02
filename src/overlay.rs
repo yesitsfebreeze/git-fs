@@ -21,7 +21,7 @@ use std::sync::Arc;
 pub(crate) fn describe() -> Value {
 	json!({
 		"name":"gitfs",
-		"description":"The session's Git branch: writes and edits commit to refs/gitfs/<session>, and the worktree stays untouched until materialize copies files in to run them; rollback undoes one commit, or puts one path back to session start; catchup moves the session onto trunk after trunk moved (replays paths trunk did not touch, drops ones trunk already holds, refuses real conflicts by path, empties the session when nothing is left). Ops: ls, diff, rollback, catchup, materialize, capture. Full guidance: `kern help fs`.",
+		"description":"The session's Git branch: writes and edits commit to refs/gitfs/<session>, and the worktree stays untouched until materialize copies files in to run them; rollback undoes one commit, or puts one path back to session start; catchup moves the session onto trunk after trunk moved (replays paths trunk did not touch, drops ones trunk already holds, merges non-overlapping edits from two sessions, refuses only overlapping edits by path, empties the session when nothing is left). Ops: ls, diff, rollback, catchup, materialize, capture. Full guidance: `kern help fs`.",
 		"input_schema":{
 			"type":"object",
 			"required":["op"],

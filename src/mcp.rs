@@ -27,9 +27,10 @@ pub fn workspace() -> Result<std::path::PathBuf, String> {
 }
 
 /// The session every call runs as. Read on each call, so a `session-start`
-/// hook that fires after the server came up still wins. Ceiling: two Claude
-/// sessions in one repository share `CURRENT`, and the later one wins both;
-/// set `GIT_FS_SESSION` per server to keep them apart.
+/// hook that fires after the server came up still wins. Two hosts in one
+/// repository each find the pin written against this process's ancestry;
+/// `CURRENT` remains the fallback for a host whose hook and server do not
+/// share an ancestor (set `GIT_FS_SESSION` there to keep sessions apart).
 pub fn session() -> Result<String, String> {
 	if let Ok(session) = std::env::var("GIT_FS_SESSION") {
 		if !session.trim().is_empty() {
@@ -37,11 +38,14 @@ pub fn session() -> Result<String, String> {
 		}
 	}
 	let store = crate::store_config()?;
-	if let Ok(current) = std::fs::read_to_string(
-		store
-			.at_readonly(&workspace()?)
-			.map(|s| s.root().join(store.directory()).join("CURRENT"))?,
-	) {
+	let dir = store
+		.at_readonly(&workspace()?)?
+		.root()
+		.join(store.directory());
+	if let Some(session) = crate::session_pin::resolve(&dir) {
+		return Ok(session);
+	}
+	if let Ok(current) = std::fs::read_to_string(dir.join("CURRENT")) {
 		let current = current.trim();
 		if !current.is_empty() {
 			return Ok(current.to_owned());

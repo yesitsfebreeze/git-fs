@@ -167,8 +167,7 @@ fn selected_capture_records_only_new_commits_and_retains_partial_evidence() {
 	let out = dispatch_captured(&store, "s", &json!({"op":"capture"}), &mut capture).unwrap();
 	assert_eq!(out["error"], true);
 	assert_eq!(capture.records.len(), 2);
-	assert!(capture
-		.records
-		.iter()
-		.all(|r| r.target.path.ends_with("/A")));
+	assert!(capture.records.iter().all(|r| Path::new(&r.target.path)
+		.file_name()
+		.is_some_and(|n| n == "A")));
 }

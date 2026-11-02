@@ -186,6 +186,7 @@ impl Recorder {
 		Ok(result)
 	}
 }
-#[cfg(test)]
+// The provenance tests use symlinks, FIFOs and POSIX file modes.
+#[cfg(all(test, unix))]
 #[path = "../tests/unit/provenance.rs"]
 mod tests;

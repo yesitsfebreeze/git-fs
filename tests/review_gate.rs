@@ -1,7 +1,11 @@
 //! Exercise the installed CLI/private-hook boundary, including a forged trailer.
+// Everything here is POSIX: it links the binary as a `pre-push` symlink.
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
 fn git(root: &std::path::Path, args: &[&str]) -> String {
 	let output = Command::new("git")
 		.arg("-C")

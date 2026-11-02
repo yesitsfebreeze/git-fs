@@ -173,7 +173,7 @@ impl Context<'_> {
 		#[cfg(not(unix))]
 		{
 			let _ = &mut command;
-			return Err("bounded push requires macOS/Linux".into());
+			Err("bounded push requires macOS/Linux".into())
 		}
 		#[cfg(unix)]
 		{
@@ -596,7 +596,7 @@ fn private_dir(path: &Path) -> Result<()> {
 	Ok(())
 }
 pub(crate) use crate::hook::atomic_write;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use crate::hook::hook_valid;
 
 pub fn execute(
@@ -781,6 +781,7 @@ pub fn execute(
 	Ok(cx.reconcile(&dir, record)?.value())
 }
 
-#[cfg(test)]
+// The push tests spawn `/bin/sh`, `/bin/kill` and POSIX helper groups.
+#[cfg(all(test, unix))]
 #[path = "../tests/unit/push/tests.rs"]
 mod tests;

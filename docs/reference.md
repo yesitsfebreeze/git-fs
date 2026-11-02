@@ -5,16 +5,27 @@
 - **Guarded writes.** `write` and `edit` are refused unless the bytes the
   session last read are still current. A whole-file read of more than 350 lines
   is refused; read a range or grep. `edit` replaces one exact unique match, all
-  matches with `all`, or an `edits` array in one all-or-nothing commit.
+  matches with `all`, or an `edits` array in one all-or-nothing commit. When a
+  sibling agent's committed revision (on trunk or its session branch) reaches
+  the shared worktree after this session's read, `edit` rebases onto it if its
+  `old` text is still unique; an unknown hand edit is still refused.
 - **Branch-first reads and search.** `read`, `glob`, `grep` and `search`
   (typed ripgrep stages with cursors) see the session's changes before the
   worktree, so an agent searches what it wrote without materializing.
 - **The session branch.** `gitfs_ls`, `gitfs_diff`, `gitfs_rollback` (one
   commit, or one path back to session start), `gitfs_catchup` (rebase onto
-  moved trunk after checking which owned paths trunk changed under you),
+  moved trunk after checking which owned paths trunk changed under you;
+  non-overlapping changes to one file from two sessions merge three-way),
   `gitfs_materialize` (copy owned paths to disk, refusing files newer on disk or
-  modified since the last materialize, `force` to override), `gitfs_capture`
-  (pull disk edits of owned paths back in).
+  modified since the last materialize, `force` to override; a copy another
+  session committed and materialized is merged instead of refused),
+  `gitfs_capture` (pull disk edits of owned paths back in). Both report the
+  paths they merged under `merged`.
+- **Two sessions, one file.** An append to a file both sessions extend (a
+  ledger, a log, a table) is a union: `edit` rebases onto the sibling's
+  committed revision when its anchor is still unique, `catchup` and
+  `materialize` merge the two files line-wise, and two appends at the same
+  anchor both land. Only changes to the same lines refuse, naming the path.
 - **Publication.** `integrate` previews and commits the session onto trunk
   with a secret scan, `push` runs a guarded push with `operation_id`
   idempotency and a private pre-push hook, `undo` reverts the last integrated
@@ -213,9 +224,12 @@ reviewer's snapshot and response validation checks.
 
 ## Known ceilings
 
-- Two Claude sessions in one checkout share `.git-fs/CURRENT`; the later
-  `session-start` wins for both MCP servers. Set `GIT_FS_SESSION` per server to
-  keep them apart.
+- Session pins are written per ancestor process id, so two hosts in one
+  checkout keep their own sessions. A host whose hook and MCP server share no
+  ancestor, or whose process ids were reused after a crash, falls back to
+  `.git-fs/CURRENT`; set `GIT_FS_SESSION` per server there to keep them apart.
+- A merge is text only. A binary file both sessions changed, or changes to the
+  same lines, keeps the refusal; read the path again and rewrite it.
 - Native `Grep`, `Glob` and `Bash` see the disk, not the branch; the hooks
   say so next to each result but do not block them. Call `gitfs_materialize`
   before building or testing, or use the git-fs `grep`.
@@ -236,6 +250,8 @@ reviewer's snapshot and response validation checks.
 | `src/codex.rs` | Codex patch targets, host guidance and per-call MCP session/workspace routing |
 | `install/codex/` | Codex hook and MCP configuration |
 | `src/store.rs` | the session branch over git plumbing, materialize ledger, catchup, integrate trees |
+| `src/merge.rs` | three-way text merge for a path two sessions changed |
+| `src/session_pin.rs` | per-ancestor session pins and MCP lookup |
 | `src/files.rs`, `src/search.rs` | bounded reads, guarded writes and edits, ripgrep stages |
 | `src/overlay.rs`, `src/integrate.rs`, `src/push.rs` | the gitfs and integrate operations |
 | `manifest.md` | the declared configuration defaults and operation contracts |

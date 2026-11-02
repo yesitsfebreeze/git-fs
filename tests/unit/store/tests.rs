@@ -297,14 +297,7 @@ fn reviewed_publication_refuses_stale_head_without_deleting_new_unowned_files() 
 
 #[test]
 fn reviewed_publication_binds_index_overlay_branch_and_repository_identity() {
-	for changed in [
-		"index",
-		"overlay",
-		"branch",
-		"repository",
-		"cancel",
-		"index-lock",
-	] {
+	for changed in ["index", "overlay", "branch", "repository", "cancel"] {
 		let (dir, store) = new_repo();
 		store
 			.write_blob("review", Path::new("owned"), b"overlay", "100644")
@@ -327,9 +320,6 @@ fn reviewed_publication_binds_index_overlay_branch_and_repository_identity() {
 					.unwrap();
 			}
 			"repository" => reviewed.repository = "another-root".into(),
-			"index-lock" => {
-				std::fs::write(dir.path().join(".git/index.lock"), "another writer").unwrap()
-			}
 			_ => (),
 		}
 		let before = store.head().unwrap();
@@ -528,7 +518,7 @@ fn integrate_carries_a_moved_trunk_but_refuses_a_read_behind_it() {
 	git(&["add", "-A"]);
 	git(&["commit", "-q", "-m", "trunk a"]);
 	let err = store.preview_integrate(session).unwrap_err();
-	assert!(err.contains("read revision behind trunk in a.txt"), "{err}");
+	assert!(err.contains("stale read revision in a.txt"), "{err}");
 	assert_eq!(store.tip(session).unwrap().as_deref(), Some(tip.as_str()));
 	let held = store.read(session, Path::new("a.txt")).unwrap().unwrap();
 	assert_eq!(String::from_utf8(held).unwrap(), "mine\n");
@@ -568,10 +558,7 @@ fn a_stale_session_is_refused_while_the_session_that_integrated_first_lands() {
 	assert_eq!(store.git_str(&["show", "HEAD:README"]).unwrap(), "first\n");
 	// The second read is now behind trunk on exactly that path.
 	let err = store.preview_integrate("second").unwrap_err();
-	assert!(
-		err.contains("read revision behind trunk in README"),
-		"{err}"
-	);
+	assert!(err.contains("stale read revision in README"), "{err}");
 	// A path neither session touched is not behind anything.
 	store
 		.write_blob("second", Path::new("other"), b"other\n", "100644")
@@ -651,6 +638,7 @@ fn trunk_read_serves_what_the_worktree_deleted_and_nothing_untracked() {
 	assert_eq!(store.trunk_read(Path::new("never")).unwrap(), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn mode_for_keeps_the_executable_bit_before_the_first_write() {
 	use std::os::unix::fs::PermissionsExt;
@@ -718,32 +706,116 @@ fn a_integrated_session_owns_nothing_and_integrates_again_after_trunk_moves() {
 }
 
 #[test]
-fn integrate_waits_out_a_brief_foreign_index_lock_and_refuses_a_held_one() {
+fn integrate_commit_never_takes_or_waits_on_the_shared_index_lock() {
+	let (dir, store) = new_repo();
+	store
+		.write_blob("s", Path::new("README"), b"integrated\n", "100644")
+		.unwrap();
+	let review = store.reviewed_tree("s").unwrap();
+	// A foreign holder of `.git/index.lock`: a commit built from a reviewed
+	// tree must publish without touching it, so another agent's `git add` or
+	// `git status` neither blocks integrate nor loses its lock.
+	let lock = dir.path().join(".git/index.lock");
+	std::fs::write(&lock, "").unwrap();
+	let commit = store
+		.commit_reviewed(
+			"s",
+			&review,
+			"integrate\n\nIntegrated-by: gitfs",
+			"a",
+			"a@b",
+			&AtomicBool::new(false),
+		)
+		.unwrap();
+	assert!(lock.exists(), "the foreign lock is left exactly as it was");
+	assert_eq!(
+		store.git_str(&["rev-parse", "HEAD"]).unwrap().trim(),
+		commit
+	);
+	std::fs::remove_file(&lock).unwrap();
+}
+
+#[test]
+fn sync_integrated_writes_the_blob_bytes_without_eol_conversion() {
+	let (dir, store) = new_repo();
+	// The shared worktree converts line endings; the branch holds LF bytes.
+	store.git_str(&["config", "core.autocrlf", "true"]).unwrap();
+	std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+	store.git(&["add", "a.txt"]).unwrap();
+	store.git(&["commit", "-qm", "a"]).unwrap();
+	store
+		.write_blob("s", Path::new("a.txt"), b"two\nthree\n", "100644")
+		.unwrap();
+	let review = store.reviewed_tree("s").unwrap();
+	let commit = store
+		.commit_reviewed(
+			"s",
+			&review,
+			"integrate\n\nIntegrated-by: gitfs",
+			"a",
+			"a@b",
+			&AtomicBool::new(false),
+		)
+		.unwrap();
+	let sync = store
+		.sync_integrated(&review.head, &commit, &review.owned)
+		.unwrap();
+	assert_eq!(sync["synced"], json!(["a.txt"]), "{sync}");
+	assert_eq!(
+		std::fs::read(dir.path().join("a.txt")).unwrap(),
+		b"two\nthree\n",
+		"the worktree copy is the blob's exact bytes, not its autocrlf form"
+	);
+}
+
+#[test]
+fn sync_integrated_stages_the_commit_so_git_status_is_clean() {
+	let (_dir, store) = new_repo();
+	store
+		.write_blob("s", Path::new("README"), b"integrated\n", "100644")
+		.unwrap();
+	let review = store.reviewed_tree("s").unwrap();
+	let commit = store
+		.commit_reviewed(
+			"s",
+			&review,
+			"integrate\n\nIntegrated-by: gitfs",
+			"a",
+			"a@b",
+			&AtomicBool::new(false),
+		)
+		.unwrap();
+	let sync = store
+		.sync_integrated(&review.head, &commit, &review.owned)
+		.unwrap();
+	assert_eq!(sync["synced"], json!(["README"]), "{sync}");
+	// Staged by sha through plumbing: no `git restore`, no filter conversion,
+	// and the shared index holds the integrated blob rather than the parent's.
+	let status = store.git_str(&["status", "--porcelain"]).unwrap();
+	assert!(status.trim().is_empty(), "{status:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_write_retries_while_another_process_holds_the_file() {
+	use std::os::windows::fs::OpenOptionsExt;
 	let dir = tempfile::tempdir().unwrap();
-	let lock = dir.path().join("index.lock");
-	std::fs::write(&lock, "").unwrap();
-	let brief = lock.clone();
+	let path = dir.path().join("locked");
+	std::fs::write(&path, "old\n").unwrap();
+	// share_mode(0) refuses every other opener, exactly as a running image does.
+	let held = std::fs::OpenOptions::new()
+		.read(true)
+		.share_mode(0)
+		.open(&path)
+		.unwrap();
+	let released = path.clone();
 	let release = std::thread::spawn(move || {
-		std::thread::sleep(std::time::Duration::from_millis(50));
-		std::fs::remove_file(brief).unwrap();
+		std::thread::sleep(std::time::Duration::from_millis(250));
+		drop(held);
 	});
-	let taken = IndexLock::take(lock.clone(), std::time::Duration::from_secs(2))
-		.expect("a lock released within the patience is taken");
+	write_file_retrying(&released, b"new\n").expect("a brief holder is retried");
 	release.join().unwrap();
-	drop(taken);
-	assert!(!lock.exists(), "dropping the guard removes the lock");
-	std::fs::write(&lock, "").unwrap();
-	let refused = IndexLock::take(lock.clone(), std::time::Duration::from_millis(30))
-		.err()
-		.expect("a lock held past the patience is refused");
-	assert!(
-		refused.starts_with("shared index busy; preview again"),
-		"{refused}"
-	);
-	assert!(
-		lock.exists(),
-		"a refused take leaves the other holder's lock alone"
-	);
+	assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
 }
 
 #[test]
@@ -889,6 +961,58 @@ fn catchup_refuses_a_real_conflict_by_path_and_writes_nothing() {
 	assert!(refused.contains("rollback {path}"), "{refused}");
 	assert!(!refused.contains("b.txt"), "{refused}");
 	assert_eq!(store.tip("c3").unwrap(), tip, "atomic: nothing written");
+}
+
+#[test]
+fn catchup_merges_two_sessions_that_appended_to_one_file() {
+	let (_dir, store) = new_repo();
+	store
+		.write_blob("c6", Path::new("README"), b"base\nsession row\n", "100644")
+		.unwrap();
+	trunk_commit(&store, &[("README", Some("trunk row\nbase\n"))]);
+	let head = store.head().unwrap().unwrap();
+	let answer = catchup(&store, "c6").unwrap();
+	assert_eq!(answer["merged"], json!(["README"]), "{answer}");
+	assert_eq!(answer["dropped"], json!([]), "{answer}");
+	assert_eq!(
+		store.read("c6", Path::new("README")).unwrap().unwrap(),
+		b"trunk row\nbase\nsession row\n"
+	);
+	assert_eq!(
+		store.merge_base("c6").unwrap().as_deref(),
+		Some(head.as_str()),
+		"the merged session sits on current trunk"
+	);
+}
+
+#[test]
+fn materialize_merges_a_sibling_sessions_revision_on_the_shared_worktree() {
+	let (_dir, store) = new_repo();
+	store
+		.write_blob("mine", Path::new("README"), b"base\nmine\n", "100644")
+		.unwrap();
+	let first = store.materialize("mine", None, false).unwrap();
+	assert_eq!(first.applied, vec!["README".to_owned()], "{first:?}");
+	// A sibling commits its own row and materializes it over the same shared file.
+	store
+		.write_blob("peer", Path::new("README"), b"base\npeer\n", "100644")
+		.unwrap();
+	let peer = store.materialize("peer", None, false).unwrap();
+	assert_eq!(peer.applied, vec!["README".to_owned()], "{peer:?}");
+	// This session's copy is behind the disk, but the disk holds a committed
+	// revision, so the two changes merge instead of refusing.
+	let second = store.materialize("mine", None, false).unwrap();
+	assert_eq!(second.merged, vec!["README".to_owned()], "{second:?}");
+	assert!(second.conflicts.is_empty(), "{second:?}");
+	assert_eq!(
+		std::fs::read_to_string(store.root().join("README")).unwrap(),
+		"base\nmine\npeer\n"
+	);
+	assert_eq!(
+		store.read("mine", Path::new("README")).unwrap().unwrap(),
+		b"base\nmine\npeer\n",
+		"the session branch holds what the worktree now holds"
+	);
 }
 
 #[test]

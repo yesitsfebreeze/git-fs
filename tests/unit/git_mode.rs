@@ -572,3 +572,78 @@ async fn reads_and_searches_agree_on_staged_and_unstaged_changes() {
 	assert_eq!(edit["error"], true, "{edit}");
 	assert!(edit["content"].as_str().unwrap().contains("changed since"));
 }
+
+#[tokio::test]
+async fn edit_rebases_onto_a_sibling_materialized_revision_when_the_anchor_is_unique() {
+	let (_dir, root, service, _recorded) = fixture(Mode::Git, true);
+	let read = tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	assert_eq!(read["error"], false, "{read}");
+	// Another agent commits its row to its own branch, and Stop materializes it
+	// onto the shared worktree before anything integrates it to trunk.
+	let sibling = service.store.at(&root).unwrap();
+	sibling
+		.write_blob("s2", Path::new("a.txt"), b"zero\none\n", "100644")
+		.unwrap();
+	std::fs::write(root.join("a.txt"), "zero\none\n").unwrap();
+
+	let edited = tool(
+		&service,
+		&root,
+		"edit",
+		json!({"path":"a.txt","old":"one\n","new":"two\n"}),
+	)
+	.await;
+	assert_eq!(edited["error"], false, "{edited}");
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs/s1:a.txt"]),
+		"zero\ntwo\n",
+		"the edit lands on the sibling's newer text"
+	);
+}
+
+#[tokio::test]
+async fn edit_still_refuses_an_unknown_hand_edit_on_disk() {
+	let (_dir, root, service, _recorded) = fixture(Mode::Git, true);
+	tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	std::fs::write(root.join("a.txt"), "hand edit\n").unwrap();
+	let edited = tool(
+		&service,
+		&root,
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"two"}),
+	)
+	.await;
+	assert_eq!(edited["error"], true, "{edited}");
+	assert!(
+		edited["content"]
+			.as_str()
+			.unwrap_or_default()
+			.contains("file changed since it was read"),
+		"{edited}"
+	);
+}
+
+#[tokio::test]
+async fn glob_paths_use_forward_slashes_on_every_host() {
+	let (_dir, root, service, _recorded) = fixture(Mode::Git, true);
+	std::fs::create_dir_all(root.join("nested")).unwrap();
+	std::fs::write(root.join("nested/deep.txt"), "x\n").unwrap();
+	git(&root, &["add", "nested/deep.txt"]);
+	git(
+		&root,
+		&["-c", "commit.gpgsign=false", "commit", "-qm", "nested"],
+	);
+	if !has_rg() {
+		return;
+	}
+	let glob = tool(&service, &root, "glob", json!({"pattern":"*.txt"})).await;
+	let glob: Value = glob["content"].clone();
+	assert!(
+		glob["items"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.any(|p| p == "nested/deep.txt"),
+		"{glob}"
+	);
+}

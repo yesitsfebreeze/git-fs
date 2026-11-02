@@ -601,6 +601,9 @@ mod tests {
 			file_hash(&path).unwrap(),
 			format!("{:x}", expected.finalize())
 		);
+		// Opening a directory as a regular file is a POSIX distinction; the
+		// Windows error text differs and is not what this assertion tests.
+		#[cfg(unix)]
 		assert!(bounded_read(temp.path(), 100)
 			.unwrap_err()
 			.contains("regular files"));

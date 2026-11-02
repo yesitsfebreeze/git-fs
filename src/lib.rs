@@ -18,6 +18,7 @@ pub mod hooks;
 mod integrate;
 mod limits;
 pub mod mcp;
+mod merge;
 pub mod overlay;
 mod provenance;
 mod push;
@@ -25,6 +26,7 @@ pub mod review;
 mod search;
 mod secrets;
 pub mod service;
+mod session_pin;
 pub mod store;
 mod tool_result;
 

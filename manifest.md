@@ -147,7 +147,7 @@
       }
     },
     "tool.gitfs.catchup": {
-      "description": "Rebase the session onto current trunk after checking its owned paths.",
+      "description": "Rebase the session onto current trunk after checking its owned paths. Changes to one file from two sessions merge when they do not overlap; only overlapping edits are refused.",
       "schema": {
         "type": "object",
         "required": [
@@ -175,7 +175,7 @@
       }
     },
     "tool.gitfs.materialize": {
-      "description": "Materialize selected session paths into the worktree with overwrite guards.",
+      "description": "Materialize selected session paths into the worktree with overwrite guards. When another session's committed revision is on disk, the two are merged three-way; an unknown hand edit is still refused.",
       "schema": {
         "type": "object",
         "required": [

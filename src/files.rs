@@ -492,12 +492,16 @@ fn render(text: &str, offset: usize, limit: usize, max_bytes: usize) -> String {
 	out
 }
 
+/// `sibling_revision` admits a disk copy that equals another gitfs session's
+/// committed branch content: an edit that is rebasing onto a sibling's work
+/// may accept it, while a first whole-file write never adopts it silently.
 fn require_disk_agreement(
 	branch: Option<&Branch>,
 	session: &str,
 	path: &Path,
 	selected: Option<[u8; 32]>,
 	max_bytes: usize,
+	sibling_revision: bool,
 ) -> Result<(), String> {
 	let Some(branch) = branch else {
 		return Ok(());
@@ -519,7 +523,7 @@ fn require_disk_agreement(
 		.store
 		.trunk_read(&branch.rel)?
 		.map(|bytes| version(&bytes));
-	if trunk.is_some() && disk != trunk {
+	if trunk.is_some() && disk != trunk && !sibling_revision {
 		return Err("disk differs from committed trunk; reconcile local changes before editing; capture applies only to session-owned paths".into());
 	}
 	if disk != selected {
@@ -575,6 +579,7 @@ fn write(
 		&resolved,
 		current,
 		service.config.max_file_bytes,
+		false,
 	)?;
 	let new_version = version(text.as_bytes());
 	if let Some(branch) = &branch {
@@ -647,16 +652,44 @@ fn edit(
 	let bytes = current_bytes(branch.as_ref(), &context.session, &resolved)
 		.map_err(|e| format!("edit failed: {e}"))?
 		.ok_or("file disappeared since it was read; reread it")?;
-	if version(&bytes) != expected {
-		return Err("file changed since it was read; reread it".into());
-	}
-	require_disk_agreement(
-		branch.as_ref(),
-		&context.session,
-		&resolved,
-		Some(expected),
-		service.config.max_file_bytes,
-	)?;
+	// A sibling agent on the same worktree can move a file this session read:
+	// its change is committed on that agent's session branch (or already on
+	// trunk) and materialize put it on the shared disk before trunk moved. The
+	// replacement decides whether that is safe — when its `old` text still
+	// matches uniquely, the edit rebases onto the newer text instead of making
+	// the caller reread and race the same file again. Bytes that are neither
+	// trunk nor a gitfs session's revision are an unknown hand edit, and the
+	// edit still refuses.
+	let rebased = if version(&bytes) != expected {
+		let known = match &branch {
+			Some(branch) => branch
+				.store
+				.known_revision(&context.session, &branch.rel, &bytes)?,
+			None => false,
+		};
+		if !known {
+			return Err("file changed since it was read; reread it".into());
+		}
+		require_disk_agreement(
+			branch.as_ref(),
+			&context.session,
+			&resolved,
+			Some(version(&bytes)),
+			service.config.max_file_bytes,
+			true,
+		)?;
+		true
+	} else {
+		require_disk_agreement(
+			branch.as_ref(),
+			&context.session,
+			&resolved,
+			Some(expected),
+			service.config.max_file_bytes,
+			false,
+		)?;
+		false
+	};
 	let text =
 		String::from_utf8(bytes).map_err(|_| "binary or invalid UTF-8 content".to_string())?;
 	let mut replaced = text;
@@ -668,12 +701,22 @@ fn edit(
 		};
 		let count = replaced.matches(old).count();
 		if count == 0 {
-			return Err(format!("{at}no match for old text"));
+			return Err(if rebased {
+				format!("{at}file changed since it was read and its old text is gone; reread it")
+			} else {
+				format!("{at}no match for old text")
+			});
 		}
 		if !*all && count > 1 {
-			return Err(format!(
-				"{at}ambiguous edit: {count} matches; use all=true or a more specific old text"
-			));
+			return Err(if rebased {
+				format!(
+					"{at}file changed since it was read and its old text is no longer unique ({count} matches); reread it"
+				)
+			} else {
+				format!(
+					"{at}ambiguous edit: {count} matches; use all=true or a more specific old text"
+				)
+			});
 		}
 		replaced = replaced.replace(old.as_str(), new.as_str());
 	}
