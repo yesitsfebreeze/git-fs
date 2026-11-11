@@ -75,6 +75,10 @@ const IDENT_EMAIL: &str = "gitfs@kern.local";
 pub struct Store {
 	root: PathBuf,
 	dir: PathBuf,
+	/// Set when the project has no repository of its own: the store directory
+	/// is then the git directory, holding only session branches and their
+	/// objects, with `root` as its worktree.
+	git_dir: Option<PathBuf>,
 }
 
 pub struct StoreConfig {
@@ -93,26 +97,76 @@ impl StoreConfig {
 	}
 
 	/// Resolve the repo root from a caller cwd (which may be a checkout or any
-	/// directory inside it) and the runtime store dir under it.
+	/// directory inside it) and the runtime store dir under it. A directory
+	/// outside every repository gets a store that is its own git directory.
 	pub fn at(&self, cwd: &Path) -> Result<Store> {
-		let store = self.at_readonly(cwd)?;
+		let store = match self.at_readonly(cwd) {
+			Ok(store) => store,
+			Err(_) => self.init_standalone(cwd)?,
+		};
+		self.prepare(store)
+	}
+
+	/// As `at`, but never makes a standalone store: for callers that observe
+	/// (the hooks), so that only a git-fs write creates one.
+	pub fn at_existing(&self, cwd: &Path) -> Result<Store> {
+		self.prepare(self.at_readonly(cwd)?)
+	}
+
+	fn prepare(&self, store: Store) -> Result<Store> {
 		std::fs::create_dir_all(&store.dir).map_err(|e| format!("cannot create store dir: {e}"))?;
-		exclude_private(&store.root, &self.store_dir);
+		// A store that is its own git directory has no `.git/info/exclude`.
+		if store.git_dir.is_none() {
+			exclude_private(&store.root, &self.store_dir);
+		}
 		Ok(store)
 	}
 
 	pub fn at_readonly(&self, cwd: &Path) -> Result<Store> {
-		let s = run(cwd, &["rev-parse", "--show-toplevel"], None, None)
-			.map_err(|_| "not inside a git repository".to_string())?;
-		// Git prints `/` separators on Windows; rebuild in native form.
-		let root: PathBuf = Path::new(String::from_utf8_lossy(&s).trim())
-			.components()
-			.collect();
-		if root.as_os_str().is_empty() {
-			return Err("not inside a git repository".into());
+		if let Ok(s) = run(cwd, None, &["rev-parse", "--show-toplevel"], None, None) {
+			// Git prints `/` separators on Windows; rebuild in native form.
+			let root: PathBuf = Path::new(String::from_utf8_lossy(&s).trim())
+				.components()
+				.collect();
+			if !root.as_os_str().is_empty() {
+				let dir = root.join(&self.store_dir);
+				return Ok(Store {
+					root,
+					dir,
+					git_dir: None,
+				});
+			}
 		}
-		let dir = root.join(&self.store_dir);
-		Ok(Store { root, dir })
+		// No project repository: the nearest store that is a git directory.
+		cwd.ancestors()
+			.map(|root| (root, root.join(&self.store_dir)))
+			.find(|(_, dir)| dir.join("HEAD").is_file())
+			.map(|(root, dir)| Store {
+				root: root.to_path_buf(),
+				git_dir: Some(dir.clone()),
+				dir,
+			})
+			.ok_or_else(|| {
+				"no git repository and no git-fs store here yet; the first write creates one"
+					.to_string()
+			})
+	}
+
+	/// Make the store directory under `cwd` a git directory of its own.
+	fn init_standalone(&self, cwd: &Path) -> Result<Store> {
+		let dir = cwd.join(&self.store_dir);
+		// No templates: the store holds branches and objects only, and two first
+		// calls at once would otherwise fail copying the same template files.
+		run(cwd, Some(&dir), &["init", "-q", "--template="], None, None)?;
+		// rg honours `.gitignore` only inside a repository, `.ignore` always:
+		// keep the object store out of every search.
+		std::fs::write(dir.join(".ignore"), "*\n")
+			.map_err(|e| format!("cannot create store dir: {e}"))?;
+		Ok(Store {
+			root: cwd.to_path_buf(),
+			git_dir: Some(dir.clone()),
+			dir,
+		})
 	}
 }
 
@@ -156,7 +210,8 @@ fn printable(p: &Path) -> String {
 /// No porcelain checkout runs here: blobs are staged by sha and written to disk
 /// as their exact bytes, so `core.autocrlf` and attribute filters never rewrite
 /// content behind the branch's back.
-fn git_cmd(root: &Path, args: &[&str], index: Option<&Path>) -> Command {
+/// `git_dir` names the store's own git directory when the project has none.
+fn git_cmd(root: &Path, git_dir: Option<&Path>, args: &[&str], index: Option<&Path>) -> Command {
 	let mut cmd = Command::new("git");
 	cmd.arg("-C")
 		.arg(root)
@@ -170,13 +225,22 @@ fn git_cmd(root: &Path, args: &[&str], index: Option<&Path>) -> Command {
 	if let Some(index) = index {
 		cmd.env("GIT_INDEX_FILE", index);
 	}
+	if let Some(dir) = git_dir {
+		cmd.env("GIT_DIR", dir).env("GIT_WORK_TREE", root);
+	}
 	cmd
 }
 
 /// Run git against `root` with a fixed identity, hooks disabled, and an
 /// optional private index file (never the working tree's index).
-fn run(root: &Path, args: &[&str], index: Option<&Path>, stdin: Option<&[u8]>) -> Result<Vec<u8>> {
-	let mut cmd = git_cmd(root, args, index);
+fn run(
+	root: &Path,
+	git_dir: Option<&Path>,
+	args: &[&str],
+	index: Option<&Path>,
+	stdin: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+	let mut cmd = git_cmd(root, git_dir, args, index);
 	if stdin.is_some() {
 		cmd.stdin(Stdio::piped());
 	}
@@ -201,8 +265,8 @@ fn run(root: &Path, args: &[&str], index: Option<&Path>, stdin: Option<&[u8]>) -
 /// Probe run for `--verify --quiet`-style ref checks: a clean non-zero exit
 /// (empty stderr, e.g. a missing ref) yields empty output; real failures with
 /// a message stay errors.
-fn run_tolerant(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-	let mut cmd = git_cmd(root, args, None);
+fn run_tolerant(root: &Path, git_dir: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
+	let mut cmd = git_cmd(root, git_dir, args, None);
 	cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 	let out = cmd.output().map_err(|e| format!("git spawn failed: {e}"))?;
 	if !out.status.success() {
@@ -246,7 +310,7 @@ impl Store {
 	}
 
 	pub fn git(&self, args: &[&str]) -> Result<Vec<u8>> {
-		run(&self.root, args, None, None)
+		run(&self.root, self.git_dir.as_deref(), args, None, None)
 	}
 
 	pub fn git_str(&self, args: &[&str]) -> Result<String> {
@@ -257,19 +321,28 @@ impl Store {
 	pub fn tip(&self, session: &str) -> Result<Option<String>> {
 		let out = run_tolerant(
 			&self.root,
+			self.git_dir.as_deref(),
 			&["rev-parse", "--verify", "--quiet", &self.branch(session)],
 		)?;
 		Ok(trimmed_opt(lossy(out)))
 	}
 
 	pub fn head(&self) -> Result<Option<String>> {
-		let out = run_tolerant(&self.root, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+		let out = run_tolerant(
+			&self.root,
+			self.git_dir.as_deref(),
+			&["rev-parse", "--verify", "--quiet", "HEAD"],
+		)?;
 		Ok(trimmed_opt(lossy(out)))
 	}
 
 	/// Current branch symbolic name, or None on a detached HEAD.
 	pub fn branch_name(&self) -> Result<Option<String>> {
-		let out = run_tolerant(&self.root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+		let out = run_tolerant(
+			&self.root,
+			self.git_dir.as_deref(),
+			&["symbolic-ref", "--quiet", "--short", "HEAD"],
+		)?;
 		Ok(trimmed_opt(lossy(out)))
 	}
 
@@ -361,38 +434,78 @@ impl Store {
 	pub fn merge_base(&self, session: &str) -> Result<Option<String>> {
 		match self.tip(session)? {
 			None => Ok(None),
-			Some(_) => match self.git_str(&["merge-base", "HEAD", &self.branch(session)]) {
-				Ok(s) => Ok(trimmed_opt(s)),
-				Err(_) => Ok(None),
-			},
+			Some(_) => Ok(self.trunk_base(session)),
 		}
+	}
+
+	/// The merge base of an existing session branch and trunk.
+	fn trunk_base(&self, session: &str) -> Option<String> {
+		self.git_str(&["merge-base", "HEAD", &self.branch(session)])
+			.ok()
+			.and_then(trimmed_opt)
 	}
 
 	/// Paths the session owns and how they changed relative to trunk at
 	/// session start: `(status, path)` with status A/M/D.
 	pub fn owned_paths(&self, session: &str) -> Result<Vec<Owned>> {
-		let Some(base) = self.merge_base(session)? else {
+		let Some(base) = self.change_base(session)? else {
 			return Ok(vec![]);
 		};
-		let branch = self.branch(session);
-		let range = format!("{base}...{branch}");
-		let out = self.git(&["diff", "--name-status", "--no-renames", "-z", &range])?;
-		Ok(parse_name_status(&out))
-	}
-
-	/// How the session changed one path against trunk at session start: `None`
-	/// when it did not, `Some(None)` when it deleted it, else its content.
-	pub fn session_change(&self, session: &str, rel: &Path) -> Result<Option<Option<Vec<u8>>>> {
-		let Some(base) = self.merge_base(session)? else {
-			return Ok(None);
-		};
-		let range = format!("{base}...{}", self.branch(session));
 		let out = self.git(&[
 			"diff",
 			"--name-status",
 			"--no-renames",
 			"-z",
-			&range,
+			&base,
+			&self.branch(session),
+			"--",
+		])?;
+		Ok(parse_name_status(&out))
+	}
+
+	/// The revision a session's changes are diffed against: its merge base
+	/// with trunk. A store that is its own git directory has no trunk:
+	/// everything on the branch is the session's, so the empty tree is the
+	/// base. A project repository without a merge base owns nothing, as
+	/// before: an orphan or unborn HEAD there is not "no trunk".
+	fn change_base(&self, session: &str) -> Result<Option<String>> {
+		if self.tip(session)?.is_none() {
+			return Ok(None);
+		}
+		if let Some(base) = self.trunk_base(session) {
+			return Ok(Some(base));
+		}
+		if self.git_dir.is_none() {
+			return Ok(None);
+		}
+		self.empty_tree().map(Some)
+	}
+
+	/// The empty tree's id in this repository's object format.
+	fn empty_tree(&self) -> Result<String> {
+		let out = run(
+			&self.root,
+			self.git_dir.as_deref(),
+			&["hash-object", "-t", "tree", "--stdin"],
+			None,
+			Some(b""),
+		)?;
+		var_str(lossy(out))
+	}
+
+	/// How the session changed one path against trunk at session start: `None`
+	/// when it did not, `Some(None)` when it deleted it, else its content.
+	pub fn session_change(&self, session: &str, rel: &Path) -> Result<Option<Option<Vec<u8>>>> {
+		let Some(base) = self.change_base(session)? else {
+			return Ok(None);
+		};
+		let out = self.git(&[
+			"diff",
+			"--name-status",
+			"--no-renames",
+			"-z",
+			&base,
+			&self.branch(session),
 			"--",
 			&literal(rel),
 		])?;
@@ -435,6 +548,7 @@ impl Store {
 	fn is_ancestor(&self, ancestor: &str, of: &str) -> Result<bool> {
 		let status = git_cmd(
 			&self.root,
+			self.git_dir.as_deref(),
 			&["merge-base", "--is-ancestor", ancestor, of],
 			None,
 		)
@@ -480,7 +594,11 @@ impl Store {
 				"rollback: {commit} is not a commit of session {session}"
 			));
 		}
-		let parent = format!("{commit}^");
+		// A session without a trunk under it starts at a root commit.
+		let parent = match self.tree_of(&format!("{commit}^")) {
+			Ok(_) => format!("{commit}^"),
+			Err(_) => self.empty_tree()?,
+		};
 		let changed = self.git(&[
 			"diff-tree",
 			"-r",
@@ -546,10 +664,11 @@ impl Store {
 		if self.session_change(session, path)?.is_none() {
 			return Err(format!("rollback: session {session} does not change {rel}"));
 		}
-		let base = self
-			.merge_base(session)?
-			.ok_or("session has no branch to roll back")?;
-		let listing = self.git_str(&["ls-tree", &base, "--", &literal(path)])?;
+		// No merge base here means no trunk: the path did not exist before.
+		let listing = match self.merge_base(session)? {
+			Some(base) => self.git_str(&["ls-tree", &base, "--", &literal(path)])?,
+			None => String::new(),
+		};
 		let mut cols = listing.split_whitespace();
 		let prior = match (cols.next(), cols.next(), cols.next()) {
 			(Some(mode), Some("blob"), Some(sha)) => {
@@ -739,6 +858,7 @@ impl Store {
 	fn hash_object(&self, bytes: &[u8]) -> Result<String> {
 		let out = run(
 			&self.root,
+			self.git_dir.as_deref(),
 			&["hash-object", "-w", "--stdin"],
 			None,
 			Some(bytes),
@@ -758,13 +878,26 @@ impl Store {
 		let index = self.index_file(session);
 		let _ = std::fs::remove_file(&index);
 		if base_tree.is_empty() {
-			run(&self.root, &["read-tree", "--empty"], Some(&index), None)?;
+			run(
+				&self.root,
+				self.git_dir.as_deref(),
+				&["read-tree", "--empty"],
+				Some(&index),
+				None,
+			)?;
 		} else {
-			run(&self.root, &["read-tree", base_tree], Some(&index), None)?;
+			run(
+				&self.root,
+				self.git_dir.as_deref(),
+				&["read-tree", base_tree],
+				Some(&index),
+				None,
+			)?;
 		}
 		for (mode, blob, rel) in adds {
 			run(
 				&self.root,
+				self.git_dir.as_deref(),
 				&[
 					"update-index",
 					"--add",
@@ -780,12 +913,19 @@ impl Store {
 		for rel in removes {
 			run(
 				&self.root,
+				self.git_dir.as_deref(),
 				&["update-index", "--force-remove", "--", &printable(rel)],
 				Some(&index),
 				None,
 			)?;
 		}
-		let out = run(&self.root, &["write-tree"], Some(&index), None)?;
+		let out = run(
+			&self.root,
+			self.git_dir.as_deref(),
+			&["write-tree"],
+			Some(&index),
+			None,
+		)?;
 		var_str(String::from_utf8(out).map_err(|e| e.to_string())?)
 	}
 
@@ -1317,6 +1457,7 @@ impl Store {
 		}
 		let out = run_tolerant(
 			&self.root,
+			self.git_dir.as_deref(),
 			&[
 				"log",
 				"-n",
@@ -1565,6 +1706,7 @@ impl Store {
 		}
 		let mut child = git_cmd(
 			&self.root,
+			self.git_dir.as_deref(),
 			&["commit-tree", &expected.tree, "-p", &expected.head],
 			None,
 		)
@@ -1596,12 +1738,17 @@ impl Store {
 		// name only after prepare: Git rejects symref-verify HEAD plus an update
 		// to its referent in one transaction (duplicate synthetic HEAD update).
 		// A prepared HEAD update prevents concurrent checkout/symbolic-ref changes.
-		let mut transaction = git_cmd(&self.root, &["update-ref", "--stdin"], None)
-			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
-			.stderr(Stdio::piped())
-			.spawn()
-			.map_err(|e| e.to_string())?;
+		let mut transaction = git_cmd(
+			&self.root,
+			self.git_dir.as_deref(),
+			&["update-ref", "--stdin"],
+			None,
+		)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|e| e.to_string())?;
 		let mut dispatched = false;
 		let result: Result<()> = (|| {
 			use std::io::{BufRead, BufReader};
@@ -2096,7 +2243,7 @@ mod tests;
 
 /// The repository's git directory, absolute, for a checkout root.
 pub fn git_dir(root: &Path) -> Result<PathBuf> {
-	let out = run(root, &["rev-parse", "--absolute-git-dir"], None, None)?;
+	let out = run(root, None, &["rev-parse", "--absolute-git-dir"], None, None)?;
 	let dir: PathBuf = Path::new(String::from_utf8_lossy(&out).trim())
 		.components()
 		.collect();

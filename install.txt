@@ -204,7 +204,9 @@ OPERATING NOTES
 
 The default Git mode stores session refs in the project's .git and session
 metadata in .git-fs/, which is added to .git/info/exclude. Outside a Git
-repository, git-fs operates in local mode and writes directly to disk.
+repository, .git-fs/ is itself the Git directory: it holds only the session
+branches and their objects, and the project needs no .git. There is no trunk
+there, so integrate, catchup and push refuse; materialize copies changes out.
 GIT_FS_CONFIG can override defaults with a JSON object; do not set
 {"mode":"local"} if session branch isolation is the intended behavior.
 

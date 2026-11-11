@@ -38,10 +38,11 @@ pub fn session() -> Result<String, String> {
 		}
 	}
 	let store = crate::store_config()?;
-	let dir = store
-		.at_readonly(&workspace()?)?
-		.root()
-		.join(store.directory());
+	// No repository and no store yet is not an error: the first write makes one.
+	let Ok(found) = store.at_readonly(&workspace()?) else {
+		return Ok("main".into());
+	};
+	let dir = found.root().join(store.directory());
 	if let Some(session) = crate::session_pin::resolve(&dir) {
 		return Ok(session);
 	}

@@ -411,7 +411,7 @@ fn prepared_head_transaction_holds_the_symbolic_branch_until_decision() {
 		.unwrap();
 	let review = store.reviewed_tree("review").unwrap();
 	store.git(&["branch", "other"]).unwrap();
-	let mut process = git_cmd(store.root(), &["update-ref", "--stdin"], None)
+	let mut process = git_cmd(store.root(), None, &["update-ref", "--stdin"], None)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())

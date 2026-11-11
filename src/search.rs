@@ -447,8 +447,10 @@ fn matches_glob(path: &str, pattern: Option<&str>) -> bool {
 /// them answers a false empty, which reads exactly like a true one. `.git/` is
 /// the single exclusion, because the composition nests submodules whose object
 /// stores would otherwise outnumber every real result; `.gitignore` still
-/// removes `target/` and `node_modules/`.
-fn base_argv(globs: &[&str]) -> Vec<String> {
+/// removes `target/` and `node_modules/`. The store directory goes the same
+/// way: outside a repository it is a git directory itself, and no
+/// `.gitignore` applies there.
+fn base_argv(globs: &[&str], store_dir: &str) -> Vec<String> {
 	let mut argv = vec![
 		"--no-config".to_string(),
 		"--no-follow".to_string(),
@@ -462,6 +464,7 @@ fn base_argv(globs: &[&str]) -> Vec<String> {
 	// `*` matches the object store's file names too, and would re-include
 	// everything this excludes if the exclusion came first.
 	argv.push("--glob=!.git/".to_string());
+	argv.push(format!("--glob=!/{}/", store_dir.trim_matches('/')));
 	argv
 }
 
@@ -476,7 +479,7 @@ async fn enumerate(
 	pattern: Option<&str>,
 ) -> Result<Vec<String>, String> {
 	let pattern = pattern.unwrap_or("*");
-	let mut argv = base_argv(&[pattern]);
+	let mut argv = base_argv(&[pattern], &service.config.store_dir);
 	argv.push("--files".to_string());
 	argv.push("--null".to_string());
 	let raw = run_rg(service, context, cwd, cancel, argv).await?;
@@ -511,7 +514,10 @@ pub async fn grep_paths(
 	paths: &[String],
 	glob: Option<&str>,
 ) -> Result<Vec<MatchItem>, String> {
-	let mut argv = base_argv(&glob.into_iter().collect::<Vec<_>>());
+	let mut argv = base_argv(
+		&glob.into_iter().collect::<Vec<_>>(),
+		&service.config.store_dir,
+	);
 	argv.push("--json".to_string());
 	argv.push("--".to_string());
 	argv.push(pattern.to_string());

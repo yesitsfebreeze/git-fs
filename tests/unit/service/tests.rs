@@ -30,6 +30,12 @@ fn service(config: Config, fail_touch: bool) -> (Arc<Service>, Arc<Mutex<Vec<Str
 		}
 		.boxed()
 	});
+	// These tests cover direct publication to the worktree; git mode would
+	// commit to a session branch in the store directory instead.
+	let config = Config {
+		mode: Mode::Local,
+		..config
+	};
 	let service = Arc::new(Service::new(config, touch));
 	(service, record, TempDir::new().unwrap())
 }
@@ -957,7 +963,13 @@ fn evidence_service() -> (Arc<Service>, Arc<Mutex<Vec<Evidence>>>, TempDir) {
 		.boxed()
 	});
 	(
-		Arc::new(Service::new(Config::default(), callback)),
+		Arc::new(Service::new(
+			Config {
+				mode: Mode::Local,
+				..Config::default()
+			},
+			callback,
+		)),
 		records,
 		TempDir::new().unwrap(),
 	)
@@ -1088,7 +1100,13 @@ async fn recording_timeout_is_bounded_unknown_and_never_replays_file_publication
 		copy.fetch_add(1, Ordering::Relaxed);
 		futures::future::pending().boxed()
 	});
-	let service = Arc::new(Service::new(Config::default(), callback));
+	let service = Arc::new(Service::new(
+		Config {
+			mode: Mode::Local,
+			..Config::default()
+		},
+		callback,
+	));
 	let dir = TempDir::new().unwrap();
 	let start = std::time::Instant::now();
 	let result = service

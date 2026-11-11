@@ -225,7 +225,7 @@ fn run_inner(action: &str, codex: bool) -> Result<(), String> {
 		.map(PathBuf::from)
 		.map(Ok)
 		.unwrap_or_else(crate::mcp::workspace)?;
-	let store = match config.at(&cwd) {
+	let store = match config.at_existing(&cwd) {
 		Ok(store) => store,
 		Err(_) => return Ok(()), // outside a repository git-fs has nothing to do
 	};

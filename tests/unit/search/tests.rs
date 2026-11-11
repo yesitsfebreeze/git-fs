@@ -767,21 +767,28 @@ async fn every_backend_call_carries_the_shared_flags() {
 	// one search would disagree about what exists.
 	let (_service, dir) = service(Config::default());
 	assert_eq!(
-		super::base_argv(&[]),
-		["--no-config", "--no-follow", "--hidden", "--glob=!.git/"]
+		super::base_argv(&[], ".git-fs"),
+		[
+			"--no-config",
+			"--no-follow",
+			"--hidden",
+			"--glob=!.git/",
+			"--glob=!/.git-fs/"
+		]
 	);
 	// rg lets the last matching glob decide, so the caller's glob is placed
 	// before the exclusion. Reversed, a caller asking for `*` re-includes the
 	// object store, which is exactly how this was first written.
 	assert_eq!(
-		super::base_argv(&["*.rs"]),
+		super::base_argv(&["*.rs"], ".git-fs"),
 		[
 			"--no-config",
 			"--no-follow",
 			"--hidden",
 			"--glob",
 			"*.rs",
-			"--glob=!.git/"
+			"--glob=!.git/",
+			"--glob=!/.git-fs/"
 		]
 	);
 	drop(dir);

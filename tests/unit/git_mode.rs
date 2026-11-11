@@ -1,7 +1,8 @@
 //! Git mode end to end through the tools: each change is one commit on the
 //! session branch, the worktree waits for materialize, reads and searches see
-//! the branch first, rollback undoes one commit, and local mode or a workspace
-//! outside a repository still writes the worktree.
+//! the branch first, rollback undoes one commit, local mode still writes the
+//! worktree, and a workspace outside a repository keeps its branches in the
+//! store directory.
 
 use crate::change_record::{Evidence, Provider, Storage};
 use crate::service::{Config, Context, Mode, Service, Touch};
@@ -258,9 +259,9 @@ async fn git_mode_commits_each_change_and_leaves_the_worktree_until_materialize(
 }
 
 #[tokio::test]
-async fn local_mode_and_a_workspace_outside_git_write_the_worktree() {
-	for (mode, repository) in [(Mode::Local, true), (Mode::Git, false)] {
-		let (_dir, root, service, recorded) = fixture(mode, repository);
+async fn local_mode_writes_the_worktree() {
+	for repository in [true, false] {
+		let (_dir, root, service, recorded) = fixture(Mode::Local, repository);
 		assert_eq!(
 			tool(&service, &root, "read", json!({"path":"a.txt"})).await["error"],
 			false
@@ -282,6 +283,89 @@ async fn local_mode_and_a_workspace_outside_git_write_the_worktree() {
 			assert!(git(&root, &["for-each-ref", "refs/gitfs/"]).is_empty());
 		}
 	}
+}
+
+#[tokio::test]
+async fn a_workspace_outside_git_keeps_its_branches_in_the_store_directory() {
+	let (_dir, root, service, _recorded) = fixture(Mode::Git, false);
+	let store_git = |args: &[&str]| {
+		let mut all = vec!["--git-dir=.git-fs"];
+		all.extend(args);
+		git(&root, &all)
+	};
+	assert_eq!(
+		tool(&service, &root, "read", json!({"path":"a.txt"})).await["error"],
+		false
+	);
+	for (path, text) in [("a.txt", "two\n"), ("src/new.txt", "fresh\n")] {
+		let written = tool(&service, &root, "write", json!({"path":path,"text":text})).await;
+		assert_eq!(written["error"], false, "{written}");
+	}
+	// The branch lives in the store directory; no `.git`, worktree untouched.
+	assert!(!root.join(".git").exists());
+	assert_eq!(store_git(&["show", "refs/gitfs/s1:a.txt"]), "two\n");
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"one\n"
+	);
+	assert!(!root.join("src/new.txt").exists());
+	let read = tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	assert!(
+		read["content"].as_str().unwrap().contains("1:two"),
+		"{read}"
+	);
+	if has_rg() {
+		let glob = tool(&service, &root, "glob", json!({"pattern":"*"})).await;
+		assert_eq!(
+			glob["content"]["items"],
+			json!(["a.txt", "src/new.txt"]),
+			"{glob}"
+		);
+	}
+
+	// Both rollbacks work on a branch that starts at a root commit.
+	let ls = gitfs(&service, &root, json!({"op":"ls"})).await;
+	let commits = ls["body"]["commits"].as_array().unwrap().clone();
+	assert_eq!(commits.len(), 2, "{ls}");
+	let dropped = gitfs(
+		&service,
+		&root,
+		json!({"op":"rollback","path":"src/new.txt"}),
+	)
+	.await;
+	assert_eq!(dropped["error"], false, "{dropped}");
+	let oldest = commits[1]["commit"].as_str().unwrap();
+	let undone = gitfs(&service, &root, json!({"op":"rollback","commit":oldest})).await;
+	assert_eq!(undone["error"], false, "{undone}");
+	let owned = gitfs(&service, &root, json!({"op":"ls"})).await["body"]["owned"].clone();
+	assert_eq!(owned, json!([]));
+
+	assert_eq!(
+		tool(&service, &root, "read", json!({"path":"a.txt"})).await["error"],
+		false
+	);
+	let written = tool(
+		&service,
+		&root,
+		"write",
+		json!({"path":"a.txt","text":"three\n"}),
+	)
+	.await;
+	assert_eq!(written["error"], false, "{written}");
+	let materialized = gitfs(&service, &root, json!({"op":"materialize"})).await;
+	assert_eq!(materialized["error"], false, "{materialized}");
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"three\n"
+	);
+
+	// Trunk operations name the missing trunk instead of a missing `.git`.
+	let catchup = gitfs(&service, &root, json!({"op":"catchup"})).await;
+	assert_eq!(catchup["error"], true, "{catchup}");
+	assert!(
+		catchup.to_string().contains("trunk has no commit yet"),
+		"{catchup}"
+	);
 }
 
 #[tokio::test]

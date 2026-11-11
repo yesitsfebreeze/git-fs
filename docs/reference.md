@@ -46,6 +46,12 @@
 Session commits live under `refs/gitfs/*`. `.git-fs/` stores session indexes, read
 records and the materialize ledger; git-fs adds it to `.git/info/exclude`.
 
+A project without `.git` needs none: the first write makes `.git-fs/` a git
+directory of its own that holds only the session branches and their objects.
+Every path a session writes counts as added, since there is no trunk to
+compare with; `integrate`, `gitfs_catchup` and `push` refuse for the same
+reason, and `gitfs_materialize` is how changes reach the worktree.
+
 ## Codex integration
 
 Codex selects `.codex-plugin/plugin.json`; Claude keeps its existing manifest.
@@ -166,8 +172,9 @@ call's edit fresh; the MCP server keeps that state for the whole session.
 | `GIT_FS_CONFIG` | A JSON object laid over the defaults in `manifest.md` (`mode`, read and search caps, `integrate.*`, `store_dir`). |
 | `GIT_FS_GATE_URL`, `GIT_FS_GATE_KEY` | An OpenAI-compatible endpoint `integrate` asks to review a diff when `integrate.gate_model` is set. A configured model with a missing endpoint or key blocks integration. |
 
-`mode: "local"` writes the worktree directly and turns the hook redirects off;
-a workspace outside a Git repository always behaves as local.
+`mode: "local"` writes the worktree directly and turns the hook redirects off.
+A workspace outside a Git repository stays in git mode: its first git-fs write
+makes the store directory a Git directory of its own.
 
 ## Repository review gate
 
