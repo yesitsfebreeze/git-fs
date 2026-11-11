@@ -25,6 +25,18 @@ fn new_repo() -> (tempfile::TempDir, Store) {
 	(dir, store)
 }
 
+#[cfg(unix)]
+#[test]
+fn a_standalone_store_owned_by_someone_else_is_not_adopted() {
+	let dir = tempfile::tempdir().unwrap();
+	assert!(owner_is_user(dir.path()));
+	assert!(!owner_is_user(&dir.path().join("absent")));
+	// `/` belongs to root; as root there is no other owner to test against.
+	if unsafe { libc::geteuid() } != 0 {
+		assert!(!owner_is_user(Path::new("/")));
+	}
+}
+
 #[test]
 fn a_submodule_refusal_names_the_gitlink_the_path_is_under_only() {
 	let (_dir, store) = new_repo();

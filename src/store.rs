@@ -140,7 +140,11 @@ impl StoreConfig {
 		// No project repository: the nearest store that is a git directory.
 		cwd.ancestors()
 			.map(|root| (root, root.join(&self.store_dir)))
-			.find(|(_, dir)| dir.join("HEAD").is_file())
+			.find(|(_, dir)| {
+				dir.join("HEAD").is_file()
+					&& owner_is_user(dir)
+					&& owner_is_user(&dir.join("config"))
+			})
 			.map(|(root, dir)| Store {
 				root: root.to_path_buf(),
 				git_dir: Some(dir.clone()),
@@ -155,6 +159,12 @@ impl StoreConfig {
 	/// Make the store directory under `cwd` a git directory of its own.
 	fn init_standalone(&self, cwd: &Path) -> Result<Store> {
 		let dir = cwd.join(&self.store_dir);
+		if dir.exists() && !owner_is_user(&dir) {
+			return Err(format!(
+				"{} belongs to another user; refusing to use it as a git directory",
+				dir.display()
+			));
+		}
 		// No templates: the store holds branches and objects only, and two first
 		// calls at once would otherwise fail copying the same template files.
 		run(cwd, Some(&dir), &["init", "-q", "--template="], None, None)?;
@@ -168,6 +178,25 @@ impl StoreConfig {
 			dir,
 		})
 	}
+}
+
+/// Whether the current user owns `path`. A standalone store is handed to git
+/// as an explicit `GIT_DIR`, which skips git's own dubious-ownership check,
+/// and its config can name commands git runs (`core.fsmonitor`): one that
+/// arrived with someone else's directory tree must not be adopted.
+#[cfg(unix)]
+fn owner_is_user(path: &Path) -> bool {
+	use std::os::unix::fs::MetadataExt;
+	// SAFETY: geteuid takes no arguments and cannot fail.
+	let uid = unsafe { libc::geteuid() };
+	std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == uid)
+}
+
+/// Ceiling: no ownership check on Windows; add one through the file's
+/// security descriptor if standalone stores are used there.
+#[cfg(not(unix))]
+fn owner_is_user(_path: &Path) -> bool {
+	true
 }
 
 #[derive(Debug)]
