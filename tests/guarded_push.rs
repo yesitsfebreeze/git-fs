@@ -1,0 +1,333 @@
+//! Exercise the real private hook, including Git for Windows' executable hook.
+use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn git(root: &Path, args: &[&str]) -> String {
+	let output = Command::new("git")
+		.current_dir(root)
+		.args([
+			"-c",
+			"user.name=Test",
+			"-c",
+			"user.email=test@example.com",
+			"-c",
+			"commit.gpgsign=false",
+		])
+		.args(args)
+		.output()
+		.unwrap();
+	assert!(
+		output.status.success(),
+		"git {args:?}: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+struct Fixture {
+	_temp: tempfile::TempDir,
+	root: PathBuf,
+	remote: PathBuf,
+	old: String,
+	new: String,
+}
+
+impl Fixture {
+	fn new() -> Self {
+		let temp = tempfile::tempdir().unwrap();
+		let root = temp.path().join("working copy");
+		let remote = temp.path().join("remote repository.git");
+		git(
+			temp.path(),
+			&[
+				"init",
+				"-q",
+				"--bare",
+				"-b",
+				"main",
+				remote.to_str().unwrap(),
+			],
+		);
+		git(
+			temp.path(),
+			&["init", "-q", "-b", "main", root.to_str().unwrap()],
+		);
+		fs::write(root.join("tracked.txt"), "base\n").unwrap();
+		git(&root, &["add", "tracked.txt"]);
+		git(&root, &["commit", "-qm", "base"]);
+		git(
+			&root,
+			&["remote", "add", "origin", remote.to_str().unwrap()],
+		);
+		git(&root, &["push", "-qu", "origin", "main"]);
+		let old = git(&root, &["rev-parse", "HEAD"]);
+		let receipt = format!(
+			"integrated\n\nIntegrated-by: gitfs\nGitfs-Session: push-test\nGitfs-Review: {}\nGitfs-Consumed: {}",
+			"a".repeat(64), "b".repeat(40),
+		);
+		git(&root, &["commit", "-q", "--allow-empty", "-m", &receipt]);
+		let new = git(&root, &["rev-parse", "HEAD"]);
+		Self {
+			_temp: temp,
+			root,
+			remote,
+			old,
+			new,
+		}
+	}
+
+	fn call(&self, input: Value) -> Value {
+		let output = Command::new(env!("CARGO_BIN_EXE_git-fs"))
+			.current_dir(&self.root)
+			.env("GIT_FS_DISK", &self.root)
+			.env("GIT_FS_SESSION", "push-test")
+			.env("GIT_FS_CONFIG", "{}")
+			.args(["call", "push", &input.to_string()])
+			.output()
+			.unwrap();
+		let result: Value = serde_json::from_slice(&output.stdout)
+			.unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
+		if result["error"] == true {
+			return result;
+		}
+		match &result["content"] {
+			Value::String(text) => serde_json::from_str(text).unwrap(),
+			value => value.clone(),
+		}
+	}
+
+	fn commit_input(&self, id: &str) -> Value {
+		let mut input = json!({"phase":"preview", "remote":"origin", "ref":"refs/heads/main",
+			"commit":self.new, "expected_remote_head":self.old});
+		let preview = self.call(input.clone());
+		assert_eq!(preview["phase"], "preview", "{preview}");
+		input["phase"] = json!("commit");
+		input["expected_revision"] = preview["revision"].clone();
+		input["operation_id"] = json!(id);
+		input
+	}
+
+	fn hook(&self, exit: u8) -> PathBuf {
+		let hooks = self.root.join("custom hooks");
+		fs::create_dir(&hooks).unwrap();
+		git(
+			&self.root,
+			&["config", "core.hooksPath", hooks.to_str().unwrap()],
+		);
+		let hook = hooks.join("pre-push");
+		fs::write(&hook, format!(
+			"#!/bin/sh\nprintf '%s\\n' \"$1\" \"$2\" > hook-args\ncat > hook-input-seen\nprintf 'run\\n' >> hook-runs\nexit {exit}\n"
+		)).unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		hook
+	}
+}
+
+fn configured_hooks_supported(root: &Path) -> bool {
+	// Invocation-only configuration leaves no probe entries in the repository.
+	let output = Command::new("git")
+		.current_dir(root)
+		.args([
+			"-c",
+			&format!(
+				"core.hooksPath={}",
+				root.join("absent-probe-hooks").display()
+			),
+			"-c",
+			"hook.git-fs-probe.event=pre-push",
+			"-c",
+			"hook.git-fs-probe.command=echo git-fs-configured-hook-probe",
+			"hook",
+			"run",
+			"--ignore-missing",
+			"pre-push",
+		])
+		.output()
+		.unwrap();
+	let supported = output.status.success()
+		&& [output.stdout, output.stderr]
+			.iter()
+			.any(|s| String::from_utf8_lossy(s).contains("git-fs-configured-hook-probe"));
+	if !supported {
+		eprintln!("Git lacks configured hooks; skipping configured-hook assertions.");
+	}
+	supported
+}
+
+#[test]
+fn guarded_push_runs_original_hook_preserves_index_and_does_not_replay() {
+	let f = Fixture::new();
+	let configured_hooks = configured_hooks_supported(&f.root);
+	let hook = f.hook(0);
+	let original_hook = fs::read(&hook).unwrap();
+	if configured_hooks {
+		git(&f.root, &["config", "hook.audit.event", "pre-push"]);
+		git(
+			&f.root,
+			&[
+				"config",
+				"hook.audit.command",
+				"printf 'configured\\n' >> configured-runs",
+			],
+		);
+		git(&f.root, &["config", "hook.disabled.event", "pre-push"]);
+		git(&f.root, &["config", "hook.disabled.command", "exit 1"]);
+		git(&f.root, &["config", "hook.disabled.enabled", "false"]);
+	}
+	fs::write(f.root.join("staged.txt"), "someone else's staged content\n").unwrap();
+	git(&f.root, &["add", "staged.txt"]);
+	fs::write(
+		f.root.join("tracked.txt"),
+		"someone else's unstaged content\n",
+	)
+	.unwrap();
+	let index = fs::read(f.root.join(".git/index")).unwrap();
+	let input = f.commit_input("success");
+	let result = f.call(input.clone());
+	assert_eq!(result["status"], "confirmed", "{result}");
+	assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/main"]), f.new);
+	assert_eq!(fs::read(f.root.join(".git/index")).unwrap(), index);
+	assert_eq!(fs::read(&hook).unwrap(), original_hook);
+	assert_eq!(
+		git(&f.root, &["config", "--get", "core.hooksPath"]),
+		hook.parent().unwrap().to_str().unwrap()
+	);
+	assert_eq!(
+		fs::read_to_string(f.root.join("tracked.txt")).unwrap(),
+		"someone else's unstaged content\n"
+	);
+	let arguments = fs::read_to_string(f.root.join("hook-args")).unwrap();
+	assert_eq!(
+		arguments.lines().collect::<Vec<_>>(),
+		["origin", f.remote.to_str().unwrap()]
+	);
+	assert_eq!(
+		fs::read_to_string(f.root.join("hook-input-seen")).unwrap(),
+		format!("{} {} refs/heads/main {}\n", f.new, f.new, f.old)
+	);
+	assert_eq!(f.call(input), result);
+	assert_eq!(
+		f.call(json!({"phase":"reconcile", "operation_id":"success"})),
+		result
+	);
+	assert_eq!(
+		fs::read_to_string(f.root.join("hook-runs")).unwrap(),
+		"run\n"
+	);
+	if configured_hooks {
+		assert_eq!(
+			fs::read_to_string(f.root.join("configured-runs")).unwrap(),
+			"configured\n"
+		);
+	}
+}
+
+#[test]
+fn configured_hook_veto_is_recorded_without_running_twice() {
+	let f = Fixture::new();
+	if !configured_hooks_supported(&f.root) {
+		return;
+	}
+	git(&f.root, &["config", "hook.veto.event", "pre-push"]);
+	git(
+		&f.root,
+		&[
+			"config",
+			"hook.veto.command",
+			"printf 'veto\\n' >> configured-runs; exit 1",
+		],
+	);
+	let input = f.commit_input("configured-refusal");
+	let result = f.call(input.clone());
+	assert_eq!(result["status"], "refused", "{result}");
+	assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/main"]), f.old);
+	assert_eq!(f.call(input), result);
+	assert_eq!(
+		fs::read_to_string(f.root.join("configured-runs")).unwrap(),
+		"veto\n"
+	);
+}
+
+#[test]
+fn legacy_hook_enable_setting_matches_native_git() {
+	let f = Fixture::new();
+	f.hook(1);
+	git(&f.root, &["config", "hook.pre-push.enabled", "false"]);
+	// Older Git ignores this setting for legacy hooks; match installed Git.
+	let baseline = Command::new("git")
+		.current_dir(&f.root)
+		.args([
+			"hook",
+			"run",
+			"--ignore-missing",
+			"pre-push",
+			"--",
+			"origin",
+			f.remote.to_str().unwrap(),
+		])
+		.output()
+		.unwrap()
+		.status
+		.success();
+	for name in ["hook-runs", "hook-args", "hook-input-seen"] {
+		let _ = fs::remove_file(f.root.join(name));
+	}
+	let result = f.call(f.commit_input("disabled-event"));
+	assert_eq!(
+		result["status"],
+		if baseline { "confirmed" } else { "refused" },
+		"{result}"
+	);
+	assert_eq!(
+		git(&f.remote, &["rev-parse", "refs/heads/main"]),
+		if baseline { f.new } else { f.old }
+	);
+	assert_eq!(f.root.join("hook-runs").exists(), !baseline);
+	assert_eq!(
+		git(&f.root, &["config", "--get", "hook.pre-push.enabled"]),
+		"false"
+	);
+}
+
+#[test]
+fn original_hook_veto_is_durable_and_never_moves_remote() {
+	let f = Fixture::new();
+	f.hook(1);
+	let input = f.commit_input("refusal");
+	let result = f.call(input.clone());
+	assert_eq!(result["status"], "refused", "{result}");
+	assert_eq!(result["reason"], "hook_refused", "{result}");
+	assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/main"]), f.old);
+	assert_eq!(f.call(input), result);
+	assert_eq!(
+		fs::read_to_string(f.root.join("hook-runs")).unwrap(),
+		"run\n"
+	);
+}
+
+#[test]
+fn changed_remote_after_preview_is_refused_before_dispatch() {
+	let f = Fixture::new();
+	let input = f.commit_input("stale");
+	git(&f.root, &["commit", "-q", "--allow-empty", "-m", "later"]);
+	git(&f.root, &["push", "-q", "origin", "main"]);
+	let current = git(&f.remote, &["rev-parse", "refs/heads/main"]);
+	f.hook(0);
+	let result = f.call(input);
+	assert_eq!(result["error"], true, "{result}");
+	assert!(
+		result["content"]
+			.as_str()
+			.unwrap()
+			.contains("expected remote head changed"),
+		"{result}"
+	);
+	assert!(!f.root.join("hook-runs").exists());
+	assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/main"]), current);
+}

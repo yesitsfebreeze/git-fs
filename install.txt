@@ -7,7 +7,7 @@ its tools to the agent. A host without MCP support needs an MCP client adapter.
 
 WHY INTEGRATE IT
 
-git-fs gives an agent a Git session branch for file work. Each write or edit
+git-fs gives an agent a Git session branch for file work. Each write, edit or delete
 is a commit on refs/gitfs/<session>. Reads and searches see that session's
 changes before the worktree. Edits to existing files require a prior git-fs
 read and refuse stale bytes, helping prevent accidental overwrites.
@@ -23,6 +23,7 @@ INSTALL THE BINARY
 
 1. Check prerequisites:
    - Git and ripgrep (the rg executable) available to the server at runtime.
+     Guarded push requires Git 2.40 or newer.
    - A Git repository with an initial commit for branch-backed operation.
    - No Rust compiler or source checkout is needed for the prebuilt binary.
 

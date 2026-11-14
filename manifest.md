@@ -215,7 +215,7 @@
       }
     },
     "tool.gitfs.capture": {
-      "description": "Capture selected worktree paths into the session branch.",
+      "description": "Capture disk changes into the session branch. Explicit paths can adopt additions, edits and tracked deletions; omitted paths capture only owned paths.",
       "schema": {
         "type": "object",
         "required": [
@@ -239,7 +239,7 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "Restrict to these owned paths (materialize, capture)."
+                "description": "Select disk paths to capture, including unowned files and tracked deletions; omit to capture only owned paths."
               }
             },
             "additionalProperties": false
@@ -425,7 +425,7 @@
     "mode": {
       "type": "string",
       "default": "git",
-      "doc": "Where write and edit publish. git: one commit per change on refs/gitfs/<session>, the worktree untouched until gitfs_materialize; reads and searches prefer the session's changes, then the working directory, including uncommitted edits and deletions. Read responses identify their revision and disk divergence. local: write the worktree directly. A workspace outside a Git repository keeps its session branches in the store directory, which is then a Git directory of its own."
+      "doc": "Where write, edit and delete publish. git: one commit per change on refs/gitfs/<session>, the worktree untouched until gitfs_materialize; reads and searches prefer the session's changes, then the working directory, including uncommitted edits and deletions. Read responses identify their revision and disk divergence. local: write the worktree directly. A workspace outside a Git repository keeps its session branches in the store directory, which is then a Git directory of its own."
     },
     "max_read_bytes": {
       "type": "integer",

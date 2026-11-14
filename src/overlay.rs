@@ -30,7 +30,7 @@ pub(crate) fn describe() -> Value {
 				"path":{"type":"string","minLength":1,"description":"Repo-relative path, no leading / or ..; absent answers the session-wide summary: every owned path with its status"},
 				"session":{"type":"string","minLength":1,"description":"Whose branch to list (ls); your own by default."},
 				"commit":{"type":"string","minLength":1,"description":"A commit of your session to undo (rollback; or give `path` instead to put that path back to its content at session start)."},
-				"paths":{"type":"array","items":{"type":"string"},"description":"Restrict to these owned paths (materialize, capture)."},
+				"paths":{"type":"array","items":{"type":"string"},"description":"Restrict materialization to these owned paths; explicit capture paths adopt selected disk files and tracked deletions."},
 				"force":{"type":"boolean","description":"Overwrite newer on-disk files (materialize)."},
 				"offset":{"type":"integer","minimum":0},
 				"limit":{"type":"integer","minimum":1,"maximum":65536,"description":"Patch bytes per page (diff); below 128 a page still answers 128, so a page always moves past a multibyte character."},
@@ -196,39 +196,67 @@ fn capture_paths(
 	input: &Value,
 	capture: &mut Capture,
 ) -> Result<Value> {
-	let owned = store.owned_paths(session)?;
-	let selected = input["paths"].as_array();
-	if let Some(paths) = selected {
-		for path in paths {
-			let path = path.as_str().ok_or("capture paths must contain strings")?;
-			resolve_rel(store.root(), path)?;
-			if !owned.iter().any(|(_, rel)| rel == path) {
-				return Err(format!(
-					"capture: path is not owned by this session: {path}"
-				));
-			}
+	let owned = store.session_paths(session)?;
+	let explicit = input["paths"].as_array();
+	let requested: Vec<String> = match explicit {
+		Some(paths) => paths
+			.iter()
+			.map(|p| {
+				p.as_str()
+					.map(str::to_owned)
+					.ok_or("capture paths must contain strings".to_owned())
+			})
+			.collect::<Result<_>>()?,
+		None => owned.iter().map(|(_, path)| path.clone()).collect(),
+	};
+	let mut selected = Vec::new();
+	for path in requested {
+		let rel = if explicit.is_some() {
+			capture_path(store.root(), &path)?
+		} else {
+			path
+		};
+		if selected.contains(&rel) {
+			continue;
 		}
+		if explicit.is_some()
+			&& !store.root().join(&rel).exists()
+			&& !owned.iter().any(|(_, p)| p == &rel)
+			&& store.selected_blob(session, Path::new(&rel))?.is_none()
+		{
+			return Err(format!(
+				"capture: missing path is not tracked by this session or trunk: {rel}"
+			));
+		}
+		selected.push(rel);
 	}
-	let source = store.root();
 	let mut saved = Vec::new();
 	let mut errors = Vec::new();
-	for (status, rel) in owned {
-		if selected.is_some_and(|paths| !paths.iter().any(|p| p.as_str() == Some(&rel))) {
-			continue;
-		}
-		if status == 'D' {
-			continue;
-		}
-		let capture = (|| -> Result<bool> {
+	for rel in selected {
+		let result = (|| -> Result<bool> {
+			capture_path(store.root(), &rel)?;
 			let path = Path::new(&rel);
-			let bytes =
-				std::fs::read(source.join(&rel)).map_err(|e| format!("read failed: {e}"))?;
-			let mode = store.mode_for(session, path)?;
-			Ok(store
-				.write_blob_captured(session, path, &bytes, &mode, capture, Operation::Capture)?
-				.is_some())
+			let changed = match std::fs::read(store.root().join(&rel)) {
+				Ok(bytes) => {
+					let mode = store.mode_for(session, path)?;
+					store.write_blob_captured(
+						session,
+						path,
+						&bytes,
+						&mode,
+						capture,
+						Operation::Capture,
+					)?
+				}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+					store.delete_blob_captured(session, path, capture, Operation::Capture)?
+				}
+				Err(e) => return Err(format!("read failed: {e}")),
+			};
+			store.note_materialized(session, &rel)?;
+			Ok(changed.is_some())
 		})();
-		match capture {
+		match result {
 			Ok(true) => saved.push(rel),
 			Ok(false) => {}
 			Err(error) => errors.push(format!("{rel}: {error}")),
@@ -237,6 +265,47 @@ fn capture_paths(
 	let mut result = ok(json!({"captured":saved,"errors":errors}))?;
 	result["error"] = json!(!errors.is_empty());
 	Ok(result)
+}
+
+/// Explicit capture is an opt-in adoption of disk content, never an escape
+/// through a symlink or a recursive directory operation.
+fn capture_path(root: &Path, path: &str) -> Result<String> {
+	use std::path::Component;
+	let path = Path::new(path);
+	if path.as_os_str().is_empty()
+		|| path
+			.components()
+			.any(|c| !matches!(c, Component::Normal(_)))
+	{
+		return Err("capture requires a repository-relative file path without . or ..".into());
+	}
+	let root = root.canonicalize().map_err(|e| e.to_string())?;
+	let rel = path
+		.components()
+		.map(|c| c.as_os_str().to_str().ok_or("capture path is not UTF-8"))
+		.collect::<Result<Vec<_>, _>>()?
+		.join("/");
+	let mut part = root.clone();
+	for component in path.components() {
+		part.push(component);
+		match std::fs::symlink_metadata(&part) {
+			Ok(metadata) if metadata.file_type().is_symlink() => {
+				return Err(format!("capture refuses symbolic links: {rel}"))
+			}
+			Ok(metadata) if part == root.join(path) && !metadata.is_file() => {
+				return Err(format!("capture requires a regular file: {rel}"))
+			}
+			Ok(_) => (),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+			Err(e) => return Err(format!("capture path unavailable: {e}")),
+		}
+	}
+	if crate::files::resolve(&root, path)? != root.join(path) {
+		return Err(format!(
+			"capture path resolves outside its selected location: {rel}"
+		));
+	}
+	Ok(rel)
 }
 
 #[cfg(test)]

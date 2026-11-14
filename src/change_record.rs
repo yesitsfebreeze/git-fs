@@ -29,6 +29,7 @@ pub enum Provider {
 pub enum Operation {
 	Write,
 	Edit,
+	Delete,
 	Capture,
 	Materialize,
 }
@@ -141,10 +142,12 @@ impl Evidence {
 		}
 		let overlay = self.target.storage == Storage::GitfsOverlay;
 		match (&self.provider, &self.operation) {
-			(Provider::Fs, Operation::Write | Operation::Edit) if !overlay => (),
+			(Provider::Fs, Operation::Write | Operation::Edit | Operation::Delete) if !overlay => {}
 			(Provider::Gitfs, Operation::Materialize) if !overlay => (),
-			(Provider::Gitfs, Operation::Write | Operation::Edit | Operation::Capture)
-				if overlay => {}
+			(
+				Provider::Gitfs,
+				Operation::Write | Operation::Edit | Operation::Delete | Operation::Capture,
+			) if overlay => {}
 			_ => return Err("invalid provider/operation/storage".into()),
 		}
 		if self.provider == Provider::Fs {

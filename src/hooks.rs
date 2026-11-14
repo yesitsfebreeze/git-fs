@@ -66,9 +66,9 @@ pub fn guide(session: &str, owned: usize, mode: Mode) -> String {
 		"Use the git-fs tools (mcp__plugin_git-fs_git-fs__*) for files in this repository, not the native ones:\n\
 		 - read, not Read, cat or sed -n: answers from the branch before the worktree and records what you read, which is what makes your next edit fresh.\n\
 		 - every tool accepts a single argument object or an items array of up to 32 argument objects. Read/search items can run concurrently (1-8); mutation items run in order and stop on error. Inspect every result and skipped item before continuing.\n\
-		 - edit and write, not Edit, Write or a heredoc: one commit each on the branch; refused when the bytes you last read are no longer current, except an edit whose old text is still unique after another agent's committed revision reached the shared worktree. A native Write or Edit inside the repository is blocked by the pre-tool hook with this reminder.\n\
+		 - edit, write and delete (remove a file after reading it), not Edit, Write or a heredoc: one commit each on the branch; refused when the bytes you last read are no longer current, except an edit whose old text is still unique after another agent's committed revision reached the shared worktree. A native Write or Edit inside the repository is blocked by the pre-tool hook with this reminder.\n\
 		 - grep, glob and search, not Grep, Glob, rg or find: see the branch, then the working directory, including uncommitted changes. The native ones see the disk only.\n\
-		 - gitfs_materialize before a Bash build or test run: copies owned paths to the worktree (Stop does it too). gitfs_capture pulls disk edits of owned paths back in.\n\
+		 - gitfs_materialize before a Bash build or test run: copies owned paths to the worktree (Stop does it too). gitfs_capture pulls disk edits and deletions of owned paths back in; explicit paths adopt selected disk files and tracked deletions.\n\
 		 - gitfs_ls and gitfs_diff to review, gitfs_catchup after trunk moved (non-overlapping changes to one file merge), integrate to commit the session onto trunk, push to publish.\n\
 		 - run git status and git diff if useful, but not git add or git commit: the session branch is your record, integrate publishes it, and a plain git command competes for the shared index.\n\
 		 Bash stays for builds, tests and everything that is not reading or writing project files.",
@@ -327,7 +327,17 @@ fn mirror(
 ) -> Result<(), String> {
 	let bytes = match std::fs::read(root.join(rel)) {
 		Ok(bytes) => bytes,
-		Err(_) => return Ok(()), // A deletion has no bytes to mirror.
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			store.delete_blob_captured(
+				session,
+				Path::new(rel),
+				&mut Capture::default(),
+				crate::change_record::Operation::Delete,
+			)?;
+			store.note_materialized(session, rel)?;
+			return Ok(());
+		}
+		Err(e) => return Err(format!("{rel}: native edit capture failed: {e}")),
 	};
 	let file_mode = store.mode_for(session, Path::new(rel))?;
 	if store.read(session, Path::new(rel))?.as_deref() != Some(bytes.as_slice()) {
@@ -346,7 +356,7 @@ fn materialize_stale(
 	rel: &str,
 ) -> Result<(), String> {
 	if !store
-		.owned_paths(session)?
+		.session_paths(session)?
 		.iter()
 		.any(|(_, owned)| owned == rel)
 	{
@@ -378,4 +388,53 @@ pub fn run_host(action: &str, codex: bool) -> i32 {
 		note(&format!("hook {action}: {e}"));
 	}
 	0
+}
+
+#[cfg(test)]
+mod deletion_tests {
+	use super::*;
+
+	#[test]
+	fn native_deletion_is_mirrored_and_read_errors_are_reported() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().canonicalize().unwrap();
+		let git = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&root)
+				.env("GIT_AUTHOR_NAME", "fixture")
+				.env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+				.env("GIT_COMMITTER_NAME", "fixture")
+				.env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"{}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+			String::from_utf8(out.stdout).unwrap()
+		};
+		git(&["init", "-q"]);
+		std::fs::write(root.join("old"), "before\n").unwrap();
+		git(&["add", "old"]);
+		git(&["-c", "commit.gpgsign=false", "commit", "-qm", "base"]);
+		let store = crate::store::StoreConfig::new(".git-fs").at(&root).unwrap();
+		std::fs::remove_file(root.join("old")).unwrap();
+		mirror(&store, "s", &root, "old").unwrap();
+		assert_eq!(
+			git(&["diff", "--name-status", "HEAD", "refs/gitfs/s"]),
+			"D\told\n"
+		);
+		assert!(store
+			.materialize_captured("s", None, false, &mut Capture::default())
+			.unwrap()
+			.errors
+			.is_empty());
+		assert!(!root.join("old").exists());
+		std::fs::create_dir(root.join("old")).unwrap();
+		assert!(mirror(&store, "s", &root, "old")
+			.unwrap_err()
+			.contains("capture failed"));
+	}
 }

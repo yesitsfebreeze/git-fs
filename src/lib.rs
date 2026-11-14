@@ -40,10 +40,11 @@ use std::sync::{Arc, OnceLock};
 pub(crate) type Result<T, E = String> = std::result::Result<T, E>;
 
 /// Every tool the MCP server lists, by the name an agent calls it.
-pub const TOOLS: [&str; 16] = [
+pub const TOOLS: [&str; 17] = [
 	"read",
 	"write",
 	"edit",
+	"delete",
 	"glob",
 	"grep",
 	"search",

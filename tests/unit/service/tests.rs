@@ -109,6 +109,95 @@ async fn unread_overwrite_fails_without_changing_bytes() {
 }
 
 #[tokio::test]
+async fn delete_rechecks_the_exact_git_preimage_after_preparation() {
+	for trunk in [false, true] {
+		let (mut service, _, dir) = service(Config::default(), false);
+		let root = dir.path().canonicalize().unwrap();
+		let git = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&root)
+				.env("GIT_AUTHOR_NAME", "fixture")
+				.env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+				.env("GIT_COMMITTER_NAME", "fixture")
+				.env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"{}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+		};
+		git(&["init", "-q"]);
+		std::fs::write(root.join("a.txt"), "before\n").unwrap();
+		git(&["add", "a.txt"]);
+		git(&["-c", "commit.gpgsign=false", "commit", "-qm", "base"]);
+		Arc::get_mut(&mut service).unwrap().config.mode = Mode::Git;
+		let captured_root = root.clone();
+		Arc::get_mut(&mut service).unwrap().before_commit = Some(Arc::new(move |_| {
+			if trunk {
+				std::fs::write(captured_root.join("a.txt"), "newer\n").unwrap();
+				for args in [
+					vec!["add", "a.txt"],
+					vec![
+						"-c",
+						"user.name=fixture",
+						"-c",
+						"user.email=fixture@example.test",
+						"-c",
+						"commit.gpgsign=false",
+						"commit",
+						"-qm",
+						"newer",
+					],
+				] {
+					assert!(std::process::Command::new("git")
+						.args(args)
+						.current_dir(&captured_root)
+						.status()
+						.unwrap()
+						.success());
+				}
+			} else {
+				crate::store::StoreConfig::new(".git-fs")
+					.at(&captured_root)
+					.unwrap()
+					.write_blob("s1", Path::new("a.txt"), b"newer\n", "100644")
+					.unwrap();
+			}
+		}));
+		assert_eq!(
+			service
+				.dispatch(
+					"read",
+					call("read", &context(&root), json!({"path":"a.txt"}))
+				)
+				.await["error"],
+			false
+		);
+		let result = service
+			.dispatch(
+				"delete",
+				call("delete", &context(&root), json!({"path":"a.txt"})),
+			)
+			.await;
+		assert_eq!(result["error"], true, "{result}");
+		assert!(result["content"]
+			.as_str()
+			.unwrap()
+			.contains("changed since it was read"));
+		let store = service.store.at(&root).unwrap();
+		let bytes = if trunk {
+			store.trunk_read(Path::new("a.txt")).unwrap()
+		} else {
+			store.read("s1", Path::new("a.txt")).unwrap()
+		};
+		assert_eq!(bytes.unwrap(), b"newer\n");
+	}
+}
+
+#[tokio::test]
 async fn unseen_edit_fails_without_changing_bytes() {
 	let (service, record, dir) = service(Config::default(), false);
 	let cwd = dir.path();

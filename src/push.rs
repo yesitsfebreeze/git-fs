@@ -6,13 +6,13 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(unix)]
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+mod windows;
 
 // Caps, not constants: declared in `kern.md` under `limits`.
 fn capacity() -> usize {
@@ -21,7 +21,6 @@ fn capacity() -> usize {
 fn record_limit() -> usize {
 	crate::limits::limits().push_record_bytes
 }
-#[cfg_attr(not(unix), allow(dead_code))]
 fn output_limit() -> usize {
 	crate::limits::limits().push_output_bytes
 }
@@ -147,8 +146,6 @@ impl Context<'_> {
 			.arg(&self.root)
 			.args([
 				"-c",
-				"core.hooksPath=/dev/null",
-				"-c",
 				"push.followTags=false",
 				"-c",
 				"push.recurseSubmodules=no",
@@ -170,21 +167,23 @@ impl Context<'_> {
 	}
 	fn run(&self, mut command: Command) -> Result<Output> {
 		self.check()?;
-		#[cfg(not(unix))]
-		{
-			let _ = &mut command;
-			Err("bounded push requires macOS/Linux".into())
-		}
 		#[cfg(unix)]
 		{
 			use std::os::unix::process::CommandExt;
+			command.process_group(0);
+		}
+		#[cfg(windows)]
+		let job = windows::Job::prepare(&mut command)?;
+		{
 			command
-				.process_group(0)
 				.stdin(Stdio::null())
 				.stdout(Stdio::piped())
 				.stderr(Stdio::piped());
 			let mut child = command.spawn().map_err(|_| "Git process unavailable")?;
+			#[cfg(unix)]
 			let group = child.id();
+			#[cfg(windows)]
+			job.attach_and_resume(&mut child)?;
 			let overflow = Arc::new(AtomicBool::new(false));
 			let read = |mut pipe: Box<dyn Read + Send>, overflow: Arc<AtomicBool>| {
 				std::thread::spawn(move || {
@@ -233,9 +232,12 @@ impl Context<'_> {
 			// Kill the entire group even after the parent exits: helpers may own its pipes.
 			// A signal, not a `/bin/kill` child: a sandbox that forbids exec
 			// would leave the group alive and `wait` blocked on it.
+			#[cfg(unix)]
 			unsafe {
 				libc::killpg(group as libc::pid_t, libc::SIGKILL);
 			}
+			#[cfg(windows)]
+			job.terminate();
 			let _ = child.wait();
 			// A descendant that left the group can still hold the pipes open;
 			// the readers get the same deadline, never an unbounded join.
@@ -263,27 +265,18 @@ impl Context<'_> {
 		String::from_utf8(o.bytes).map_err(|_| "Git output is not UTF-8".into())
 	}
 	fn repository(&self) -> Result<String> {
-		#[cfg(not(unix))]
-		{
-			Err("push repository identity unsupported".into())
-		}
-		#[cfg(unix)]
-		{
-			use std::os::unix::fs::MetadataExt;
-			let root = self
-				.root
-				.canonicalize()
-				.map_err(|_| "repository unavailable")?;
-			let dir = git_path(&self.git(&["rev-parse", "--absolute-git-dir"])?)?
-				.canonicalize()
-				.map_err(|_| "repository unavailable")?;
-			let a = fs::metadata(&root).map_err(|_| "repository unavailable")?;
-			let b = fs::metadata(&dir).map_err(|_| "repository unavailable")?;
-			Ok(digest(
-				&serde_json::to_vec(&(root, dir, a.dev(), a.ino(), b.dev(), b.ino()))
-					.expect("identity"),
-			))
-		}
+		let root = self
+			.root
+			.canonicalize()
+			.map_err(|_| "repository unavailable")?;
+		let dir = git_path(&self.git(&["rev-parse", "--absolute-git-dir"])?)?
+			.canonicalize()
+			.map_err(|_| "repository unavailable")?;
+		let a = crate::store::file_id(&root).map_err(|_| "repository unavailable")?;
+		let b = crate::store::file_id(&dir).map_err(|_| "repository unavailable")?;
+		Ok(digest(
+			&serde_json::to_vec(&(root, dir, a.0, a.1, b.0, b.1)).expect("identity"),
+		))
 	}
 	fn url(&self, remote: &str) -> Result<String> {
 		let rewrites = self.run(self.command(&[
@@ -310,6 +303,24 @@ impl Context<'_> {
 			return Err("one bounded push URL required".into());
 		}
 		Ok(urls[0].into())
+	}
+	fn configured_hooks(&self) -> Result<Vec<String>> {
+		let output =
+			self.run(self.command(&["config", "--null", "--get-regexp", r"^hook\..*\.event$"]))?;
+		let text =
+			String::from_utf8(output.bytes).map_err(|_| "hook configuration is not UTF-8")?;
+		let mut hooks = std::collections::BTreeSet::new();
+		for entry in text.split_terminator('\0') {
+			let (key, event) = entry
+				.split_once('\n')
+				.ok_or("hook configuration malformed")?;
+			if event.is_empty() {
+				hooks.remove(key);
+			} else if event == "pre-push" {
+				hooks.insert(key.to_owned());
+			}
+		}
+		Ok(hooks.into_iter().collect())
 	}
 	fn remote_head(&self, url: &str, reference: &str) -> Result<Option<String>> {
 		let data = self.git(&["ls-remote", "--refs", "--", url, reference])?;
@@ -596,7 +607,7 @@ fn private_dir(path: &Path) -> Result<()> {
 	Ok(())
 }
 pub(crate) use crate::hook::atomic_write;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) use crate::hook::hook_valid;
 
 pub fn execute(
@@ -725,9 +736,7 @@ pub fn execute(
 		}
 		private_dir(&dir)?;
 		cx.save(&dir, &record)?;
-		File::open(&cx.dir)
-			.and_then(|f| f.sync_all())
-			.map_err(|_| "push reservation durability failed")?;
+		crate::hook::sync_directory(&cx.dir)?;
 	}
 	if remote.as_deref() == Some(&record.binding.commit) {
 		record.status = Status::Confirmed;
@@ -736,19 +745,33 @@ pub fn execute(
 		cx.save(&dir, &record)?;
 		return Ok(record.value());
 	}
-	// On Windows the not(unix) arm returns first, leaving the Unix dispatch
-	// body unreachable; the code stays for the platforms that run it.
-	#[cfg_attr(not(unix), allow(unreachable_code))]
 	let dispatch = (|| -> Result<Output> {
+		let configured_hooks = cx.configured_hooks()?;
+		let user_hooks =
+			git_path(&cx.git(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"])?)?;
 		let hooks = dir.join("hooks");
 		private_dir(&hooks)?;
 		#[cfg(unix)]
 		std::os::unix::fs::symlink(crate::hook_program()?, hooks.join("pre-push"))
 			.map_err(|_| "owned push hook unavailable")?;
-		#[cfg(not(unix))]
-		return Err("owned push hook unsupported".into());
-		let hook = hooks.to_str().ok_or("hook path invalid")?;
-		let mut command = cx.command(&[
+		#[cfg(windows)]
+		{
+			let program = crate::hook_program()?;
+			let hook = hooks.join("pre-push.exe");
+			fs::hard_link(&program, &hook)
+				.or_else(|_| fs::copy(&program, &hook).map(|_| ()))
+				.map_err(|_| "owned push hook unavailable")?;
+		}
+		let hook = crate::hook::git_command_path(&hooks)?;
+		let mut command = cx.command(&[]);
+		// Git also runs configured hook.<name>.event hooks outside hooksPath.
+		// Run them once inside our private hook so their veto is recorded too.
+		for key in &configured_hooks {
+			command.args(["-c", &format!("{key}=")]);
+		}
+		command.args([
+			"-c",
+			"hook.pre-push.enabled=true",
 			"-c",
 			&format!("core.hooksPath={hook}"),
 			"push",
@@ -762,6 +785,8 @@ pub fn execute(
 		]);
 		command
 			.env("GITFS_PUSH_HOOK", "1")
+			.env("GITFS_PUSH_USER_HOOKS", user_hooks)
+			.env("GITFS_PUSH_REMOTE", &record.binding.remote)
 			.env("GITFS_PUSH_NEW", &record.binding.commit)
 			.env(
 				"GITFS_PUSH_OLD",
@@ -774,6 +799,10 @@ pub fn execute(
 			.env("GITFS_PUSH_REF", &record.binding.reference)
 			.env("GITFS_REVIEW_ROOT", &cx.root)
 			.env("GITFS_PUSH_RESULT", dir.join("hook-result"));
+		command.env_remove("GITFS_PUSH_ORIGINAL_CONFIG_PARAMETERS");
+		if let Some(parameters) = std::env::var_os("GIT_CONFIG_PARAMETERS") {
+			command.env("GITFS_PUSH_ORIGINAL_CONFIG_PARAMETERS", parameters);
+		}
 		cx.run(command)
 	})();
 
@@ -781,7 +810,10 @@ pub fn execute(
 	Ok(cx.reconcile(&dir, record)?.value())
 }
 
-// The push tests spawn `/bin/sh`, `/bin/kill` and POSIX helper groups.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "../tests/unit/push/tests.rs"]
 mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "../tests/unit/push/windows.rs"]
+mod windows_tests;

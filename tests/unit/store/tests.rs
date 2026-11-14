@@ -90,6 +90,119 @@ fn materialize_of_a_session_with_no_commit_answers_nothing_to_copy() {
 }
 
 #[test]
+fn deleting_a_changed_disk_copy_is_refused_even_with_its_original_timestamp() {
+	let (_dir, store) = new_repo();
+	let path = store.root().join("README");
+	let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+	store
+		.delete_blob_captured(
+			"s",
+			Path::new("README"),
+			&mut Capture::default(),
+			Operation::Delete,
+		)
+		.unwrap();
+	std::fs::write(&path, "unrelated hand edit\n").unwrap();
+	std::fs::File::options()
+		.write(true)
+		.open(&path)
+		.unwrap()
+		.set_times(std::fs::FileTimes::new().set_modified(modified))
+		.unwrap();
+	store
+		.write_blob("s", Path::new("other"), b"later commit\n", "100644")
+		.unwrap();
+	let result = store.materialize("s", None, false).unwrap();
+	assert_eq!(result.conflicts.len(), 1, "{:?}", result.conflicts);
+	assert_eq!(
+		std::fs::read_to_string(&path).unwrap(),
+		"unrelated hand edit\n"
+	);
+}
+
+#[test]
+fn changed_capture_snapshot_cannot_be_blessed_by_a_new_disk_timestamp() {
+	let (_dir, store) = new_repo();
+	store
+		.write_blob("s", Path::new("README"), b"captured\n", "100644")
+		.unwrap();
+	std::fs::write(store.root().join("README"), "newer disk\n").unwrap();
+	assert!(store
+		.note_materialized("s", "README")
+		.unwrap_err()
+		.contains("partial_success"));
+	let result = store.materialize("s", None, false).unwrap();
+	assert_eq!(result.conflicts.len(), 1);
+	assert_eq!(
+		std::fs::read_to_string(store.root().join("README")).unwrap(),
+		"newer disk\n"
+	);
+}
+
+#[test]
+fn pending_canceled_creation_must_materialize_before_publication_discards_it() {
+	let (_dir, store) = new_repo();
+	store
+		.write_blob("s", Path::new("new"), b"new\n", "100644")
+		.unwrap();
+	store.materialize("s", None, false).unwrap();
+	store
+		.delete_blob_captured(
+			"s",
+			Path::new("new"),
+			&mut Capture::default(),
+			Operation::Delete,
+		)
+		.unwrap();
+	store
+		.write_blob("s", Path::new("README"), b"after\n", "100644")
+		.unwrap();
+	assert!(store
+		.preview_integrate("s")
+		.unwrap_err()
+		.contains("pending deletion"));
+	assert!(store
+		.catchup_captured("s", &mut Capture::default())
+		.unwrap_err()
+		.contains("pending deletion"));
+	let result = store.materialize("s", None, false).unwrap();
+	assert!(result.errors.is_empty());
+	assert!(!store.root().join("new").exists());
+	assert!(store.preview_integrate("s").is_ok());
+	assert!(store.catchup_captured("s", &mut Capture::default()).is_ok());
+}
+
+#[test]
+fn canceled_literal_bracket_filename_stays_deleted_in_the_session_view() {
+	let (_dir, store) = new_repo();
+	store
+		.write_blob("s", Path::new("a1.txt"), b"keep\n", "100644")
+		.unwrap();
+	store
+		.write_blob("s", Path::new("a[1].txt"), b"remove\n", "100644")
+		.unwrap();
+	store.materialize("s", None, false).unwrap();
+	store
+		.delete_blob_captured(
+			"s",
+			Path::new("a[1].txt"),
+			&mut Capture::default(),
+			Operation::Delete,
+		)
+		.unwrap();
+	assert_eq!(
+		store.session_change("s", Path::new("a[1].txt")).unwrap(),
+		Some(None)
+	);
+	store.materialize("s", None, false).unwrap();
+	assert!(!store.root().join("a[1].txt").exists());
+	assert_eq!(
+		std::fs::read_to_string(store.root().join("a1.txt")).unwrap(),
+		"keep\n"
+	);
+}
+
+#[test]
 fn roundtrip_and_noop() {
 	let (_dir, store) = new_repo();
 	let session = "s1";
@@ -424,6 +537,7 @@ fn prepared_head_transaction_holds_the_symbolic_branch_until_decision() {
 	let review = store.reviewed_tree("review").unwrap();
 	store.git(&["branch", "other"]).unwrap();
 	let mut process = git_cmd(store.root(), None, &["update-ref", "--stdin"], None)
+		.unwrap()
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())

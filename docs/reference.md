@@ -2,7 +2,7 @@
 
 ## What you get
 
-- **Guarded writes.** `write` and `edit` are refused unless the bytes the
+- **Guarded writes.** `write`, `edit` and `delete` are refused unless the bytes the
   session last read are still current. A whole-file read of more than 350 lines
   is refused; read a range or grep. `edit` replaces one exact unique match, all
   matches with `all`, or an `edits` array in one all-or-nothing commit. When a
@@ -19,7 +19,9 @@
   `gitfs_materialize` (copy owned paths to disk, refusing files newer on disk or
   modified since the last materialize, `force` to override; a copy another
   session committed and materialized is merged instead of refused),
-  `gitfs_capture` (pull disk edits of owned paths back in). Both report the
+  `gitfs_capture` (pull disk changes back in; explicit paths can adopt
+  additions, edits and tracked deletions, while omitted paths stay limited to
+  owned paths). Materialization and catchup report the
   paths they merged under `merged`.
 - **Two sessions, one file.** An append to a file both sessions extend (a
   ledger, a log, a table) is a union: `edit` rebases onto the sibling's
@@ -28,7 +30,8 @@
   anchor both land. Only changes to the same lines refuse, naming the path.
 - **Publication.** `integrate` previews and commits the session onto trunk
   with a secret scan, `push` runs a guarded push with `operation_id`
-  idempotency and a private pre-push hook, `undo` reverts the last integrated
+  idempotency and a private pre-push hook that also runs the repository's
+  existing pre-push hooks once, `undo` reverts the last integrated
   change, `scan` checks files for secrets.
 - **Native tools steered by hooks.** `SessionStart` pins the session the MCP
   server serves and hands the model a short guide: which git-fs tool replaces
@@ -150,6 +153,37 @@ earlier completed call; there is no result substitution between items. In
 particular, a preview followed by a commit requires two calls, and a mutation
 may invalidate a later item's previously reviewed revision. All normal guards
 still apply. Multiple-item reads are independent views, not an atomic snapshot.
+
+## Deletions and changes made outside git-fs
+
+Read a file before calling `delete`, just as before `write` or `edit`:
+
+```json
+{"path": "obsolete.txt"}
+```
+
+Pass that argument to `read`, then to `delete` on the same MCP connection. In
+git mode, deletion is recorded on the session branch and takes effect on disk
+when materialized. It is distinct from writing an empty file. Reads and searches
+respect the deletion, and rollback can restore the prior content. In local
+mode, `delete` removes the file from disk directly.
+Git-mode deletion needs a file tracked by trunk or the session; use local mode
+for an untracked file that exists only on disk.
+
+To bring selected changes made by a formatter, editor or local-mode tool into
+a session branch, call `gitfs_capture` with explicit paths:
+
+```json
+{"paths": ["new.txt", "edited.txt", "obsolete.txt"]}
+```
+
+Present files are captured with their current bytes; a selected tracked file
+that is missing from disk is captured as a deletion. A missing path with no
+tracked or session preimage is an error. Permission errors and other read
+failures are never treated as deletions. Explicit selection can start a new
+session branch and leaves shared staging untouched. Omit `paths` to capture
+only session-owned files; `paths: []` captures nothing. Review `gitfs_diff`
+before integrating the resulting session.
 
 ## Shell
 

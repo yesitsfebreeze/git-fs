@@ -16,7 +16,7 @@ Git-backed file layer: every edit is a commit, reads see the agent's changes,
 and only changed files are copied back to your working directory.
 
 - **Keep changes separate.** Each session works on its own branch.
-- **Prevent stale edits.** Writes check that the file still matches what the agent read.
+- **Prevent stale edits.** Writes and deletions check that the file still matches what the agent read.
 - **Review and undo.** Inspect a session's diff or roll back an edit.
 - **One or many.** Every tool accepts one item or an `items` array. Reads and searches can run in parallel; mutations run in order.
 
@@ -37,6 +37,7 @@ git-fs tools
 ```
 
 Requires Git and [ripgrep](https://github.com/BurntSushi/ripgrep) at runtime.
+Guarded push requires Git 2.40 or newer to run existing pre-push hooks.
 No Rust compiler is needed. Linux downloads require glibc 2.35 or newer.
 See [install.txt](install.txt) for platform selection, checksum verification,
 persistent PATH setup, source builds, and MCP configuration. Until the first
@@ -67,7 +68,10 @@ Once configured, the agent uses git-fs for reading, searching and editing files.
 
 Edits stay on the session branch until **materialize** copies them to disk.
 The agent must materialize before builds and tests and before finishing work.
-Existing disk changes are checked before anything is overwritten.
+Existing disk changes are checked before anything is overwritten or deleted.
+Use `delete` after reading a file to record its removal on the session branch.
+For changes made directly on disk, `gitfs_capture` with explicit `paths` records
+selected additions, edits and tracked deletions without changing shared staging.
 
 Materializing updates files, while **integrate** commits the reviewed session
 changes onto your working branch. **Push** publishes them to your remote.

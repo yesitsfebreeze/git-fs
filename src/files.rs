@@ -1,4 +1,4 @@
-//! Bounded file read/write/edit tools. Paths resolve against the canonical
+//! Bounded file read/write/edit/delete tools. Paths resolve against the canonical
 //! session cwd and must stay inside it; mutations are serialized per target
 //! and gated on a content-derived read of the current version. In git
 //! mode a path inside a repository reads the session's change first and
@@ -45,6 +45,9 @@ pub enum Input {
 		/// (old, new, all): one or more exact replacements, applied in order.
 		pairs: Vec<(String, String, bool)>,
 	},
+	Delete {
+		path: PathBuf,
+	},
 }
 
 impl Input {
@@ -88,6 +91,17 @@ impl Input {
 				Ok(Input::Write {
 					path: PathBuf::from(write.path),
 					text: write.text,
+				})
+			}
+			"delete" => {
+				#[derive(Deserialize)]
+				#[serde(deny_unknown_fields)]
+				struct Delete {
+					path: String,
+				}
+				let delete: Delete = serde_json::from_value(value).map_err(|e| e.to_string())?;
+				Ok(Input::Delete {
+					path: PathBuf::from(delete.path),
 				})
 			}
 			"edit" => {
@@ -169,6 +183,7 @@ pub fn execute(
 		} => read(service, context, &path, offset, limit, whole, raw, cancel),
 		Input::Write { path, text } => write(service, context, &path, &text, cancel),
 		Input::Edit { path, pairs } => edit(service, context, &path, &pairs, cancel),
+		Input::Delete { path } => delete(service, context, &path, cancel),
 	}
 }
 
@@ -598,7 +613,7 @@ fn write(
 		&resolved,
 		Operation::Write,
 		current,
-		new_version,
+		Some(new_version),
 	)?;
 	if let Some(parent) = resolved.parent() {
 		fs::create_dir_all(parent).map_err(|e| format!("create parents failed: {e}"))?;
@@ -737,7 +752,7 @@ fn edit(
 		&resolved,
 		Operation::Edit,
 		Some(expected),
-		new_version,
+		Some(new_version),
 	)?;
 	let partial = publish(
 		service,
@@ -828,13 +843,122 @@ fn publish(
 	result
 }
 
+fn delete(
+	service: &Service,
+	context: &Context,
+	path: &Path,
+	cancel: &AtomicBool,
+) -> Result<Outcome, String> {
+	check_cancel(cancel)?;
+	let cwd = Path::new(&context.cwd)
+		.canonicalize()
+		.map_err(|e| format!("cwd unavailable: {e}"))?;
+	let requested = cwd.join(path);
+	if fs::symlink_metadata(&requested).is_ok_and(|m| m.file_type().is_symlink()) {
+		return Err("delete refuses symbolic links; name a regular file".into());
+	}
+	let resolved = resolve(&cwd, path)?;
+	check_memo_record(&cwd, &resolved)?;
+	let last_read = service.last_read(context, &resolved)?;
+	let target = service.target(&resolved);
+	let _guard = target.lock().unwrap_or_else(|e| e.into_inner());
+	let branch = branch(service, &cwd, &resolved, true);
+	if service.config.mode == Mode::Git && branch.is_none() {
+		return Err("cannot open the Git session store for deletion".into());
+	}
+	let current = current_bytes(branch.as_ref(), &context.session, &resolved)?.map(|b| version(&b));
+	let expected = match (last_read, current) {
+		(Some(Read::Absent), None) => {
+			return Ok(Outcome {
+				revision: None,
+				content: format!("{} already absent", path.display()),
+				evidence: None,
+				partial: None,
+			})
+		}
+		(None, _) => return Err("unseen delete; read the file first".into()),
+		(Some(Read::Absent), _) => {
+			return Err("file changed since it was read absent; reread it".into())
+		}
+		(Some(Read::Present(_)), None) => {
+			return Err("file disappeared since it was read; reread it".into())
+		}
+		(Some(Read::Present(expected)), Some(actual)) if expected == actual => expected,
+		_ => return Err("file changed since it was read; reread it".into()),
+	};
+	require_disk_agreement(
+		branch.as_ref(),
+		&context.session,
+		&resolved,
+		Some(expected),
+		service.config.max_file_bytes,
+		false,
+	)?;
+	let (evidence, content) = if let Some(branch) = &branch {
+		if branch
+			.store
+			.selected_blob(&context.session, &branch.rel)?
+			.is_none()
+		{
+			return Err("file is not tracked on the session or trunk; use local mode to delete an untracked file".into());
+		}
+		let mut capture = crate::provenance::Capture::from_context(
+			&serde_json::json!({"session":context.session,"run":context.run,"call":context.call}),
+		)?;
+		service.before_commit(&resolved);
+		check_cancel(cancel)?;
+		let tip = branch.store.delete_blob_checked(
+			&context.session,
+			&branch.rel,
+			expected,
+			&mut capture,
+		)?;
+		(
+			capture.records.pop(),
+			format!(
+				"deleted {} on {} at {}; materialize to remove it from disk",
+				branch.rel.display(),
+				branch.store.branch(&context.session),
+				tip.as_deref().unwrap_or("unchanged")
+			),
+		)
+	} else {
+		let evidence = evidence(
+			context,
+			&cwd,
+			&resolved,
+			Operation::Delete,
+			Some(expected),
+			None,
+		)?;
+		service.before_commit(&resolved);
+		check_cancel(cancel)?;
+		if resolve(&cwd, &resolved)? != resolved
+			|| version(&fs::read(&resolved).map_err(|e| format!("deletion check failed: {e}"))?)
+				!= expected
+		{
+			return Err("conflict: file changed during preparation; reread it".into());
+		}
+		check_memo_record(&cwd, &resolved)?;
+		fs::remove_file(&resolved).map_err(|e| format!("delete failed: {e}"))?;
+		(Some(evidence), format!("deleted {}", resolved.display()))
+	};
+	let partial = service.mark_read(context, &resolved, Read::Absent).err().map(|e| format!("partial_success: file already deleted: {}; read record failed: {e}. Do not automatically retry.", resolved.display()));
+	Ok(Outcome {
+		revision: None,
+		content,
+		evidence,
+		partial,
+	})
+}
+
 fn evidence(
 	context: &Context,
 	cwd: &Path,
 	path: &Path,
 	operation: Operation,
 	before: Option<[u8; 32]>,
-	after: [u8; 32],
+	after: Option<[u8; 32]>,
 ) -> Result<Evidence, String> {
 	let hex = |bytes: [u8; 32]| bytes.iter().map(|v| format!("{v:02x}")).collect::<String>();
 	let evidence = Evidence {
@@ -856,7 +980,9 @@ fn evidence(
 		before: before.map_or(Version::Absent {}, |value| Version::Sha256 {
 			value: hex(value),
 		}),
-		after: Version::Sha256 { value: hex(after) },
+		after: after.map_or(Version::Absent {}, |value| Version::Sha256 {
+			value: hex(value),
+		}),
 		overlay_commit: OverlayCommit {
 			before: None,
 			after: None,

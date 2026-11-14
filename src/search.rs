@@ -627,7 +627,7 @@ fn session_changes(
 	};
 	let root = store.root().canonicalize().map_err(|e| e.to_string())?;
 	let mut changes = Vec::new();
-	for (status, rel) in store.owned_paths(&context.session)? {
+	for (status, rel) in store.session_paths(&context.session)? {
 		let Ok(path) = root.join(&rel).strip_prefix(cwd).map(Path::to_path_buf) else {
 			continue;
 		};

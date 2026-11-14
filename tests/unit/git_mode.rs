@@ -103,6 +103,135 @@ fn has_rg() -> bool {
 }
 
 #[tokio::test]
+async fn delete_records_a_guarded_tombstone_and_rollback_restores_disk() {
+	let (_dir, root, service, recorded) = fixture(Mode::Git, true);
+	std::fs::write(root.join("other"), "staged\n").unwrap();
+	git(&root, &["add", "other"]);
+	std::fs::write(root.join("other"), "unstaged\n").unwrap();
+	let index = std::fs::read(root.join(".git/index")).unwrap();
+	let head = git(&root, &["rev-parse", "HEAD"]);
+	assert_eq!(
+		tool(&service, &root, "delete", json!({"path":"a.txt"})).await["error"],
+		true
+	);
+	tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	let deleted = tool(&service, &root, "delete", json!({"path":"a.txt"})).await;
+	assert_eq!(deleted["error"], false, "{deleted}");
+	assert!(root.join("a.txt").exists());
+	assert_eq!(
+		git(&root, &["diff", "--name-status", "HEAD", "refs/gitfs/s1"]),
+		"D\ta.txt\n"
+	);
+	assert_eq!(
+		tool(&service, &root, "read", json!({"path":"a.txt"})).await["error"],
+		true
+	);
+	let tip = git(&root, &["rev-parse", "refs/gitfs/s1"]);
+	assert_eq!(
+		tool(&service, &root, "delete", json!({"path":"a.txt"})).await["error"],
+		false
+	);
+	assert_eq!(git(&root, &["rev-parse", "refs/gitfs/s1"]), tip);
+	assert_eq!(recorded.lock().unwrap().len(), 1);
+	assert_eq!(
+		gitfs(&service, &root, json!({"op":"materialize"})).await["error"],
+		false
+	);
+	assert!(!root.join("a.txt").exists());
+	assert_eq!(
+		gitfs(
+			&service,
+			&root,
+			json!({"op":"rollback","commit":tip.trim()})
+		)
+		.await["error"],
+		false
+	);
+	assert_eq!(
+		gitfs(&service, &root, json!({"op":"materialize"})).await["error"],
+		false
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"one\n"
+	);
+	assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+	assert_eq!(
+		std::fs::read_to_string(root.join("other")).unwrap(),
+		"unstaged\n"
+	);
+	assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+}
+
+#[tokio::test]
+async fn delete_cancels_a_materialized_creation_and_protects_recreated_files() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	tool(
+		&service,
+		&root,
+		"write",
+		json!({"path":"new.txt","text":"new\n"}),
+	)
+	.await;
+	gitfs(&service, &root, json!({"op":"materialize"})).await;
+	let deleted = tool(&service, &root, "delete", json!({"path":"new.txt"})).await;
+	assert_eq!(deleted["error"], false, "{deleted}");
+	assert_eq!(
+		tool(&service, &root, "read", json!({"path":"new.txt"})).await["error"],
+		true
+	);
+	if has_rg() {
+		let found = tool(&service, &root, "glob", json!({"pattern":"new.txt"})).await;
+		assert_eq!(found["content"]["count"], 0, "{found}");
+	}
+	gitfs(&service, &root, json!({"op":"materialize"})).await;
+	assert!(!root.join("new.txt").exists());
+	std::fs::write(root.join("new.txt"), "someone else's recreation\n").unwrap();
+	let conflict = gitfs(&service, &root, json!({"op":"materialize"})).await;
+	assert_eq!(
+		conflict["body"]["conflicts"].as_array().unwrap().len(),
+		1,
+		"{conflict}"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("new.txt")).unwrap(),
+		"someone else's recreation\n"
+	);
+}
+
+#[tokio::test]
+async fn local_delete_requires_a_fresh_read_and_records_absence() {
+	let (_dir, root, service, recorded) = fixture(Mode::Local, false);
+	assert_eq!(
+		tool(&service, &root, "delete", json!({"path":"a.txt"})).await["error"],
+		true
+	);
+	tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+	assert_eq!(
+		tool(&service, &root, "delete", json!({"path":"a.txt"})).await["error"],
+		true
+	);
+	tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	let deleted = tool(&service, &root, "delete", json!({"path":"a.txt"})).await;
+	assert_eq!(deleted["error"], false, "{deleted}");
+	assert!(!root.join("a.txt").exists());
+	let evidence = recorded.lock().unwrap().clone();
+	assert_eq!(evidence.len(), 1);
+	assert_eq!(evidence[0].after, crate::change_record::Version::Absent {});
+	assert_eq!(
+		tool(&service, &root, "delete", json!({"path":"a.txt"})).await["error"],
+		false
+	);
+	std::fs::write(root.join("a.txt"), "recreated\n").unwrap();
+	assert_eq!(
+		tool(&service, &root, "delete", json!({"path":"a.txt"})).await["error"],
+		true
+	);
+	assert!(root.join("a.txt").exists());
+}
+
+#[tokio::test]
 async fn git_mode_commits_each_change_and_leaves_the_worktree_until_materialize() {
 	let (_dir, root, service, recorded) = fixture(Mode::Git, true);
 	assert_eq!(
@@ -256,6 +385,14 @@ async fn git_mode_commits_each_change_and_leaves_the_worktree_until_materialize(
 	)
 	.await;
 	assert_eq!(again["error"], true, "{again}");
+	let cleanup = gitfs(
+		&service,
+		&root,
+		json!({"op":"materialize","paths":["src/new.txt"]}),
+	)
+	.await;
+	assert_eq!(cleanup["error"], false, "{cleanup}");
+	assert!(!root.join("src/new.txt").exists());
 }
 
 #[tokio::test]
@@ -339,6 +476,12 @@ async fn a_workspace_outside_git_keeps_its_branches_in_the_store_directory() {
 	assert_eq!(undone["error"], false, "{undone}");
 	let owned = gitfs(&service, &root, json!({"op":"ls"})).await["body"]["owned"].clone();
 	assert_eq!(owned, json!([]));
+	let cleanup = gitfs(&service, &root, json!({"op":"materialize"})).await;
+	assert_eq!(cleanup["error"], false, "{cleanup}");
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"one\n"
+	);
 
 	assert_eq!(
 		tool(&service, &root, "read", json!({"path":"a.txt"})).await["error"],
@@ -729,5 +872,72 @@ async fn glob_paths_use_forward_slashes_on_every_host() {
 			.iter()
 			.any(|p| p == "nested/deep.txt"),
 		"{glob}"
+	);
+}
+
+#[tokio::test]
+async fn explicit_delete_without_materialization_keeps_its_absent_view() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	tool(
+		&service,
+		&root,
+		"write",
+		json!({"path":"new.txt","text":"session\n"}),
+	)
+	.await;
+	let deleted = tool(&service, &root, "delete", json!({"path":"new.txt"})).await;
+	assert_eq!(deleted["error"], false, "{deleted}");
+	std::fs::write(root.join("new.txt"), "foreign recreation\n").unwrap();
+	assert_eq!(
+		tool(&service, &root, "read", json!({"path":"new.txt"})).await["error"],
+		true
+	);
+	let result = gitfs(&service, &root, json!({"op":"materialize"})).await;
+	assert_eq!(
+		result["body"]["conflicts"].as_array().unwrap().len(),
+		1,
+		"{result}"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("new.txt")).unwrap(),
+		"foreign recreation\n"
+	);
+}
+
+#[tokio::test]
+async fn overlay_rollback_supersedes_older_explicit_deletion_of_untouched_disk() {
+	let (_dir, root, service, _) = fixture(Mode::Git, false);
+	tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	tool(
+		&service,
+		&root,
+		"write",
+		json!({"path":"a.txt","text":"session\n"}),
+	)
+	.await;
+	assert_eq!(
+		tool(&service, &root, "delete", json!({"path":"a.txt"})).await["error"],
+		false
+	);
+	assert_eq!(
+		tool(
+			&service,
+			&root,
+			"write",
+			json!({"path":"a.txt","text":"later\n"})
+		)
+		.await["error"],
+		false
+	);
+	let rolled = gitfs(&service, &root, json!({"op":"rollback","path":"a.txt"})).await;
+	assert_eq!(rolled["error"], false, "{rolled}");
+	let read = tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	assert_eq!(read["error"], false, "{read}");
+	assert!(read["content"].as_str().unwrap().contains("1:one"));
+	let cleanup = gitfs(&service, &root, json!({"op":"materialize"})).await;
+	assert_eq!(cleanup["error"], false, "{cleanup}");
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"one\n"
 	);
 }

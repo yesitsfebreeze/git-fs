@@ -240,7 +240,16 @@ fn printable(p: &Path) -> String {
 /// as their exact bytes, so `core.autocrlf` and attribute filters never rewrite
 /// content behind the branch's back.
 /// `git_dir` names the store's own git directory when the project has none.
-fn git_cmd(root: &Path, git_dir: Option<&Path>, args: &[&str], index: Option<&Path>) -> Command {
+fn git_cmd(
+	root: &Path,
+	git_dir: Option<&Path>,
+	args: &[&str],
+	index: Option<&Path>,
+) -> Result<Command> {
+	#[cfg(windows)]
+	let normalized_root = PathBuf::from(crate::hook::git_command_path(root)?);
+	#[cfg(windows)]
+	let root = normalized_root.as_path();
 	let mut cmd = Command::new("git");
 	cmd.arg("-C")
 		.arg(root)
@@ -252,12 +261,16 @@ fn git_cmd(root: &Path, git_dir: Option<&Path>, args: &[&str], index: Option<&Pa
 		.env("GIT_COMMITTER_NAME", IDENT_NAME)
 		.env("GIT_COMMITTER_EMAIL", IDENT_EMAIL);
 	if let Some(index) = index {
+		#[cfg(windows)]
+		let index = crate::hook::git_command_path(index)?;
 		cmd.env("GIT_INDEX_FILE", index);
 	}
 	if let Some(dir) = git_dir {
+		#[cfg(windows)]
+		let dir = crate::hook::git_command_path(dir)?;
 		cmd.env("GIT_DIR", dir).env("GIT_WORK_TREE", root);
 	}
-	cmd
+	Ok(cmd)
 }
 
 /// Run git against `root` with a fixed identity, hooks disabled, and an
@@ -269,7 +282,7 @@ fn run(
 	index: Option<&Path>,
 	stdin: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-	let mut cmd = git_cmd(root, git_dir, args, index);
+	let mut cmd = git_cmd(root, git_dir, args, index)?;
 	if stdin.is_some() {
 		cmd.stdin(Stdio::piped());
 	}
@@ -295,7 +308,7 @@ fn run(
 /// (empty stderr, e.g. a missing ref) yields empty output; real failures with
 /// a message stay errors.
 fn run_tolerant(root: &Path, git_dir: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
-	let mut cmd = git_cmd(root, git_dir, args, None);
+	let mut cmd = git_cmd(root, git_dir, args, None)?;
 	cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 	let out = cmd.output().map_err(|e| format!("git spawn failed: {e}"))?;
 	if !out.status.success() {
@@ -381,7 +394,7 @@ impl Store {
 		if self.tip(session)?.is_none() {
 			return Ok(None);
 		}
-		let out = self.git(&["ls-tree", &self.branch(session), "--", &printable(rel)])?;
+		let out = self.git(&["ls-tree", &self.branch(session), "--", &literal(rel)])?;
 		let line = std::str::from_utf8(&out).map_err(|e| e.to_string())?;
 		let mut cols = line.split_whitespace();
 		let mode = cols.next().unwrap_or("100644").to_owned();
@@ -392,11 +405,26 @@ impl Store {
 		}
 	}
 
+	/// The selected Git entry: the session tip when present, otherwise HEAD.
+	pub(crate) fn selected_blob(
+		&self,
+		session: &str,
+		rel: &Path,
+	) -> Result<Option<(String, String)>> {
+		if self.tip(session)?.is_some() {
+			return self.blob_for(session, rel);
+		}
+		match self.head()? {
+			Some(head) => Ok(self.entry_at(&head, rel)?.map(|(mode, sha)| (sha, mode))),
+			None => Ok(None),
+		}
+	}
+
 	/// Git mode a session write of `rel` keeps: the session's own blob mode, else
 	/// the file on disk (a tracked file before the session's first write, or an
 	/// untracked one), else a plain file.
 	pub fn mode_for(&self, session: &str, rel: &Path) -> Result<String> {
-		if let Some((_, mode)) = self.blob_for(session, rel)? {
+		if let Some((_, mode)) = self.selected_blob(session, rel)? {
 			return Ok(if mode == "100755" {
 				mode
 			} else {
@@ -492,6 +520,93 @@ impl Store {
 		Ok(parse_name_status(&out))
 	}
 
+	/// The session view also retains canceled additions and materialized paths
+	/// awaiting a rollback. Their net trunk diff can be empty while disk still
+	/// needs a deletion or restoration.
+	pub(crate) fn session_paths(&self, session: &str) -> Result<Vec<Owned>> {
+		let mut paths = self.owned_paths(session)?;
+		let Some(tip) = self.tip(session)? else {
+			return Ok(paths);
+		};
+		let base = self.trunk_base(session);
+		let mut args = vec![
+			"log",
+			"--format=",
+			"--diff-filter=D",
+			"--name-only",
+			"--no-renames",
+			"-z",
+			&tip,
+		];
+		let exclude = base.map(|base| format!("^{base}"));
+		if let Some(exclude) = &exclude {
+			args.push(exclude);
+		}
+		args.push("--");
+		for rel in self
+			.git(&args)?
+			.split(|b| *b == 0)
+			.filter(|p| !p.is_empty())
+		{
+			let rel = std::str::from_utf8(rel).map_err(|_| "session path is not UTF-8")?;
+			if !paths.iter().any(|(_, p)| p == rel)
+				&& self.blob_for(session, Path::new(rel))?.is_none()
+				&& self.explicit_deletion(session, Path::new(rel))?
+			{
+				paths.push(('D', rel.into()));
+			}
+		}
+		for (rel, entry) in self.load_ledger(session)? {
+			if paths.iter().any(|(_, p)| p == &rel) {
+				continue;
+			}
+			let current = self.blob_for(session, Path::new(&rel))?.map(|(sha, _)| sha);
+			if current != entry.blob {
+				paths.push((if current.is_some() { 'M' } else { 'D' }, rel));
+			}
+		}
+		paths.sort_by(|a, b| a.1.cmp(&b.1));
+		Ok(paths)
+	}
+
+	/// A rollback removes an overlay entry without requesting deletion of an
+	/// untouched disk file. Only the latest deletion's explicit intent persists.
+	fn explicit_deletion(&self, session: &str, rel: &Path) -> Result<bool> {
+		let branch = self.branch(session);
+		let exclude = self.trunk_base(session).map(|base| format!("^{base}"));
+		let path = literal(rel);
+		let mut args = vec![
+			"log",
+			"-1",
+			"--format=%(trailers:key=Gitfs-Deletion,valueonly)",
+			"--diff-filter=D",
+			&branch,
+		];
+		if let Some(exclude) = &exclude {
+			args.push(exclude);
+		}
+		args.extend(["--", &path]);
+		Ok(self.git_str(&args)?.trim() == "true")
+	}
+
+	fn require_settled_cancellations(&self, session: &str) -> Result<()> {
+		let owned = self.owned_paths(session)?;
+		for (_, rel) in self.session_paths(session)? {
+			if owned.iter().any(|(_, p)| p == &rel) {
+				continue;
+			}
+			let disk = match std::fs::read(self.root.join(&rel)) {
+				Ok(bytes) => Some(bytes),
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+				Err(e) => return Err(format!("{rel}: cannot check pending materialization: {e}")),
+			};
+			if disk != self.read(session, Path::new(&rel))? {
+				return Err(format!("{rel}: materialize the pending deletion or rollback before integrating or catching up"));
+			}
+		}
+		Ok(())
+	}
+
 	/// The revision a session's changes are diffed against: its merge base
 	/// with trunk. A store that is its own git directory has no trunk:
 	/// everything on the branch is the session's, so the empty tree is the
@@ -528,7 +643,7 @@ impl Store {
 		let Some(base) = self.change_base(session)? else {
 			return Ok(None);
 		};
-		let out = self.git(&[
+		let changed = self.git(&[
 			"diff",
 			"--name-status",
 			"--no-renames",
@@ -538,11 +653,23 @@ impl Store {
 			"--",
 			&literal(rel),
 		])?;
-		match parse_name_status(&out).first() {
-			None => Ok(None),
-			Some(('D', _)) => Ok(Some(None)),
-			Some(_) => Ok(Some(self.read(session, rel)?)),
+		if let Some((status, _)) = parse_name_status(&changed).first() {
+			return if *status == 'D' {
+				Ok(Some(None))
+			} else {
+				Ok(Some(self.read(session, rel)?))
+			};
 		}
+		let current = self.blob_for(session, rel)?.map(|(sha, _)| sha);
+		if let Some(entry) = self.load_ledger(session)?.get(&printable(rel)) {
+			if current != entry.blob {
+				return Ok(Some(self.read(session, rel)?));
+			}
+		}
+		if current.is_none() && self.explicit_deletion(session, rel)? {
+			return Ok(Some(None));
+		}
+		Ok(None)
 	}
 
 	/// The session's own commits, newest first: those on its branch that trunk
@@ -580,7 +707,7 @@ impl Store {
 			self.git_dir.as_deref(),
 			&["merge-base", "--is-ancestor", ancestor, of],
 			None,
-		)
+		)?
 		.stdout(Stdio::null())
 		.stderr(Stdio::null())
 		.status()
@@ -690,7 +817,12 @@ impl Store {
 		capture: &mut Capture,
 	) -> Result<()> {
 		let path = Path::new(rel);
-		if self.session_change(session, path)?.is_none() {
+		// Pending materialization can retain a tombstone after its tree change was undone.
+		if !self
+			.owned_paths(session)?
+			.iter()
+			.any(|(_, owned)| Path::new(owned) == path)
+		{
 			return Err(format!("rollback: session {session} does not change {rel}"));
 		}
 		// No merge base here means no trunk: the path did not exist before.
@@ -731,6 +863,7 @@ impl Store {
 		capture.check_session(session)?;
 		let _repo = self.mutation_lock("repository")?;
 		let _session = self.mutation_lock(&format!("session:{session}"))?;
+		self.require_settled_cancellations(session)?;
 		let head = self.head()?.ok_or("catchup: trunk has no commit yet")?;
 		let at_trunk = |base: Option<&str>| json!({"caught_up":true,"base":base,"head":head,"replayed":[],"merged":[],"dropped":[],"ref_deleted":false});
 		let Some(tip) = self.tip(session)? else {
@@ -1017,6 +1150,43 @@ impl Store {
 
 	/// Commit one path's new content, or its removal when `content` is `None`,
 	/// onto the session branch. `None` back when the tree would not change.
+	pub(crate) fn delete_blob_captured(
+		&self,
+		session: &str,
+		rel: &Path,
+		capture: &mut Capture,
+		op: Operation,
+	) -> Result<Option<String>> {
+		self.commit_path_captured(
+			session,
+			rel,
+			None,
+			capture,
+			op,
+			&format!("delete {}", printable(rel)),
+		)
+	}
+
+	pub(crate) fn delete_blob_checked(
+		&self,
+		session: &str,
+		rel: &Path,
+		expected: [u8; 32],
+		capture: &mut Capture,
+	) -> Result<Option<String>> {
+		capture.check_session(session)?;
+		let _guard = self.mutation_lock(&format!("session:{session}"))?;
+		self.commit_path_locked_checked(
+			session,
+			rel,
+			None,
+			capture,
+			Operation::Delete,
+			&format!("delete {}", printable(rel)),
+			Some(expected),
+		)
+	}
+
 	fn commit_path_captured(
 		&self,
 		session: &str,
@@ -1044,6 +1214,20 @@ impl Store {
 		op: Operation,
 		subject: &str,
 	) -> Result<Option<String>> {
+		self.commit_path_locked_checked(session, rel, content, capture, op, subject, None)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn commit_path_locked_checked(
+		&self,
+		session: &str,
+		rel: &Path,
+		content: Option<(&[u8], &str)>,
+		capture: &mut Capture,
+		op: Operation,
+		subject: &str,
+		expected: Option<[u8; 32]>,
+	) -> Result<Option<String>> {
 		let branch = self.branch(session);
 		let prev = self.tip(session)?;
 		let head = self.head()?;
@@ -1055,16 +1239,27 @@ impl Store {
 			},
 		};
 		self.refuse_submodule(&base_tree, rel)?;
+		if let Some(expected) = expected {
+			let (_, sha) = self
+				.entry_at(&base_tree, rel)?
+				.ok_or("file disappeared since it was read; reread it")?;
+			let actual: [u8; 32] = Sha256::digest(self.git(&["cat-file", "blob", &sha])?).into();
+			if actual != expected {
+				return Err("file changed since it was read; reread it".into());
+			}
+		}
 		let claimed = printable(rel);
 		let fresh_claim = !self
 			.owned_paths(session)?
 			.iter()
 			.any(|(_, owned)| owned == &claimed);
+		let deletion_intent =
+			content.is_none() && matches!(&op, Operation::Delete | Operation::Capture);
 		let mut evidence = capture.reserve(self, rel, op, Storage::GitfsOverlay)?;
 		if let Some(e) = &mut evidence {
 			e.overlay_commit.before = prev.clone();
 			if !base_tree.is_empty() {
-				let output = self.git(&["ls-tree", &base_tree, "--", &printable(rel)])?;
+				let output = self.git(&["ls-tree", &base_tree, "--", &literal(rel)])?;
 				if let Some(sha) = std::str::from_utf8(&output)
 					.map_err(|e| e.to_string())?
 					.split_whitespace()
@@ -1090,10 +1285,15 @@ impl Store {
 		if tree == base_tree {
 			return Ok(None); // content already at the tip
 		}
+		let deletion = if deletion_intent {
+			"\nGitfs-Deletion: true"
+		} else {
+			""
+		};
 		let commit = self.commit_tree(
 			&tree,
 			parent.as_deref(),
-			&format!("gitfs: {subject}\n\nGitfs-Session: {session}"),
+			&format!("gitfs: {subject}\n\nGitfs-Session: {session}{deletion}"),
 		)?;
 		if let Some(e) = &mut evidence {
 			if let Some(value) = blob {
@@ -1180,7 +1380,7 @@ impl Store {
 		capture.check_session(session)?;
 		let _repo = self.mutation_lock("repository")?;
 		let _session = self.mutation_lock(&format!("session:{session}"))?;
-		let mut ledger = self.load_ledger(session).unwrap_or_default();
+		let mut ledger = self.load_ledger(session)?;
 		let mut result = Materialize {
 			applied: vec![],
 			merged: vec![],
@@ -1194,7 +1394,7 @@ impl Store {
 		};
 		// Commit times are whole seconds; disk times are milliseconds.
 		let tip_ts = seconds_end_ms(self.tip_time(&tip)?);
-		for (status, rel) in self.owned_paths(session)? {
+		for (status, rel) in self.session_paths(session)? {
 			if let Some(allowed) = paths {
 				if !allowed.iter().any(|p| p == &rel) {
 					continue;
@@ -1227,7 +1427,7 @@ impl Store {
 						ledger.insert(
 							rel.clone(),
 							LedgerEntry {
-								blob: sha,
+								blob: Some(sha),
 								mtime: disk_mtime.unwrap_or_else(now_ms),
 							},
 						);
@@ -1240,11 +1440,25 @@ impl Store {
 					let entry = ledger.get(&rel).cloned();
 					let conflict = match &entry {
 						Some(e) if !force => {
-							if disk_mtime.is_some() && disk_mtime != Some(e.mtime) {
-								Some("file modified on disk since it was materialized".to_string())
-							} else {
-								None
-							}
+							let expected = e
+								.blob
+								.as_ref()
+								.map(|sha| self.git(&["cat-file", "blob", sha]))
+								.transpose()?;
+							let actual = match std::fs::read(&disk) {
+								Ok(bytes) => Some(bytes),
+								Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+								Err(e) => {
+									result
+										.errors
+										.push(format!("{rel}: materialization check failed: {e}"));
+									continue;
+								}
+							};
+							(actual != expected).then(|| {
+								"file modified or removed on disk since it was materialized"
+									.to_string()
+							})
 						}
 						None => {
 							if let Some(dm) = disk_mtime {
@@ -1340,40 +1554,51 @@ impl Store {
 					ledger.insert(
 						rel.clone(),
 						LedgerEntry {
-							blob: sha,
+							blob: Some(sha),
 							mtime: fs_mtime(&disk).unwrap_or_else(now_ms),
 						},
 					);
 					result.applied.push(rel.clone());
 				}
 				'D' => {
-					let entry = ledger.get(&rel).cloned();
-					let conflict = match &entry {
-						Some(e) if !force => {
-							if disk_mtime.is_some() && disk_mtime != Some(e.mtime) {
-								Some("file modified on disk since it was materialized".to_string())
-							} else {
-								None
-							}
-						}
-						None => {
-							if let Some(dm) = disk_mtime {
-								if dm > tip_ts && !force {
-									Some(
-										"on-disk file is newer than the gitfs deletion".to_string(),
-									)
-								} else {
-									None
-								}
-							} else {
-								None
-							}
-						}
-						_ => None,
-					};
-					if let Some(reason) = conflict {
-						result.conflicts.push((rel.clone(), reason));
+					let root = self.root.canonicalize().map_err(|e| e.to_string())?;
+					let checked = crate::files::resolve(&root, Path::new(&rel));
+					if checked.as_ref().ok() != Some(&root.join(&rel))
+						|| std::fs::symlink_metadata(&disk).is_ok_and(|m| !m.is_file())
+					{
+						result.errors.push(format!(
+							"{rel}: deletion refuses a symlink, directory or escaped path"
+						));
 						continue;
+					}
+					let disk_bytes = match std::fs::read(&disk) {
+						Ok(bytes) => Some(bytes),
+						Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+						Err(e) => {
+							result
+								.errors
+								.push(format!("{rel}: deletion check failed: {e}"));
+							continue;
+						}
+					};
+					if !force {
+						if let Some(bytes) = &disk_bytes {
+							match self.deletion_matches(session, &rel, ledger.get(&rel), bytes) {
+								Ok(true) => (),
+								Ok(false) => {
+									result.conflicts.push((
+										rel.clone(),
+										"file changed or was recreated since the deletion's base"
+											.into(),
+									));
+									continue;
+								}
+								Err(e) => {
+									result.errors.push(format!("{rel}: {e}"));
+									continue;
+								}
+							}
+						}
 					}
 					let mut evidence = match capture.reserve(
 						self,
@@ -1415,7 +1640,13 @@ impl Store {
 						capture.keep(evidence);
 					}
 
-					ledger.remove(&rel);
+					ledger.insert(
+						rel.clone(),
+						LedgerEntry {
+							blob: None,
+							mtime: now_ms(),
+						},
+					);
 					result.applied.push(rel.clone());
 				}
 				_ => {}
@@ -1539,6 +1770,7 @@ impl Store {
 		self.preview_integrate_locked(session)
 	}
 	fn preview_integrate_locked(&self, session: &str) -> Result<(String, Vec<Owned>)> {
+		self.require_settled_cancellations(session)?;
 		let Some(head) = self.head()? else {
 			return Err("cannot integrate: no HEAD commit".into());
 		};
@@ -1738,7 +1970,7 @@ impl Store {
 			self.git_dir.as_deref(),
 			&["commit-tree", &expected.tree, "-p", &expected.head],
 			None,
-		)
+		)?
 		.env("GIT_AUTHOR_NAME", author)
 		.env("GIT_AUTHOR_EMAIL", email)
 		.stdin(Stdio::piped())
@@ -1772,7 +2004,7 @@ impl Store {
 			self.git_dir.as_deref(),
 			&["update-ref", "--stdin"],
 			None,
-		)
+		)?
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
@@ -1853,14 +2085,13 @@ impl Store {
 		Ok(commit)
 	}
 
-	/// After an integrate, bring the shared index and working tree up to the
-	/// commit on every owned path they still hold as the parent held it, so
-	/// `git status` stops showing the integrated change as reverted and a later
-	/// plain `git commit` cannot undo it. The blob's bytes are written exactly
-	/// as stored — a checkout would apply `core.autocrlf` and the attributes
-	/// filters, turning the worktree copy into something the branch never held.
-	/// A path somebody changed on disk or in the index since the parent, or an
-	/// untracked file in the way, is left alone and named in `kept`.
+	/// After an integrate, sync selected owned paths whose index still matches
+	/// the parent. Disk bytes already matching the commit, or an already absent
+	/// deleted file, need only an index update. Otherwise an unchanged parent
+	/// copy receives the exact committed bytes, without checkout filters.
+	/// This prevents `git status` showing the integrated change as reverted and
+	/// a later plain `git commit` undoing it. Independent disk or staged changes,
+	/// and untracked files in the way, are left alone and named in `kept`.
 	pub fn sync_integrated(&self, parent: &str, commit: &str, owned: &[Owned]) -> Result<Value> {
 		let _repo = self.mutation_lock("repository")?;
 		let mut synced = Vec::new();
@@ -1868,10 +2099,45 @@ impl Store {
 		for (status, rel) in owned {
 			let path = Path::new(rel);
 			let spec = literal(path);
-			let untouched = self.git(&["diff", "--quiet", parent, "--", &spec]).is_ok()
-				&& self
-					.git(&["diff", "--cached", "--quiet", parent, "--", &spec])
-					.is_ok() && (*status != 'A' || !self.root.join(path).exists());
+			let index_unchanged = self
+				.git(&["diff", "--cached", "--quiet", parent, "--", &spec])
+				.is_ok();
+			let entry = self.entry_at(commit, path)?;
+			let materialized = match &entry {
+				Some((_, sha)) => {
+					std::fs::symlink_metadata(self.root.join(path)).is_ok_and(|m| m.is_file())
+						&& std::fs::read(self.root.join(path)).ok()
+							== Some(self.git(&["cat-file", "blob", sha])?)
+				}
+				None if *status == 'D' => std::fs::symlink_metadata(self.root.join(path))
+					.is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+				None => false,
+			};
+			if index_unchanged && materialized {
+				let done = match entry {
+					Some((mode, sha)) => self.index_update(&[
+						"update-index",
+						"--add",
+						"--cacheinfo",
+						&format!("{mode},{sha},{}", printable(path)),
+					]),
+					None => self.index_update(&[
+						"update-index",
+						"--force-remove",
+						"--",
+						&printable(path),
+					]),
+				};
+				if done {
+					synced.push(rel.clone());
+				} else {
+					kept.push(rel.clone());
+				}
+				continue;
+			}
+			let untouched = index_unchanged
+				&& self.git(&["diff", "--quiet", parent, "--", &spec]).is_ok()
+				&& (*status != 'A' || !self.root.join(path).exists());
 			let done = untouched && self.sync_path(commit, *status, path);
 			if done {
 				synced.push(rel.clone());
@@ -2051,6 +2317,49 @@ impl Store {
 
 	// ————— materialize helpers —————
 
+	fn deletion_matches(
+		&self,
+		session: &str,
+		rel: &str,
+		entry: Option<&LedgerEntry>,
+		bytes: &[u8],
+	) -> Result<bool> {
+		let matches_blob = |blob: &str| {
+			self.git(&["cat-file", "blob", blob])
+				.map(|prior| prior == bytes)
+		};
+		if let Some(entry) = entry {
+			return match &entry.blob {
+				Some(blob) => matches_blob(blob),
+				None => Ok(false),
+			};
+		}
+		let path = Path::new(rel);
+		if let Some(base) = self.trunk_base(session) {
+			if let Some((_, blob)) = self.entry_at(&base, path)? {
+				if matches_blob(&blob)? {
+					return Ok(true);
+				}
+			}
+		}
+		let commit = self.git_str(&[
+			"log",
+			"-1",
+			"--format=%H",
+			"--diff-filter=D",
+			&self.branch(session),
+			"--",
+			&literal(path),
+		])?;
+		if commit.trim().is_empty() {
+			return Ok(false);
+		}
+		match self.entry_at(&format!("{}^", commit.trim()), path)? {
+			Some((_, blob)) => matches_blob(&blob),
+			None => Ok(false),
+		}
+	}
+
 	/// Committer timestamp of a commit, seconds since the epoch.
 	fn tip_time(&self, tip: &str) -> Result<u64> {
 		let s = self.git_str(&["log", "-1", "--format=%ct", tip])?;
@@ -2099,10 +2408,20 @@ impl Store {
 	/// next materialize does not read the disk copy as a foreign change.
 	pub fn note_materialized(&self, session: &str, rel: &str) -> Result<()> {
 		let _session = self.mutation_lock(&format!("session:{session}"))?;
-		let Some((sha, _)) = self.blob_for(session, Path::new(rel))? else {
-			return Ok(());
+		let sha = self
+			.selected_blob(session, Path::new(rel))?
+			.map(|(sha, _)| sha);
+		let expected = sha
+			.as_ref()
+			.map(|sha| self.git(&["cat-file", "blob", sha]))
+			.transpose()?;
+		let actual = match std::fs::read(self.root.join(rel)) {
+			Ok(bytes) => Some(bytes),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+			Err(e) => return Err(format!("{rel}: cannot verify captured disk content: {e}")),
 		};
-		let mut ledger = self.load_ledger(session).unwrap_or_default();
+		let changed = actual != expected;
+		let mut ledger = self.load_ledger(session)?;
 		ledger.insert(
 			rel.to_owned(),
 			LedgerEntry {
@@ -2110,7 +2429,11 @@ impl Store {
 				mtime: fs_mtime(&self.root.join(rel)).unwrap_or_else(now_ms),
 			},
 		);
-		self.save_ledger(session, &ledger)
+		self.save_ledger(session, &ledger)?;
+		if changed {
+			return Err(format!("partial_success: {rel} already captured but disk changed during capture; do not automatically retry"));
+		}
+		Ok(())
 	}
 
 	fn load_ledger(&self, session: &str) -> Result<HashMap<String, LedgerEntry>> {
@@ -2141,7 +2464,7 @@ impl Store {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LedgerEntry {
-	blob: String,
+	blob: Option<String>,
 	mtime: u64,
 }
 
@@ -2207,13 +2530,13 @@ fn literal(rel: &Path) -> String {
 /// The (device, file) number pair naming the filesystem object behind `path`, so the reviewed
 /// repository identity changes when a path is replaced by a different directory.
 #[cfg(unix)]
-fn file_id(path: &Path) -> Result<(u64, u64)> {
+pub(crate) fn file_id(path: &Path) -> Result<(u64, u64)> {
 	use std::os::unix::fs::MetadataExt;
 	let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
 	Ok((meta.dev(), meta.ino()))
 }
 #[cfg(windows)]
-fn file_id(path: &Path) -> Result<(u64, u64)> {
+pub(crate) fn file_id(path: &Path) -> Result<(u64, u64)> {
 	use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 	use windows_sys::Win32::Storage::FileSystem::{
 		GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
@@ -2239,7 +2562,7 @@ fn file_id(path: &Path) -> Result<(u64, u64)> {
 	))
 }
 #[cfg(not(any(unix, windows)))]
-fn file_id(_: &Path) -> Result<(u64, u64)> {
+pub(crate) fn file_id(_: &Path) -> Result<(u64, u64)> {
 	Err("reviewed repository identity requires file ids (macOS, Linux or Windows)".into())
 }
 

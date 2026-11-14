@@ -20,6 +20,7 @@ fn hook_requires_exactly_one_complete_advertised_update() {
 	}
 }
 #[test]
+#[cfg(unix)]
 fn command_timeout_and_overflow_are_bounded_and_do_not_expose_stderr() {
 	let dir = tempfile::tempdir().unwrap();
 	let cancel = AtomicBool::new(false);
@@ -117,6 +118,7 @@ fn durable_attempt_capacity_corruption_and_monotonic_readback() {
 	assert!(cx.records().is_err());
 }
 #[test]
+#[cfg(unix)]
 fn cancelled_command_kills_the_spawned_helper_group() {
 	let temp = tempfile::tempdir().unwrap();
 	let pidfile = temp.path().join("pid");

@@ -115,7 +115,7 @@ fn single_calls_and_multiple_reads_edits_and_materializations_share_freshness() 
 	let mut server = Server::new(&root);
 	let tools = server.request("tools/list", json!({}));
 	let tools = tools["tools"].as_array().unwrap();
-	assert_eq!(tools.len(), 16);
+	assert_eq!(tools.len(), 17);
 	assert!(!tools.iter().any(|t| t["name"] == "batch"));
 	for tool in tools {
 		assert!(
@@ -265,4 +265,104 @@ fn integration_items_preserve_preview_and_commit_review_guards() {
 		]}),
 	);
 	assert_ne!(git(&root, &["rev-parse", "HEAD"]), original);
+}
+
+#[test]
+fn deletion_tools_preserve_freshness_and_complete_rollback_and_integration() {
+	let dir = repo();
+	let root = dir.path().canonicalize().unwrap();
+	let mut server = Server::new(&root);
+	let advertised = server.request("tools/list", json!({}));
+	assert!(advertised["tools"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.any(|t| t["name"] == "delete"));
+	std::fs::write(root.join("other"), "staged\n").unwrap();
+	git(&root, &["add", "other"]);
+	std::fs::write(root.join("other"), "unstaged\n").unwrap();
+	let staged = git(&root, &["ls-files", "--stage", "other"]);
+	let index = std::fs::read(root.join(".git/index")).unwrap();
+	server.ok("read", json!({"items":[{"path":"a.txt"},{"path":"b.txt"}]}));
+	server.ok("delete", json!({"path":"a.txt"}));
+	let deleted = git(&root, &["rev-parse", "refs/gitfs/items-test"]);
+	server.ok("gitfs_diff", json!({"path":"a.txt"}));
+	assert_eq!(
+		git(
+			&root,
+			&["diff", "--name-status", "HEAD", "refs/gitfs/items-test"]
+		),
+		"D\ta.txt"
+	);
+	assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+	server.ok("gitfs_materialize", json!({"paths":["a.txt"]}));
+	assert!(!root.join("a.txt").exists());
+	server.ok("gitfs_rollback", json!({"commit":deleted}));
+	server.ok("gitfs_materialize", json!({"paths":["a.txt"]}));
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"before\n"
+	);
+	server.ok("read", json!({"items":[{"path":"a.txt"},{"path":"b.txt"}]}));
+	let result = server.call(
+		"delete",
+		json!({"items":[{"path":"a.txt"},{"path":"b.txt"},{"path":"c.txt"},{"path":"other"}]}),
+	);
+	assert_eq!(result["isError"], true);
+	assert_eq!(content(&result)["failed"], 1);
+	assert_eq!(content(&result)["skipped"], 1);
+	server.ok("gitfs_materialize", json!({}));
+	assert!(!root.join("a.txt").exists());
+	assert!(!root.join("b.txt").exists());
+	assert!(root.join("c.txt").exists());
+	let preview = content(&server.ok(
+		"integrate",
+		json!({"phase":"preview","message":"remove obsolete files"}),
+	));
+	server.ok("integrate", json!({"phase":"commit","expected_revision":preview["revision"],"message":"remove obsolete files"}));
+	assert_eq!(git(&root, &["ls-tree", "--name-only", "HEAD"]), "c.txt");
+	assert_eq!(git(&root, &["ls-files", "--", "a.txt", "b.txt"]), "");
+	assert_eq!(git(&root, &["ls-files", "--stage", "other"]), staged);
+	assert_eq!(
+		std::fs::read_to_string(root.join("other")).unwrap(),
+		"unstaged\n"
+	);
+}
+
+#[test]
+fn explicit_capture_integrates_disk_migrations_without_staging_inverse_changes() {
+	let dir = repo();
+	let root = dir.path().canonicalize().unwrap();
+	let mut server = Server::new(&root);
+	std::fs::write(root.join("c.txt"), "staged unrelated\n").unwrap();
+	git(&root, &["add", "c.txt"]);
+	std::fs::write(root.join("c.txt"), "unstaged unrelated\n").unwrap();
+	let staged = git(&root, &["ls-files", "--stage", "c.txt"]);
+	let index = std::fs::read(root.join(".git/index")).unwrap();
+	std::fs::write(root.join("a.txt"), "updated\n").unwrap();
+	std::fs::remove_file(root.join("b.txt")).unwrap();
+	std::fs::write(root.join("new.txt"), "new\n").unwrap();
+	server.ok(
+		"gitfs_capture",
+		json!({"paths":["a.txt","b.txt","new.txt"]}),
+	);
+	assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+	let preview = content(&server.ok(
+		"integrate",
+		json!({"phase":"preview","message":"capture disk migration"}),
+	));
+	server.ok("integrate", json!({"phase":"commit","expected_revision":preview["revision"],"message":"capture disk migration"}));
+	assert_eq!(git(&root, &["show", "HEAD:a.txt"]), "updated");
+	assert_eq!(git(&root, &["show", "HEAD:new.txt"]), "new");
+	assert_eq!(
+		git(&root, &["ls-tree", "--name-only", "HEAD", "--", "b.txt"]),
+		""
+	);
+	assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "c.txt");
+	assert_eq!(git(&root, &["diff", "--name-only"]), "c.txt");
+	assert_eq!(git(&root, &["ls-files", "--stage", "c.txt"]), staged);
+	assert_eq!(
+		std::fs::read_to_string(root.join("c.txt")).unwrap(),
+		"unstaged unrelated\n"
+	);
 }
