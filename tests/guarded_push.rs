@@ -79,10 +79,14 @@ impl Fixture {
 	}
 
 	fn call(&self, input: Value) -> Value {
+		self.call_as("push-test", input)
+	}
+
+	fn call_as(&self, session: &str, input: Value) -> Value {
 		let output = Command::new(env!("CARGO_BIN_EXE_git-fs"))
 			.current_dir(&self.root)
 			.env("GIT_FS_DISK", &self.root)
-			.env("GIT_FS_SESSION", "push-test")
+			.env("GIT_FS_SESSION", session)
 			.env("GIT_FS_CONFIG", "{}")
 			.args(["call", "push", &input.to_string()])
 			.output()
@@ -104,6 +108,17 @@ impl Fixture {
 		let preview = self.call(input.clone());
 		assert_eq!(preview["phase"], "preview", "{preview}");
 		input["phase"] = json!("commit");
+		input["expected_revision"] = preview["revision"].clone();
+		input["operation_id"] = json!(id);
+		input
+	}
+
+	fn handoff_input(&self, id: &str, recipient: &str) -> Value {
+		let mut input = json!({"phase":"preview", "remote":"origin", "ref":"refs/heads/main",
+			"commit":self.new, "expected_remote_head":self.old, "recipient_session":recipient});
+		let preview = self.call(input.clone());
+		assert_eq!(preview["next_phase"], "handoff", "{preview}");
+		input["phase"] = json!("handoff");
 		input["expected_revision"] = preview["revision"].clone();
 		input["operation_id"] = json!(id);
 		input
@@ -330,4 +345,154 @@ fn changed_remote_after_preview_is_refused_before_dispatch() {
 	);
 	assert!(!f.root.join("hook-runs").exists());
 	assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/main"]), current);
+}
+
+fn recipient_commit(record: &Value) -> Value {
+	let b = &record["binding"];
+	json!({"phase":"commit","operation_id":record["operation_id"],"expected_revision":record["revision"],
+		"remote":b["remote"],"ref":b["reference"],"commit":b["commit"],"expected_remote_head":b["expected_remote_head"]})
+}
+
+#[test]
+fn source_authorized_handoff_survives_restart_and_dispatches_once() {
+	let f = Fixture::new();
+	f.hook(0);
+	let input = f.handoff_input("delivery", "recovery");
+	let grant = f.call(input.clone());
+	assert_eq!(grant["status"], "ready", "{grant}");
+	assert_eq!(grant["binding"]["session"], "recovery");
+	assert_eq!(grant["binding"]["authorized_by"], "push-test");
+	assert_eq!(f.call(input), grant);
+	assert_eq!(git(&f.remote, &["rev-parse", "main"]), f.old);
+	let recovered = f.call_as(
+		"recovery",
+		json!({"phase":"reconcile","operation_id":"delivery"}),
+	);
+	assert_eq!(recovered["status"], "ready", "{recovered}");
+	let commit = recipient_commit(&recovered);
+	let (a, b) = std::thread::scope(|scope| {
+		let first = scope.spawn(|| f.call_as("recovery", commit.clone()));
+		let second = scope.spawn(|| f.call_as("recovery", commit.clone()));
+		(first.join().unwrap(), second.join().unwrap())
+	});
+	for r in [&a, &b] {
+		assert!(
+			r["status"] == "confirmed" || r["status"] == "unknown",
+			"{r}"
+		);
+	}
+	assert_eq!(git(&f.remote, &["rev-parse", "main"]), f.new);
+	assert_eq!(f.call_as("recovery", commit)["status"], "confirmed");
+	assert_eq!(
+		fs::read_to_string(f.root.join("hook-runs"))
+			.unwrap()
+			.lines()
+			.count(),
+		1
+	);
+}
+
+#[test]
+fn push_handoff_requires_source_authority_and_exact_recipient_binding() {
+	let f = Fixture::new();
+	let bare = json!({"remote":"origin","ref":"refs/heads/main","commit":f.new,"expected_remote_head":f.old});
+	assert_eq!(f.call_as("recovery", bare.clone())["error"], true);
+	let input = f.handoff_input("delivery", "recovery");
+	assert_eq!(f.call_as("intruder", input.clone())["error"], true);
+	let mut stale = input.clone();
+	stale["expected_revision"] = json!("0".repeat(64));
+	assert_eq!(f.call(stale)["error"], true);
+	let grant = f.call(input);
+	let commit = recipient_commit(&grant);
+	assert_eq!(f.call_as("intruder", commit.clone())["error"], true);
+	let missing_reviewer = f.root.join("missing-reviewer.exe");
+	let policy = json!([missing_reviewer]).to_string();
+	git(&f.root, &["config", "gitfs.reviewCommand", &policy]);
+	assert_eq!(f.call_as("recovery", commit.clone())["error"], true);
+	git(&f.root, &["config", "--unset", "gitfs.reviewCommand"]);
+	let mut wrong = commit.clone();
+	wrong["ref"] = json!("refs/heads/other");
+	assert_eq!(f.call_as("recovery", wrong)["error"], true);
+	git(
+		&f.root,
+		&["config", "remote.origin.url", f.root.to_str().unwrap()],
+	);
+	assert_eq!(f.call_as("recovery", commit.clone())["error"], true);
+	git(
+		&f.root,
+		&["config", "remote.origin.url", f.remote.to_str().unwrap()],
+	);
+	git(
+		&f.root,
+		&["commit", "-q", "--allow-empty", "-m", "later local work"],
+	);
+	assert_eq!(f.call_as("recovery", commit)["error"], true);
+	assert_eq!(git(&f.remote, &["rev-parse", "main"]), f.old);
+}
+
+#[test]
+fn push_handoff_preserves_hook_veto_without_retrying_dispatch() {
+	let f = Fixture::new();
+	f.hook(1);
+	let grant = f.call(f.handoff_input("delivery", "recovery"));
+	let input = recipient_commit(&grant);
+	let refused = f.call_as("recovery", input.clone());
+	assert_eq!(refused["status"], "refused", "{refused}");
+	assert_eq!(refused["reason"], "hook_refused");
+	assert_eq!(f.call_as("recovery", input), refused);
+	assert_eq!(
+		fs::read_to_string(f.root.join("hook-runs"))
+			.unwrap()
+			.lines()
+			.count(),
+		1
+	);
+	assert_eq!(git(&f.remote, &["rev-parse", "main"]), f.old);
+}
+
+#[test]
+fn push_handoff_refuses_remote_drift_and_reconciles_exact_delivery() {
+	let f = Fixture::new();
+	let grant = f.call(f.handoff_input("delivery", "recovery"));
+	let tree = git(&f.root, &["rev-parse", "HEAD^{tree}"]);
+	let competing = git(
+		&f.root,
+		&[
+			"commit-tree",
+			&tree,
+			"-p",
+			&f.old,
+			"-m",
+			"competing delivery",
+		],
+	);
+	git(
+		&f.root,
+		&[
+			"push",
+			"-q",
+			"origin",
+			&format!("{competing}:refs/heads/main"),
+		],
+	);
+	let answer = f.call_as("recovery", recipient_commit(&grant));
+	assert_eq!(answer["error"], true, "{answer}");
+	assert_eq!(git(&f.remote, &["rev-parse", "main"]), competing);
+	let g = Fixture::new();
+	g.call(g.handoff_input("delivery", "recovery"));
+	git(
+		&g.root,
+		&[
+			"push",
+			"-q",
+			"origin",
+			&format!("{}:refs/heads/main", g.new),
+		],
+	);
+	let confirmed = g.call_as(
+		"recovery",
+		json!({"phase":"reconcile","operation_id":"delivery"}),
+	);
+	assert_eq!(confirmed["status"], "confirmed", "{confirmed}");
+	assert!(!g.root.join("hook-runs").exists());
 }

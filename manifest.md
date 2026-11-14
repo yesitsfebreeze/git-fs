@@ -299,7 +299,7 @@
       }
     },
     "tool.integrate.push": {
-      "description": "Preview, commit or reconcile a guarded push with reviewed revision evidence.",
+      "description": "Preview, hand off, commit or reconcile a guarded push with reviewed revision evidence.",
       "schema": {
         "type": "object",
         "required": [
@@ -323,7 +323,8 @@
                 "enum": [
                   "preview",
                   "commit",
-                  "reconcile"
+                  "reconcile",
+                  "handoff"
                 ]
               },
               "expected_revision": {
@@ -346,6 +347,10 @@
               },
               "operation_id": {
                 "type": "string"
+              },
+              "recipient_session": {
+                "type": "string",
+                "description": "Authorize a distinct recipient to finish this exact guarded push; preview then handoff."
               }
             },
             "additionalProperties": false

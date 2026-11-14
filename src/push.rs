@@ -53,6 +53,8 @@ fn session_name(s: &str) -> bool {
 struct Binding {
 	repository: String,
 	session: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	authorized_by: Option<String>,
 	remote: String,
 	reference: String,
 	commit: String,
@@ -63,6 +65,7 @@ struct Binding {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Status {
+	Ready,
 	Unknown,
 	Refused,
 	Confirmed,
@@ -87,7 +90,9 @@ impl Record {
 			&& session_name(&self.binding.session)
 			&& self.revision == revision(&self.binding)
 			&& valid_binding(&self.binding)
+			&& (self.status != Status::Ready || self.binding.authorized_by.is_some())
 			&& [
+				"handoff_authorized",
 				"dispatch_pending_or_unknown",
 				"cancelled_before_dispatch",
 				"hook_refused",
@@ -101,6 +106,10 @@ impl Record {
 fn valid_binding(b: &Binding) -> bool {
 	b.repository.len() == 64
 		&& b.repository.bytes().all(|c| c.is_ascii_hexdigit())
+		&& session_name(&b.session)
+		&& b.authorized_by
+			.as_deref()
+			.is_none_or(|source| session_name(source) && source != b.session)
 		&& name(&b.remote, 64)
 		&& b.reference.starts_with("refs/heads/")
 		&& b.reference.len() <= 256
@@ -412,9 +421,19 @@ impl Context<'_> {
 		{
 			return Err("invalid push binding: remote must be a plain remote name, ref a full refs/heads/<branch> of [A-Za-z0-9/_.-], commit a full 40-hex sha".into());
 		}
+		let recipient = input
+			.get("recipient_session")
+			.map(|value| {
+				value
+					.as_str()
+					.filter(|value| session_name(value) && *value != session)
+					.ok_or("handoff recipient must be a distinct bounded session")
+			})
+			.transpose()?;
 		let mut b = Binding {
 			repository: String::new(),
-			session: session.into(),
+			session: recipient.unwrap_or(session).into(),
+			authorized_by: recipient.map(|_| session.to_owned()),
 			remote: remote.into(),
 			reference: reference.into(),
 			commit: commit.into(),
@@ -447,10 +466,27 @@ impl Context<'_> {
 				);
 			}
 		}
+		if recipient.is_some() && self.git(&["rev-parse", "--verify", reference])?.trim() != commit
+		{
+			return Err("handoff requires the exact current local destination ref".into());
+		}
 		let url = self.url(remote)?;
 		b.url_digest = digest(url.as_bytes());
 		b.repository = self.repository()?;
 		Ok((b, url))
+	}
+	fn resume_binding(&self, binding: &Binding, timeout_ms: u64) -> Result<String> {
+		let source = binding
+			.authorized_by
+			.as_deref()
+			.ok_or("push handoff authority missing")?;
+		let input = json!({"remote":binding.remote,"ref":binding.reference,"commit":binding.commit,
+			"expected_remote_head":binding.expected_remote_head,"recipient_session":binding.session});
+		let (current, url) = self.binding(source, &input, timeout_ms)?;
+		if current != *binding {
+			return Err("push handoff binding changed".into());
+		}
+		Ok(url)
 	}
 	fn lock(&self) -> Result<File> {
 		private_dir(&self.dir)?;
@@ -514,14 +550,16 @@ impl Context<'_> {
 		if !prior.valid() || prior.revision != record.revision {
 			return Err("push record changed unexpectedly".into());
 		}
-		if prior.status != Status::Unknown {
+		if (prior.status != Status::Unknown && prior.status != Status::Ready)
+			|| (prior.status == Status::Unknown && record.status == Status::Ready)
+		{
 			record = prior;
 		}
 		self.save(dir, &record)?;
 		Ok(record)
 	}
 	fn reconcile(&self, dir: &Path, mut r: Record) -> Result<Record> {
-		if r.status != Status::Unknown {
+		if r.status != Status::Unknown && r.status != Status::Ready {
 			return Ok(r);
 		}
 		if bounded_read(&dir.join("hook-result"), 16).ok().as_deref() == Some(b"refused") {
@@ -636,9 +674,21 @@ pub fn execute(
 		.map_err(|_| "repository unavailable")?;
 	cx.dir = cx.root.join(config.directory()).join("push-attempts");
 	let phase = input["phase"].as_str().unwrap_or("preview");
-	if !["preview", "commit", "reconcile"].contains(&phase) {
+	if !["preview", "commit", "reconcile", "handoff"].contains(&phase) {
 		return Err("unknown push phase".into());
 	}
+	let recipient = input.get("recipient_session").and_then(Value::as_str);
+	if recipient.is_some() && !["preview", "handoff"].contains(&phase) {
+		return Err("recipient_session authorizes a handoff, not a push; use phase handoff".into());
+	}
+	if phase == "handoff" && recipient.is_none() {
+		return Err("handoff requires recipient_session".into());
+	}
+	let operation_session = if phase == "handoff" {
+		recipient.unwrap()
+	} else {
+		session
+	};
 	let id = input["operation_id"].as_str().unwrap_or("");
 	if phase != "preview" && !name(id, 64) {
 		return Err(format!("{phase} needs operation_id: a name you pick for this push ([A-Za-z0-9_.-], at most 64), the same on a retry or reconcile so the push happens once; plus expected_revision from the preview"));
@@ -648,15 +698,17 @@ pub fn execute(
 	{
 		return Err("preview accepts no operation_id or expected_revision; to push, send them with phase: \"commit\"".into());
 	}
+	let mut resumed = None;
 	if phase != "preview" {
 		let _lock = cx.lock()?;
 		let records = cx.records()?;
 		if let Some((dir, record)) = records
 			.into_iter()
-			.find(|(_, r)| r.operation_id == id && r.binding.session == session)
+			.find(|(_, r)| r.operation_id == id && r.binding.session == operation_session)
 		{
-			if phase == "commit" {
-				if input["expected_revision"].as_str() != Some(&record.revision)
+			if phase == "commit" || phase == "handoff" {
+				if (phase == "handoff" && record.binding.authorized_by.as_deref() != Some(session))
+					|| input["expected_revision"].as_str() != Some(&record.revision)
 					|| input["remote"].as_str() != Some(&record.binding.remote)
 					|| input["ref"].as_str() != Some(&record.binding.reference)
 					|| input["commit"].as_str() != Some(&record.binding.commit)
@@ -664,10 +716,14 @@ pub fn execute(
 				{
 					return Err("operation identity binding conflict".into());
 				}
-				return Ok(record.value());
+				if phase == "handoff" || record.status != Status::Ready {
+					return Ok(record.value());
+				}
+				resumed = Some(record);
+			} else {
+				drop(_lock);
+				return Ok(cx.reconcile(&dir, record)?.value());
 			}
-			drop(_lock);
-			return Ok(cx.reconcile(&dir, record)?.value());
 		}
 		if phase == "reconcile" {
 			return Err("push attempt unavailable".into());
@@ -680,7 +736,14 @@ pub fn execute(
 	} else {
 		input
 	};
-	let (binding, url) = cx.binding(session, input, timeout_ms)?;
+	let (binding, url) = if let Some(record) = &resumed {
+		(
+			record.binding.clone(),
+			cx.resume_binding(&record.binding, timeout_ms)?,
+		)
+	} else {
+		cx.binding(session, input, timeout_ms)?
+	};
 	crate::review::check_range(
 		&cx.root,
 		binding
@@ -696,47 +759,60 @@ pub fn execute(
 	}
 	if phase == "preview" {
 		return Ok(
-			json!({"phase":"preview","revision":revision,"binding":binding,"already_present":remote.as_deref()==Some(&binding.commit),"next":"push again with the same fields plus phase: commit, expected_revision: <revision> and operation_id: a name you pick ([A-Za-z0-9_.-]); reuse it to retry or reconcile"}),
+			json!({"phase":"preview","revision":revision,"binding":binding,"already_present":remote.as_deref()==Some(&binding.commit),"next_phase":if recipient.is_some(){"handoff"}else{"commit"},"next":"use next_phase with the same fields, expected_revision and operation_id; handoff authorizes its recipient without pushing; reuse the operation_id to retry or reconcile"}),
 		);
 	}
 	if input["expected_revision"].as_str() != Some(&revision) {
 		return Err("reviewed push binding changed; preview again".into());
 	}
-	let dir = cx.dir.join(record_key(session, id));
+	let dir = cx.dir.join(record_key(&binding.session, id));
 	let mut record = Record {
 		schema: "gitfs-push/v1".into(),
 		operation_id: id.into(),
 		revision,
 		binding,
-		status: Status::Unknown,
-		reason: "dispatch_pending_or_unknown".into(),
+		status: if phase == "handoff" {
+			Status::Ready
+		} else {
+			Status::Unknown
+		},
+		reason: if phase == "handoff" {
+			"handoff_authorized"
+		} else {
+			"dispatch_pending_or_unknown"
+		}
+		.into(),
 	};
 	{
 		let _lock = cx.lock()?;
 		let records = cx.records()?;
 		if let Some((_, prior)) = records
 			.iter()
-			.find(|(_, r)| r.operation_id == id && r.binding.session == session)
+			.find(|(_, r)| r.operation_id == id && r.binding.session == record.binding.session)
 		{
 			if prior.revision != record.revision {
 				return Err("operation identity binding conflict".into());
 			}
-			return Ok(prior.value());
-		}
-
-		if records.len() >= capacity() {
+			if phase != "commit" || prior.status != Status::Ready {
+				return Ok(prior.value());
+			}
+		} else if records.len() >= capacity() {
 			return Err("push attempt capacity reached".into());
 		}
-		if records.iter().any(|(_, r)| {
-			r.status == Status::Unknown
-				&& r.binding.url_digest == record.binding.url_digest
-				&& r.binding.reference == record.binding.reference
-		}) {
+		if phase == "commit"
+			&& records.iter().any(|(_, r)| {
+				r.status == Status::Unknown
+					&& r.binding.url_digest == record.binding.url_digest
+					&& r.binding.reference == record.binding.reference
+			}) {
 			return Err("destination has an unresolved attempt; reconcile it first".into());
 		}
 		private_dir(&dir)?;
 		cx.save(&dir, &record)?;
 		crate::hook::sync_directory(&cx.dir)?;
+	}
+	if phase == "handoff" {
+		return Ok(record.value());
 	}
 	if remote.as_deref() == Some(&record.binding.commit) {
 		record.status = Status::Confirmed;

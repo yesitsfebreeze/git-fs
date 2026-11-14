@@ -49,6 +49,7 @@ fn sample_record(id: &str) -> Record {
 	let binding = Binding {
 		repository: "a".repeat(64),
 		session: "s".into(),
+		authorized_by: None,
 		remote: "origin".into(),
 		reference: "refs/heads/main".into(),
 		commit: "b".repeat(40),
@@ -323,4 +324,43 @@ fn a_bare_preview_after_a_integrate_derives_remote_ref_commit_and_remote_head() 
 	assert!(preview("s", json!({"remote": "-x"})).is_err());
 	let none = preview("other", json!({})).unwrap_err();
 	assert!(none.contains("integrate first"), "{none}");
+}
+
+#[test]
+fn stale_ready_readback_cannot_undo_a_dispatched_handoff() {
+	let temp = tempfile::tempdir().unwrap();
+	let cancel = AtomicBool::new(false);
+	let cx = Context {
+		root: temp.path().into(),
+		dir: temp.path().join("attempts"),
+		deadline: Instant::now() + Duration::from_secs(30),
+		cancel: &cancel,
+	};
+	{
+		let _lock = cx.lock().unwrap();
+	}
+	let mut ready = sample_record("delivery");
+	ready.binding.authorized_by = Some("source".into());
+	ready.revision = revision(&ready.binding);
+	ready.status = Status::Ready;
+	ready.reason = "handoff_authorized".into();
+	let dir = cx.dir.join(record_key("s", "delivery"));
+	private_dir(&dir).unwrap();
+	cx.save(&dir, &ready).unwrap();
+	let mut dispatched = ready.clone();
+	dispatched.status = Status::Unknown;
+	dispatched.reason = "dispatch_pending_or_unknown".into();
+	cx.save(&dir, &dispatched).unwrap();
+	let after = cx.persist_readback(&dir, ready).unwrap();
+	assert_eq!(after.status, Status::Unknown);
+	assert_eq!(after.reason, "dispatch_pending_or_unknown");
+}
+
+#[test]
+fn legacy_push_receipts_keep_their_binding_without_handoff_fields() {
+	let record = sample_record("legacy");
+	assert!(record.value()["binding"].get("authorized_by").is_none());
+	let decoded: Record = serde_json::from_value(record.value()).unwrap();
+	assert!(decoded.valid());
+	assert_eq!(decoded.revision, record.revision);
 }

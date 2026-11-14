@@ -136,10 +136,11 @@ pub(crate) fn describe() -> Value {
 			"properties":{
 				"op":{"type":"string","enum":["integrate","push","undo","scan"]},
 				"message":{"type":"string","description":"Reviewed commit subject; never bypasses a required gate."},
-				"phase":{"type":"string","enum":["preview","commit","reconcile"]},
+				"phase":{"type":"string","enum":["preview","commit","reconcile","handoff"]},
 				"expected_revision":{"type":"string"},
 				"remote":{"type":"string"},"ref":{"type":"string"},"commit":{"type":"string"},
 				"expected_remote_head":{"type":["string","null"]},"operation_id":{"type":"string"},
+				"recipient_session":{"type":"string","description":"Authorize a distinct recipient to finish this exact guarded push; preview then handoff."},
 				"force_secrets":{"type":"boolean","description":"Integrate despite secrets in the diff."},
 				"paths":{"type":"array","items":{"type":"string"},"description":"Files to scan (scan)."}
 			},

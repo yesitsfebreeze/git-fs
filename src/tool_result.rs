@@ -40,6 +40,7 @@ pub(crate) fn validate(tool: &str, input: &Value) -> Result<()> {
 				"phase",
 				"operation_id",
 				"expected_revision",
+				"recipient_session",
 			],
 		),
 		("integrate", "integrate") => (
@@ -93,7 +94,7 @@ pub(crate) fn validate(tool: &str, input: &Value) -> Result<()> {
 			}
 			"path" => valid_path(value.as_str().ok_or("path must be a string")?)?,
 			"message" | "phase" | "expected_revision" | "remote" | "ref" | "commit"
-			| "operation_id" | "session"
+			| "operation_id" | "session" | "recipient_session"
 				if value.is_string() => {}
 			"expected_remote_head" if value.is_null() || value.is_string() => {}
 			"offset" if value.as_u64().is_some() => {}

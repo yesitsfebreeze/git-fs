@@ -197,6 +197,49 @@ git-fs tools
 Each `call` is its own process, so a read in one call does not make the next
 call's edit fresh; the MCP server keeps that state for the whole session.
 
+## Publication completion and handoff
+
+Saving a session branch, materializing files, integrating a trunk commit and
+pushing a remote ref are separate outcomes. A stop only materializes. Integration
+returns `push: false`. Finish a requested delivery by pushing the exact integrated
+commit and observing a confirmed remote receipt.
+
+An originating session can authorize a different session to finish one reviewed
+push without giving it the originating identity:
+
+1. The source calls `push` with `phase: "preview"`, the exact `remote`, `ref`,
+   `commit`, `expected_remote_head`, and `recipient_session`.
+2. It repeats those fields with `phase: "handoff"`, the preview's
+   `expected_revision`, and a distinct `operation_id`. This stores a durable
+   `ready` receipt; it does not push.
+3. The recipient, under its own trusted session, calls
+   `push {phase: "reconcile", operation_id}`. The receipt names the original
+   source in `binding.authorized_by` and the recipient in `binding.session`.
+4. The recipient sends `phase: "commit"`, the same `operation_id`,
+   `expected_revision: receipt.revision`, and the receipt's `remote`,
+   `ref: binding.reference`, `commit` and `expected_remote_head`.
+   It omits `recipient_session`.
+
+The grant requires the source's terminal integration receipt and the exact current
+local destination ref. Use the same repository and worktree after restart. A
+changed local destination, repository, remote URL, expected remote head or current
+review policy blocks dispatch. Configured pre-push hooks still run. Concurrent
+recipient retries persist `unknown` before dispatch and cannot dispatch the same
+operation twice. Reconcile an uncertain outcome; never create a fresh operation
+merely because an acknowledgement was lost.
+
+Handoffs share the bounded push-attempt store and its retention rules. A
+`ready` receipt means authorized but not dispatched; `unknown` remains unresolved;
+`confirmed` requires the exact remote commit to have been observed. Reconciliation
+can confirm an already-delivered grant without another push. A late ready-state
+readback cannot make an already-dispatched operation dispatchable again.
+
+Ordinary pushes remain limited to commits integrated by the current session.
+A worker that ended before creating a grant has not authorized a replacement
+session; restarting with its identity or supplying another session name is not a
+handoff. Resume a genuinely continuous session with its stable identity, or arrange
+the source-authorized handoff before it ends.
+
 ## Environment
 
 | Variable | Meaning |
