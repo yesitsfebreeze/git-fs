@@ -1,5 +1,7 @@
-//! Codex wire adapter. Tool hooks bind each MCP call to its originating
+//! Codex wire adapter. Trusted host hooks bind each MCP call to its originating
 //! session/workspace instead of the process cwd or checkout-global CURRENT.
+//! The MCP wire format itself cannot authenticate model-supplied `_git_fs`:
+//! the host must inject/overwrite routing on every call and prevent bypass.
 use crate::service::{Context, Mode};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
@@ -51,6 +53,9 @@ pub fn describe_context(schema: &mut Value) {
 pub fn take_context(input: &mut Value, call: u64) -> Result<Context, String> {
 	let routing = input.as_object_mut().and_then(|map| map.remove(CONTEXT))
 		.ok_or("git-fs Codex routing is missing. Enable and trust this plugin's hooks in /hooks before using its tools.")?;
+	if routing.as_object().is_none_or(|fields| fields.len() != 2) {
+		return Err("invalid git-fs Codex routing fields".into());
+	}
 	let session = routing["session"]
 		.as_str()
 		.filter(|s| crate::provenance::valid_session(s))
@@ -120,4 +125,47 @@ pub fn patch_paths(payload: &Value, root: &Path, cwd: &Path, store_dir: &str) ->
 		}
 	}
 	paths
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn host_hook_overwrites_model_supplied_route_before_mcp() {
+		let cwd = std::env::current_dir()
+			.unwrap()
+			.to_string_lossy()
+			.into_owned();
+		let payload = json!({
+			"cwd": cwd,
+			"tool_input": {
+				"_git_fs": {"session": "spoofed", "cwd": "/wrong"},
+				"paths": ["keep.txt"],
+			},
+		});
+		let mut routed = routed_input(&payload, "verified-session").unwrap();
+		let context = take_context(&mut routed, 1).unwrap();
+		assert_eq!(context.session, "verified-session");
+		assert_eq!(context.cwd, cwd);
+		assert!(
+			routed.get("_git_fs").is_none(),
+			"host route is not a model input"
+		);
+		assert_eq!(routed["paths"], json!(["keep.txt"]));
+	}
+
+	#[test]
+	fn unknown_or_missing_hook_routing_fields_are_refused() {
+		let cwd = std::env::current_dir()
+			.unwrap()
+			.to_string_lossy()
+			.into_owned();
+		for mut input in [
+			json!({}),
+			json!({"_git_fs":{"session":"s","cwd":cwd,"model_override":true}}),
+		] {
+			assert!(take_context(&mut input, 1).is_err());
+		}
+	}
 }
