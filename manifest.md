@@ -446,7 +446,7 @@
     "mode": {
       "type": "string",
       "default": "git",
-      "doc": "Where write, edit and delete publish. git: each tool change commits to its session branch and the local shared refs/gitfs-live/current; reads/search prefer the live commit, then session and disk; the worktree is unchanged until materialize. gitfs_snapshot makes isolated build/test worktrees pinned to live. Local mode writes directly to disk. Outside Git a standalone .git-fs store holds the branch objects."
+      "doc": "Where write, edit and delete publish. git: each tool change commits to its session branch and the local shared refs/gitfs-live/current; reads/search prefer the live commit, then session and disk; the worktree is unchanged until materialize. gitfs_snapshot defaults to isolated live-tip worktrees; kind=candidate exports the exact reviewed integration tree with per-run cleanup capability. Local mode writes directly to disk. Outside Git a standalone .git-fs store holds the branch objects."
     },
     "max_read_bytes": {
       "type": "integer",

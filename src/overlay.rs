@@ -35,7 +35,11 @@ pub(crate) fn describe() -> Value {
 				"offset":{"type":"integer","minimum":0},
 				"limit":{"type":"integer","minimum":1,"maximum":65536,"description":"Patch bytes per page (diff); below 128 a page still answers 128, so a page always moves past a multibyte character."},
 				"expected_revision":{"type":"string","description":"Required for diff continuation."},
-				"id":{"type":"string","description":"Release this session's previously generated snapshot; omit to create one."}
+				"id":{"type":"string","description":"Release this session's previously generated snapshot; omit to create one."},
+				"kind":{"type":"string","enum":["live","candidate"],"description":"Snapshot kind; defaults to live for backward compatibility."},
+				"expected_tree":{"type":"string","minLength":40,"description":"Require an exact integration-candidate tree ID."},
+				"expected_review":{"type":"object","description":"Require the exact ReviewedTree returned by an integration preview."},
+				"capability":{"type":"string","minLength":64,"description":"Unforgeable per-run capability returned on candidate creation; required for its release."}
 			},
 			"additionalProperties":false
 		}
@@ -207,9 +211,24 @@ pub(crate) fn dispatch_captured(
 			ok(json!({"rolled_back":commit,"restored":restored,"tip":store.tip(session)?}))
 		}
 		Some("catchup") => ok(store.catchup_captured(session, capture)?),
-		Some("snapshot") => match input["id"].as_str() {
-			Some(id) => ok(store.release_snapshot(session, id)?),
-			None => ok(store.create_snapshot(session)?),
+		Some("snapshot") => match (
+			input["kind"].as_str().unwrap_or("live"),
+			input["id"].as_str(),
+		) {
+			("live", Some(id)) => ok(store.release_snapshot(session, id)?),
+			("live", None) => ok(store.create_snapshot(session)?),
+			("candidate", Some(id)) => {
+				let capability = input["capability"]
+					.as_str()
+					.ok_or("candidate release capability required")?;
+				ok(store.release_candidate_snapshot(session, id, capability)?)
+			}
+			("candidate", None) => ok(store.create_candidate_snapshot_checked(
+				session,
+				input["expected_tree"].as_str(),
+				input.get("expected_review"),
+			)?),
+			(other, _) => err(format!("unsupported snapshot kind: {other}")),
 		},
 		Some("diff") => inspection::diff(store, session, input),
 		Some("materialize") => {

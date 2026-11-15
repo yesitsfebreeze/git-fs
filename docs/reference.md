@@ -78,6 +78,15 @@ untracked changes. Generated ignored build outputs may be removed with the
 checkout. Snapshots require a normal project Git repository (not a standalone
 `.git-fs` object store).
 
+Use `gitfs_snapshot {"kind":"candidate"}` to export the exact merged
+`reviewed_tree` that integration would commit (current trunk + session
+overlay). Supply optional `expected_tree` and/or the full `expected_review`
+source object to reject stale previews. Its result includes a per-run secret
+`capability`, which is required alongside `kind` and `id` to release only
+that run's checkout. Foreign, modified, ignored or untracked outputs are
+preserved, not forcibly removed. See [exact candidate verification](verification.md)
+for raw-byte/mode checks, limitations and check handoff.
+
 ## Codex integration
 
 Codex selects `.codex-plugin/plugin.json`; Claude keeps its existing manifest.

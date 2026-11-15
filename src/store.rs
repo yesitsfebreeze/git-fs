@@ -4,6 +4,9 @@
 //! branch head, so trunk movement between session start and integrate can't show
 //! stale full trees.
 
+#[path = "snapshot.rs"]
+mod snapshot;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
