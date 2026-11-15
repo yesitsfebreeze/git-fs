@@ -1,8 +1,8 @@
-//! git-fs: workspace file access and the Git session branch it commits to.
-//! In `git` mode every write and edit lands as one commit on
-//! `refs/gitfs/<session>` and the worktree stays untouched until materialize;
-//! reads and searches prefer the session's changes and fall back to the
-//! worktree. Integrate reviews that branch onto trunk; `local` mode writes
+//! git-fs: workspace file access with shared, durable agent commits.
+//! In `git` mode each change commits to the session branch and publishes
+//! on `refs/gitfs-live/current` so peers read/search it immediately while
+//! the reviewed worktree and index remain untouched. Snapshots isolate builds;
+//! integrate reviews a session onto trunk; `local` mode writes
 //! directly. One process serves it all: the stdio MCP server (`git-fs mcp`),
 //! the Claude Code lifecycle hooks (`git-fs hook <action>`), a one-shot CLI
 //! (`git-fs call <tool> <json>`), and the private pre-push hook.
@@ -40,7 +40,7 @@ use std::sync::{Arc, OnceLock};
 pub(crate) type Result<T, E = String> = std::result::Result<T, E>;
 
 /// Every tool the MCP server lists, by the name an agent calls it.
-pub const TOOLS: [&str; 17] = [
+pub const TOOLS: [&str; 18] = [
 	"read",
 	"write",
 	"edit",
@@ -54,6 +54,7 @@ pub const TOOLS: [&str; 17] = [
 	"gitfs_catchup",
 	"gitfs_materialize",
 	"gitfs_capture",
+	"gitfs_snapshot",
 	"integrate",
 	"push",
 	"undo",
@@ -148,6 +149,7 @@ fn dotted(tool: &str) -> Option<(&'static str, &'static str)> {
 		"gitfs_catchup" => ("gitfs", "catchup"),
 		"gitfs_materialize" => ("gitfs", "materialize"),
 		"gitfs_capture" => ("gitfs", "capture"),
+		"gitfs_snapshot" => ("gitfs", "snapshot"),
 		"integrate" => ("integrate", "integrate"),
 		"push" => ("integrate", "push"),
 		"undo" => ("integrate", "undo"),

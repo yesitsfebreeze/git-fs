@@ -2,7 +2,7 @@
 
 # 🗂️ git-fs
 
-**Git session branches for AI agents.**
+**Live Git commits for collaborating AI agents.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
@@ -11,14 +11,16 @@
 
 </div>
 
-An agent's edits belong on its own branch. git-fs gives any MCP-capable agent a
-Git-backed file layer: every edit is a commit, reads see the agent's changes,
-and only changed files are copied back to your working directory.
+git-fs gives MCP-capable agents a shared, Git-backed file view. Every successful
+edit or deletion becomes a durable commit on `refs/gitfs-live/current`, visible
+immediately to other sessions on the same repository—without touching the
+working tree, index, or reviewed `main` branch.
 
-- **Keep changes separate.** Each session works on its own branch.
-- **Prevent stale edits.** Writes and deletions check that the file still matches what the agent read.
-- **Review and undo.** Inspect a session's diff or roll back an edit.
-- **One or many.** Every tool accepts one item or an `items` array. Reads and searches can run in parallel; mutations run in order.
+- **Collaborate live.** Reads and searches see the shared commit; independent edits merge, conflicting edits refuse without overwriting a peer.
+- **Keep ownership.** Session branches still record provenance, rollback, and review history.
+- **Build independently.** `gitfs_snapshot` creates a detached worktree pinned to one exact live commit.
+- **Review before release.** Integration and remote push remain separate, guarded operations.
+- **Batch work.** Every tool accepts one item or an `items` array; read/search items run concurrently.
 
 ## Install
 
@@ -66,15 +68,17 @@ Once configured, the agent uses git-fs for reading, searching and editing files.
 
 > Roll back the last git-fs edit.
 
-Edits stay on the session branch until **materialize** copies them to disk.
-The agent must materialize before builds and tests and before finishing work.
-Existing disk changes are checked before anything is overwritten or deleted.
-Use `delete` after reading a file to record its removal on the session branch.
-For changes made directly on disk, `gitfs_capture` with explicit `paths` records
-selected additions, edits and tracked deletions without changing shared staging.
+Changes publish immediately to the shared live Git ref, but the ordinary disk
+checkout remains unchanged. Use `gitfs_snapshot {}` to get a clean pinned
+worktree and run independent builds/tests there; pass its returned `id` to
+`gitfs_snapshot` to release it after the checkout is clean. `gitfs_materialize`
+remains available when a native tool must work in the common checkout and checks
+for disk conflicts. The session branch remains the review and rollback record.
 
-Materializing updates files, while **integrate** commits the reviewed session
-changes onto your working branch. **Push** publishes them to your remote.
+Shared live commits are **local to that Git repository**. They are not
+automatically pushed to GitHub: `integrate` and the guarded `push` workflow
+still control reviewed publication to `main`. To share between machines, use
+the reviewed Git remote handoff.
 
 For tool arguments, batching examples, configuration and hook behavior, see the
 [reference](docs/reference.md).

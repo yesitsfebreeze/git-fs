@@ -1,9 +1,9 @@
 //! Bounded file read/write/edit/delete tools. Paths resolve against the canonical
 //! session cwd and must stay inside it; mutations are serialized per target
 //! and gated on a content-derived read of the current version. In git
-//! mode a path inside a repository reads the session's change first and
-//! publishes as one commit on the session branch; everything else, and local
-//! mode, reads and writes the worktree.
+//! mode a path inside a repository reads the shared live revision first and
+//! publishes changes both to its session branch and the shared live ref;
+//! local mode reads and writes the worktree.
 
 use crate::change_record::{
 	publication_id, Actor, Evidence, Operation, OverlayCommit, Provider, Storage, Target, Version,
@@ -267,14 +267,17 @@ fn branch(service: &Service, cwd: &Path, resolved: &Path, create: bool) -> Optio
 	(!rel.as_os_str().is_empty()).then_some(Branch { store, rel })
 }
 
-/// The current bytes of a path: the session's change when it made one,
-/// otherwise the worktree. `None` when absent from both.
+/// The current bytes: shared live revision, then any private session change,
+/// then the worktree. `None` when absent from all three.
 fn current_bytes(
 	branch: Option<&Branch>,
 	session: &str,
 	resolved: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
 	if let Some(branch) = branch {
+		if let Some(change) = branch.store.live_change(&branch.rel)? {
+			return Ok(change);
+		}
 		if let Some(change) = branch.store.session_change(session, &branch.rel)? {
 			return Ok(change);
 		}
@@ -286,7 +289,7 @@ fn current_bytes(
 	}
 }
 
-/// What another tool reads for a workspace path: the session's change first.
+/// What another tool reads for a workspace path, including peer commits.
 #[allow(dead_code)]
 pub fn read_current(service: &Service, context: &Context, path: &str) -> Result<Vec<u8>, String> {
 	let cwd = Path::new(&context.cwd)
@@ -305,12 +308,19 @@ pub fn read_current(service: &Service, context: &Context, path: &str) -> Result<
 fn commit(
 	branch: &Branch,
 	context: &Context,
+	before: Option<&[u8]>,
 	bytes: &[u8],
 	operation: Operation,
 ) -> Result<(Option<Evidence>, String), String> {
 	let mut capture = crate::provenance::Capture::from_context(
 		&serde_json::json!({"session":context.session,"run":context.run,"call":context.call}),
 	)?;
+	if branch
+		.store
+		.unpublished_session_path(&context.session, &branch.rel)?
+	{
+		return Err("session branch changed since its last live publication; reconcile the unpublished edit before continuing".into());
+	}
 	let mode = branch.store.mode_for(&context.session, &branch.rel)?;
 	let tip = branch.store.write_blob_captured(
 		&context.session,
@@ -320,14 +330,28 @@ fn commit(
 		&mut capture,
 		operation,
 	)?;
+	let live = branch
+		.store
+		.publish_live(&context.session, &branch.rel, before, Some(bytes), &mode)
+		.map_err(|error| {
+			format!(
+				"session commit {} preserved, but live publication failed: {error}",
+				tip.as_deref().unwrap_or("unchanged")
+			)
+		})?;
 	let name = branch.store.branch(&context.session);
 	let summary = match tip {
 		Some(tip) => format!(
-			"committed {} bytes to {} as {tip} on {name}; materialize to run it",
+			"committed {} bytes to {} as {tip} on {name}; live at {}; materialize to run it",
 			bytes.len(),
-			branch.rel.display()
+			branch.rel.display(),
+			live.as_deref().unwrap_or("unchanged")
 		),
-		None => format!("{} unchanged on {name}", branch.rel.display()),
+		None => format!(
+			"{} unchanged on {name}; live at {}",
+			branch.rel.display(),
+			live.as_deref().unwrap_or("unchanged")
+		),
 	};
 	Ok((capture.records.pop(), summary))
 }
@@ -361,14 +385,26 @@ fn read(
 		.map(|b| b.store.tip(&context.session))
 		.transpose()?
 		.flatten();
-	let mut view = "disk";
-	let change = match &branch {
+	let live_tip = branch
+		.as_ref()
+		.map(|branch| branch.store.live_tip())
+		.transpose()?
+		.flatten();
+	let live_change = match &branch {
+		Some(branch) => branch.store.live_change(&branch.rel)?,
+		None => None,
+	};
+	let session_change = match &branch {
 		Some(branch) => branch.store.session_change(&context.session, &branch.rel)?,
 		None => None,
 	};
-	if change.is_some() {
-		view = "session";
-	}
+	let (view, change) = if live_change.is_some() {
+		("live", live_change)
+	} else if session_change.is_some() {
+		("session", session_change)
+	} else {
+		("disk", None)
+	};
 	let bytes = match change {
 		Some(Some(bytes)) => bytes,
 		Some(None) => {
@@ -415,7 +451,10 @@ fn read(
 		}
 	}
 	if let Some(b) = &branch {
-		if b.store.head()? != head || b.store.tip(&context.session)? != tip {
+		if b.store.head()? != head
+			|| b.store.tip(&context.session)? != tip
+			|| b.store.live_tip()? != live_tip
+		{
 			return Err("revision moved during read; reread it".into());
 		}
 	}
@@ -431,7 +470,9 @@ fn read(
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({"state":"absent"}),
 		Err(e) => serde_json::json!({"state":"unavailable","error":e.to_string()}),
 	};
-	let commit = if view == "session" {
+	let commit = if view == "live" {
+		live_tip
+	} else if view == "session" {
 		tip
 	} else if view == "trunk" {
 		head
@@ -538,6 +579,11 @@ fn require_disk_agreement(
 		.store
 		.trunk_read(&branch.rel)?
 		.map(|bytes| version(&bytes));
+	// The unchanged worktree is allowed while the selected shared revision
+	// has advanced, including a published deletion (selected == None).
+	if branch.store.live_change(&branch.rel)?.is_some() && disk == trunk {
+		return Ok(());
+	}
 	if trunk.is_some() && disk != trunk && !sibling_revision {
 		return Err("disk differs from committed trunk; reconcile local changes before editing; capture applies only to session-owned paths".into());
 	}
@@ -566,9 +612,9 @@ fn write(
 	let _guard = target.lock().unwrap_or_else(|e| e.into_inner());
 	check_cancel(cancel)?;
 	let branch = branch(service, &cwd, &resolved, true);
-	let current = current_bytes(branch.as_ref(), &context.session, &resolved)
-		.map_err(|e| format!("write failed: {e}"))?
-		.map(|bytes| version(&bytes));
+	let previous = current_bytes(branch.as_ref(), &context.session, &resolved)
+		.map_err(|e| format!("write failed: {e}"))?;
+	let current = previous.as_deref().map(version);
 	match last_read {
 		None => {
 			if current.is_some() {
@@ -599,7 +645,13 @@ fn write(
 	let new_version = version(text.as_bytes());
 	if let Some(branch) = &branch {
 		check_cancel(cancel)?;
-		let (evidence, content) = commit(branch, context, text.as_bytes(), Operation::Write)?;
+		let (evidence, content) = commit(
+			branch,
+			context,
+			previous.as_deref(),
+			text.as_bytes(),
+			Operation::Write,
+		)?;
 		return Ok(Outcome {
 			revision: None,
 			content,
@@ -705,6 +757,7 @@ fn edit(
 		)?;
 		false
 	};
+	let before = bytes.clone();
 	let text =
 		String::from_utf8(bytes).map_err(|_| "binary or invalid UTF-8 content".to_string())?;
 	let mut replaced = text;
@@ -738,7 +791,13 @@ fn edit(
 	let new_version = version(replaced.as_bytes());
 	if let Some(branch) = &branch {
 		check_cancel(cancel)?;
-		let (evidence, content) = commit(branch, context, replaced.as_bytes(), Operation::Edit)?;
+		let (evidence, content) = commit(
+			branch,
+			context,
+			Some(&before),
+			replaced.as_bytes(),
+			Operation::Edit,
+		)?;
 		return Ok(Outcome {
 			revision: None,
 			content,
@@ -866,7 +925,8 @@ fn delete(
 	if service.config.mode == Mode::Git && branch.is_none() {
 		return Err("cannot open the Git session store for deletion".into());
 	}
-	let current = current_bytes(branch.as_ref(), &context.session, &resolved)?.map(|b| version(&b));
+	let previous = current_bytes(branch.as_ref(), &context.session, &resolved)?;
+	let current = previous.as_deref().map(version);
 	let expected = match (last_read, current) {
 		(Some(Read::Absent), None) => {
 			return Ok(Outcome {
@@ -895,31 +955,59 @@ fn delete(
 		false,
 	)?;
 	let (evidence, content) = if let Some(branch) = &branch {
+		let selected = branch.store.selected_blob(&context.session, &branch.rel)?;
+		if selected.is_none() && !matches!(branch.store.live_change(&branch.rel)?, Some(Some(_))) {
+			return Err("file is not tracked on the session, trunk or live revision; use local mode to delete an untracked file".into());
+		}
 		if branch
 			.store
-			.selected_blob(&context.session, &branch.rel)?
-			.is_none()
+			.unpublished_session_path(&context.session, &branch.rel)?
 		{
-			return Err("file is not tracked on the session or trunk; use local mode to delete an untracked file".into());
+			return Err("session branch changed since its last live publication; reconcile the unpublished edit before continuing".into());
 		}
 		let mut capture = crate::provenance::Capture::from_context(
 			&serde_json::json!({"session":context.session,"run":context.run,"call":context.call}),
 		)?;
 		service.before_commit(&resolved);
 		check_cancel(cancel)?;
-		let tip = branch.store.delete_blob_checked(
-			&context.session,
-			&branch.rel,
-			expected,
-			&mut capture,
-		)?;
+		let tip = if selected.is_some() {
+			branch.store.delete_blob_checked(
+				&context.session,
+				&branch.rel,
+				expected,
+				&mut capture,
+			)?
+		} else {
+			branch.store.delete_blob_captured(
+				&context.session,
+				&branch.rel,
+				&mut capture,
+				Operation::Delete,
+			)?
+		};
+		let live = branch
+			.store
+			.publish_live(
+				&context.session,
+				&branch.rel,
+				previous.as_deref(),
+				None,
+				"100644",
+			)
+			.map_err(|error| {
+				format!(
+					"session deletion {} preserved, but live publication failed: {error}",
+					tip.as_deref().unwrap_or("unchanged")
+				)
+			})?;
 		(
 			capture.records.pop(),
 			format!(
-				"deleted {} on {} at {}; materialize to remove it from disk",
+				"deleted {} on {} at {}; live at {}; materialize to remove it from disk",
 				branch.rel.display(),
 				branch.store.branch(&context.session),
-				tip.as_deref().unwrap_or("unchanged")
+				tip.as_deref().unwrap_or("unchanged"),
+				live.as_deref().unwrap_or("unchanged")
 			),
 		)
 	} else {

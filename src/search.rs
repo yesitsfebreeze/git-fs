@@ -610,10 +610,8 @@ struct Change {
 	content: Option<Vec<u8>>,
 }
 
-/// In git mode, the session's changed paths under the workspace, so searches
-/// see its branch before the worktree. Dot-directories are included, as they
-/// are for the walker: an overlay is hidden from a search only when the walker
-/// hides it too, or the two halves of one answer disagree.
+/// The shared live changes are visible before the worktree and before
+/// older session-only edits. This is the same priority as file reads.
 fn session_changes(
 	service: &Service,
 	context: &Context,
@@ -627,21 +625,28 @@ fn session_changes(
 	};
 	let root = store.root().canonicalize().map_err(|e| e.to_string())?;
 	let mut changes = Vec::new();
-	for (status, rel) in store.session_paths(&context.session)? {
-		let Ok(path) = root.join(&rel).strip_prefix(cwd).map(Path::to_path_buf) else {
-			continue;
-		};
-		let content = match status {
-			'D' => None,
-			_ => store.read(&context.session, Path::new(&rel))?,
-		};
-		changes.push(Change {
-			// Results, glob matching and rg's own output all speak `/`; a
-			// Windows `\` here made a session-added file unmatchable and kept
-			// the disk copy of an overlay in the list twice.
-			path: path.to_string_lossy().replace('\\', "/"),
-			content,
-		});
+	let mut seen = std::collections::HashSet::new();
+	for (live, paths) in [
+		(true, store.live_paths()?),
+		(false, store.session_paths(&context.session)?),
+	] {
+		for (status, rel) in paths {
+			let Ok(path) = root.join(&rel).strip_prefix(cwd).map(Path::to_path_buf) else {
+				continue;
+			};
+			let path = path.to_string_lossy().replace('\\', "/");
+			if !seen.insert(path.clone()) {
+				continue;
+			}
+			let content = if status == 'D' {
+				None
+			} else if live {
+				store.live_change(Path::new(&rel))?.flatten()
+			} else {
+				store.read(&context.session, Path::new(&rel))?
+			};
+			changes.push(Change { path, content });
+		}
 	}
 	Ok(changes)
 }

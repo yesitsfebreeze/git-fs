@@ -7,17 +7,18 @@ its tools to the agent. A host without MCP support needs an MCP client adapter.
 
 WHY INTEGRATE IT
 
-git-fs gives an agent a Git session branch for file work. Each write, edit or delete
-is a commit on refs/gitfs/<session>. Reads and searches see that session's
-changes before the worktree. Edits to existing files require a prior git-fs
-read and refuse stale bytes, helping prevent accidental overwrites.
+Every successful tool-mediated write, edit or delete publishes a commit to
+refs/gitfs-live/current, immediately readable and searchable by other agents
+in the same Git repository. Session branches retain ownership and rollback.
+Edits require a prior read and stale or overlapping changes refuse safely.
 
-Changes stay on the session branch until explicitly materialized to disk.
-The agent can inspect its diff, undo session changes, and decide when builds
-and tests should see them. Integration into the project's branch and pushing
-are separate operations. Session branches do not isolate running builds:
-agents sharing a worktree still share the materialized files. Use separate
-checkouts when independent builds or concurrent disk changes are needed.
+The common worktree stays untouched. For an independent build, call
+`gitfs_snapshot {}` and run checks in its returned `path` at the pinned
+`revision`. Release the clean snapshot with `gitfs_snapshot {"id":"..."}`.
+`gitfs_materialize` remains for native tools that require the shared checkout.
+Integration to the reviewed branch and remote push remain separate guarded
+operations. The live ref is local to each repository; cross-machine handoff
+continues through reviewed commits pushed to the Git remote.
 
 INSTALL THE BINARY
 
@@ -156,30 +157,29 @@ or equivalent system configuration, so they are present in every session:
   - Use paths relative to the configured workspace. For large files, read
     bounded ranges or search for the relevant text.
   - If an edit is refused as stale, read again and reassess the change.
-  - Native file tools and shell searches see disk, not unpublished session
-    changes. Route repository reads and writes through git-fs.
-  - Before builds, tests, formatters, or other commands that need the edited
-    files on disk, call gitfs_materialize and check that it succeeded.
-  - After a formatter or another external tool changes owned files on disk,
-    call gitfs_capture before continuing branch-based work. Capture only
-    imports paths already owned by the session; create new source files
-    through write.
+  - Native file tools and shell searches see disk, not the newer live ref.
+    Route source reads and writes through git-fs; use `gitfs_snapshot {}`
+    for isolated native builds, then release its returned ID when clean.
+  - For builds and tests, prefer gitfs_snapshot {} for a clean pinned
+    worktree. Use gitfs_materialize only when native tools specifically need
+    the common worktree, and check its conflict report.
+  - After a formatter or other native tool changes files on disk, use
+    gitfs_capture with the exact intended paths before further edits.
   - Inspect gitfs_ls and gitfs_diff to review the session. Use gitfs_rollback
     to undo a session commit or restore a path when appropriate.
   - If the project's branch moved, use gitfs_catchup and resolve any reported
     conflicts before continuing.
-  - Before ending work, call gitfs_materialize and report any refused paths.
-    Do not force an overwrite merely to make an error disappear.
+  - Before ending work, report the shared live revision and unresolved
+    conflicts. Do not materialize merely because a session is ending.
   - Materialization makes files available on disk; it does not integrate or
     push them. Use integrate and push only within the user's authorized
     scope, following their preview/revision workflow and returned schemas.
 
 Without host hooks, these are agent workflow instructions, not enforcement
 against native tools or shell writes. If the host supports tool routing,
-route repository file operations to git-fs there as well. The host should
-materialize before closing the server on normal session completion and report
-failures. If it cannot do that automatically, the agent must do it explicitly.
-Closing the MCP process alone does not materialize changes.
+route repository file operations to git-fs there as well. Never auto-materialize
+on stop or disconnect: live commits remain readable, and forcing them onto
+the shared worktree recreates contention. Closing MCP does not discard commits.
 
 VERIFY THE INTEGRATION
 

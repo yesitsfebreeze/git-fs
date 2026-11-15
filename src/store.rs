@@ -70,6 +70,7 @@ const MAX_KNOWN_REVISIONS: usize = 64;
 
 const IDENT_NAME: &str = "kern gitfs";
 const IDENT_EMAIL: &str = "gitfs@kern.local";
+const LIVE_REF: &str = "refs/gitfs-live/current";
 
 #[derive(Clone)]
 pub struct Store {
@@ -378,6 +379,317 @@ impl Store {
 		Ok(trimmed_opt(lossy(out)))
 	}
 
+	/// Shared commit tip, automatically rebased onto reviewed HEAD when safe.
+	pub fn live_tip(&self) -> Result<Option<String>> {
+		let live = self.raw_live_tip()?;
+		if let (Some(live), Some(head)) = (&live, self.head()?) {
+			if !self.is_ancestor(&head, live)? {
+				let _repo = self.mutation_lock("repository")?;
+				return self.reconcile_live_locked();
+			}
+		}
+		Ok(live)
+	}
+
+	fn raw_live_tip(&self) -> Result<Option<String>> {
+		let out = run_tolerant(
+			&self.root,
+			self.git_dir.as_deref(),
+			&["rev-parse", "--verify", "--quiet", LIVE_REF],
+		)?;
+		Ok(trimmed_opt(lossy(out)))
+	}
+
+	/// Local writers share a commit chain; if reviewed HEAD advances,
+	/// merge non-overlapping head changes into a two-parent live commit.
+	/// Conflicts are explicit and leave both refs untouched.
+	fn reconcile_live_locked(&self) -> Result<Option<String>> {
+		let Some(live) = self.raw_live_tip()? else {
+			return Ok(None);
+		};
+		let Some(head) = self.head()? else {
+			return Ok(Some(live));
+		};
+		if self.is_ancestor(&head, &live)? {
+			return Ok(Some(live));
+		}
+		let base = self
+			.git_str(&["merge-base", &head, &live])
+			.map_err(|_| {
+				"reviewed HEAD and live history are unrelated; manual reconciliation required"
+					.to_owned()
+			})?
+			.trim()
+			.to_owned();
+		let changed = self.git(&["diff", "--name-status", "--no-renames", "-z", &base, &live])?;
+		let (mut adds, mut removes, mut conflicts) = (Vec::new(), Vec::new(), Vec::new());
+		for (_, rel) in parse_name_status(&changed) {
+			let path = Path::new(&rel);
+			let baseline = self.entry_at(&base, path)?;
+			let mine = self.entry_at(&live, path)?;
+			let current = self.entry_at(&head, path)?;
+			let resolved = if current == baseline {
+				mine.clone()
+			} else if current == mine {
+				current.clone()
+			} else {
+				match self.merge_revision(&base, &head, &rel, mine.as_ref())? {
+					Some(blob) => Some((
+						mine.as_ref().map_or("100644", |(mode, _)| mode).to_owned(),
+						blob,
+					)),
+					None => {
+						conflicts.push(rel);
+						continue;
+					}
+				}
+			};
+			if resolved == current {
+				continue;
+			}
+			match resolved {
+				Some((mode, blob)) => adds.push((mode, blob, path.to_path_buf())),
+				None => removes.push(path.to_path_buf()),
+			}
+		}
+		if !conflicts.is_empty() {
+			return Err(format!(
+				"live revision conflicts with reviewed HEAD on {}; reconcile before editing",
+				conflicts.join(", ")
+			));
+		}
+		let tree = self.apply("__live__", &self.tree_of(&head)?, &adds, &removes)?;
+		let commit = var_str(
+			String::from_utf8(self.git(&[
+				"commit-tree",
+				&tree,
+				"-p",
+				&live,
+				"-p",
+				&head,
+				"-m",
+				"gitfs live: reconcile reviewed HEAD",
+			])?)
+			.map_err(|e| e.to_string())?,
+		)?;
+		if self.head()?.as_deref() != Some(&head) {
+			return Err("HEAD changed during live reconciliation; retry".into());
+		}
+		self.git(&["update-ref", LIVE_REF, &commit, &live])
+			.map_err(|e| format!("live reconcile outcome unknown at {commit}: {e}"))?;
+		Ok(Some(commit))
+	}
+
+	/// A path changed on the shared revision, including a published deletion.
+	pub fn live_change(&self, rel: &Path) -> Result<Option<Option<Vec<u8>>>> {
+		let Some(live) = self.live_tip()? else {
+			return Ok(None);
+		};
+		let current = self.entry_at(&live, rel)?;
+		let trunk = match self.head()? {
+			Some(head) => self.entry_at(&head, rel)?,
+			None => None,
+		};
+		if current == trunk {
+			if current.is_none() && self.explicit_live_deletion(rel)? {
+				return Ok(Some(None));
+			}
+			return Ok(None);
+		}
+		match current {
+			Some((_, blob)) => Ok(Some(Some(self.git(&["cat-file", "blob", &blob])?))),
+			None => Ok(Some(None)),
+		}
+	}
+
+	/// An explicit deletion remains visible even when deleting a newly added
+	/// file makes its tree identical to HEAD. A rollback deletion is not explicit.
+	fn explicit_live_deletion(&self, rel: &Path) -> Result<bool> {
+		if self.live_tip()?.is_none() {
+			return Ok(false);
+		}
+		let value = self.git_str(&[
+			"log",
+			"-1",
+			"--format=%(trailers:key=Gitfs-Deletion,valueonly)",
+			LIVE_REF,
+			"--",
+			&literal(rel),
+		])?;
+		Ok(value.trim() == "true")
+	}
+
+	/// File content on the shared revision, or on HEAD before its first edit.
+	pub fn live_content(&self, rel: &Path) -> Result<Option<Vec<u8>>> {
+		let Some(rev) = self.live_tip()?.or(self.head()?) else {
+			return Ok(None);
+		};
+		match self.entry_at(&rev, rel)? {
+			Some((_, blob)) => self.git(&["cat-file", "blob", &blob]).map(Some),
+			None => Ok(None),
+		}
+	}
+
+	/// The latest published private tip for this session is recorded in the
+	/// shared commit. A private write made since then is not silently replaced
+	/// by an edit of the shared view.
+	pub fn unpublished_session_path(&self, session: &str, rel: &Path) -> Result<bool> {
+		let Some(live) = self.live_tip()? else {
+			return Ok(false);
+		};
+		let history = self.git_str(&["log", "--max-count=256", "--format=%B%x00", &live])?;
+		for message in history.split('\0') {
+			let lines = message.lines().collect::<Vec<_>>();
+			if !lines
+				.iter()
+				.any(|line| *line == format!("Gitfs-Session: {session}"))
+			{
+				continue;
+			}
+			let Some(overlay) = lines
+				.iter()
+				.find_map(|line| line.strip_prefix("Gitfs-Overlay: "))
+			else {
+				return Ok(false);
+			};
+			if overlay.is_empty() || self.tip(session)?.as_deref() == Some(overlay) {
+				return Ok(false);
+			}
+			return self
+				.git(&[
+					"diff",
+					"--name-only",
+					overlay,
+					&self.branch(session),
+					"--",
+					&literal(rel),
+				])
+				.map(|paths| !paths.is_empty());
+		}
+		Ok(false)
+	}
+
+	/// Paths changed by the shared live revision relative to reviewed HEAD.
+	pub fn live_paths(&self) -> Result<Vec<Owned>> {
+		let Some(live) = self.live_tip()? else {
+			return Ok(Vec::new());
+		};
+		let base = match self.head()? {
+			Some(head) => head,
+			None => self.empty_tree()?,
+		};
+		let changed = self.git(&["diff", "--name-status", "--no-renames", "-z", &base, &live])?;
+		let mut paths = parse_name_status(&changed);
+		// A newly added file that was subsequently deleted has no net tree
+		// diff against HEAD. Preserve its explicit tombstone for peer searches.
+		let deleted = self.git(&[
+			"log",
+			"--format=",
+			"--name-only",
+			"--diff-filter=D",
+			"--no-renames",
+			"-z",
+			&live,
+		])?;
+		for name in deleted.split(|byte| *byte == 0) {
+			let name = String::from_utf8_lossy(name);
+			let name = name.trim_start_matches(['\r', '\n']);
+			if name.is_empty() || paths.iter().any(|(_, path)| path == name) {
+				continue;
+			}
+			if self.explicit_live_deletion(Path::new(name))? {
+				paths.push(('D', name.to_owned()));
+			}
+		}
+		paths.sort_by(|a, b| a.1.cmp(&b.1));
+		Ok(paths)
+	}
+
+	/// Create a clean, detached worktree pinned to one exact shared revision.
+	/// Builds in it never touch another agent's checkout or staging area.
+	pub fn create_snapshot(&self, session: &str) -> Result<Value> {
+		if self.git_dir.is_some() {
+			return Err("snapshots require a project Git repository".into());
+		}
+		let _repo = self.mutation_lock("repository")?;
+		let revision = self
+			.reconcile_live_locked()?
+			.or(self.head()?)
+			.ok_or("snapshot requires a published live revision or HEAD")?;
+		if let Some(head) = self.head()? {
+			if !self.is_ancestor(&head, &revision)? {
+				return Err(
+					"live revision diverged from HEAD; reconcile before creating a snapshot".into(),
+				);
+			}
+		}
+		let snapshots = self.dir.join("snapshots");
+		std::fs::create_dir_all(&snapshots).map_err(|e| format!("snapshot directory: {e}"))?;
+		let root = self.root.canonicalize().map_err(|e| e.to_string())?;
+		let snapshots = snapshots.canonicalize().map_err(|e| e.to_string())?;
+		if !snapshots.starts_with(root) {
+			return Err("snapshot directory escapes the repository".into());
+		}
+		let owner = format!("{:x}", Sha256::digest(session.as_bytes()));
+		let prefix = format!("live-{}-", &owner[..12]);
+		let nonce = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_err(|e| e.to_string())?
+			.as_nanos();
+		let id = format!(
+			"{prefix}{}-{:x}-{nonce:x}",
+			&revision[..12],
+			std::process::id()
+		);
+		let path = snapshots.join(&id);
+		if path.exists() {
+			return Err("snapshot ID collision; retry".into());
+		}
+		let git_path = crate::hook::git_command_path(&path)?;
+		self.git(&["worktree", "add", "--detach", "--", &git_path, &revision])?;
+		Ok(json!({"id":id,"path":git_path,"revision":revision,"head":self.head()?}))
+	}
+
+	/// Remove only the caller's generated worktree. Git refuses a dirty
+	/// checkout; never force-remove another agent's files.
+	pub fn release_snapshot(&self, session: &str, id: &str) -> Result<Value> {
+		if self.git_dir.is_some() {
+			return Err("snapshots require a project Git repository".into());
+		}
+		let owner = format!("{:x}", Sha256::digest(session.as_bytes()));
+		let prefix = format!("live-{}-", &owner[..12]);
+		let suffix = id
+			.strip_prefix(&prefix)
+			.ok_or("snapshot ID does not belong to this session")?;
+		if suffix.is_empty()
+			|| !suffix
+				.bytes()
+				.all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+		{
+			return Err("invalid snapshot ID".into());
+		}
+		let _repo = self.mutation_lock("repository")?;
+		let snapshots = self
+			.dir
+			.join("snapshots")
+			.canonicalize()
+			.map_err(|e| format!("snapshot directory unavailable: {e}"))?;
+		let path = snapshots
+			.join(id)
+			.canonicalize()
+			.map_err(|e| format!("snapshot not found: {e}"))?;
+		if path.parent() != Some(snapshots.as_path()) {
+			return Err("snapshot path escapes its directory".into());
+		}
+		self.git(&[
+			"worktree",
+			"remove",
+			"--",
+			&crate::hook::git_command_path(&path)?,
+		])?;
+		Ok(json!({"released":id}))
+	}
+
 	/// Current branch symbolic name, or None on a detached HEAD.
 	pub fn branch_name(&self) -> Result<Option<String>> {
 		let out = run_tolerant(
@@ -471,7 +783,9 @@ impl Store {
 	/// branch never counts as a newer revision. An unknown hand edit on disk is
 	/// not one, and still refuses.
 	pub fn known_revision(&self, exclude: &str, rel: &Path, content: &[u8]) -> Result<bool> {
-		if self.trunk_read(rel)?.as_deref() == Some(content) {
+		if self.trunk_read(rel)?.as_deref() == Some(content)
+			|| self.live_content(rel)?.as_deref() == Some(content)
+		{
 			return Ok(true);
 		}
 		let refs = self.git_str(&["for-each-ref", "--format=%(refname)", "refs/gitfs/"])?;
@@ -1108,6 +1422,138 @@ impl Store {
 			args.push(expect);
 		}
 		self.git(&args).map(|_| ())
+	}
+
+	/// Publish one agent edit to the shared revision without touching HEAD,
+	/// the common index or worktree. The repository lock serializes local
+	/// writers; update-ref compares the old tip for external writers.
+	pub fn publish_live(
+		&self,
+		session: &str,
+		rel: &Path,
+		before: Option<&[u8]>,
+		after: Option<&[u8]>,
+		mode: &str,
+	) -> Result<Option<String>> {
+		self.publish_live_with_intent(session, rel, before, after, mode, after.is_none())
+	}
+
+	/// Rollback deletions restore the baseline; they are not explicit tombstones.
+	pub fn publish_live_rollback(
+		&self,
+		session: &str,
+		rel: &Path,
+		before: Option<&[u8]>,
+		after: Option<&[u8]>,
+		mode: &str,
+	) -> Result<Option<String>> {
+		self.publish_live_with_intent(session, rel, before, after, mode, false)
+	}
+
+	fn publish_live_with_intent(
+		&self,
+		session: &str,
+		rel: &Path,
+		before: Option<&[u8]>,
+		after: Option<&[u8]>,
+		mode: &str,
+		explicit_delete: bool,
+	) -> Result<Option<String>> {
+		let _repository = self.mutation_lock("repository")?;
+		let previous = self.reconcile_live_locked()?;
+		let parent = previous.clone().or(self.head()?);
+		let tree = match parent.as_deref() {
+			Some(parent) => self.tree_of(parent)?,
+			None => self.empty_tree()?,
+		};
+		self.refuse_submodule(&tree, rel)?;
+		let entry = self.entry_at(&tree, rel)?;
+		let current = match &entry {
+			Some((_, blob)) => Some(self.git(&["cat-file", "blob", blob])?),
+			None => None,
+		};
+		let standalone = self.head()?.is_none()
+			&& current.is_none()
+			&& before.is_some()
+			&& self.live_change(rel)?.is_none();
+		let sibling = if previous.is_none() {
+			match before {
+				Some(bytes) => {
+					self.known_revision(session, rel, bytes)? && current == self.trunk_read(rel)?
+				}
+				None => false,
+			}
+		} else {
+			false
+		};
+		let proposed = if current.as_deref() == before || standalone || sibling {
+			after.map(|bytes| bytes.to_vec())
+		} else {
+			match (before, after, current.as_deref()) {
+				(Some(base), Some(ours), Some(theirs)) => crate::merge::merge3(base, ours, theirs)?
+					.ok_or_else(|| {
+						format!(
+							"live conflict in {}; read the latest revision",
+							rel.display()
+						)
+					})
+					.map(Some)?,
+				(None, Some(ours), Some(theirs)) if ours == theirs => Some(ours.to_vec()),
+				(Some(_), None, None) => None,
+				_ => {
+					return Err(format!(
+						"live conflict in {}; read the latest revision",
+						rel.display()
+					))
+				}
+			}
+		};
+		if proposed.as_deref() == current.as_deref() {
+			return Ok(previous);
+		}
+		let updated = match proposed {
+			Some(bytes) => {
+				let blob = self.hash_object(&bytes)?;
+				let mode = entry
+					.as_ref()
+					.map_or(mode, |(existing, _)| existing.as_str());
+				self.apply(
+					"__live__",
+					&tree,
+					&[(mode.into(), blob, rel.to_path_buf())],
+					&[],
+				)?
+			}
+			None => self.apply("__live__", &tree, &[], &[rel.to_path_buf()])?,
+		};
+		let deletion = if explicit_delete {
+			"\nGitfs-Deletion: true"
+		} else {
+			""
+		};
+		let commit = self.commit_tree(
+			&updated,
+			parent.as_deref(),
+			&format!(
+				"gitfs live: {}\n\nGitfs-Session: {session}\nGitfs-Overlay: {}{deletion}",
+				printable(rel),
+				self.tip(session)?.unwrap_or_default()
+			),
+		)?;
+		self.git(&[
+			"update-ref",
+			LIVE_REF,
+			&commit,
+			previous
+				.as_deref()
+				.unwrap_or("0000000000000000000000000000000000000000"),
+		])
+		.map_err(|error| {
+			format!(
+				"live publication outcome unknown for {commit}: {error}; reconcile before retry"
+			)
+		})?;
+		Ok(Some(commit))
 	}
 
 	/// Commit one path into the session branch. Returns the new tip; `None`

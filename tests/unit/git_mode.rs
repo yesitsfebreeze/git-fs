@@ -95,6 +95,413 @@ fn session_commits(root: &Path) -> usize {
 		.unwrap()
 }
 
+async fn tool_as(
+	service: &Arc<Service>,
+	root: &Path,
+	session: &str,
+	name: &'static str,
+	input: Value,
+) -> Value {
+	static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let context = Context {
+		session: session.into(),
+		run: format!("{session}-run"),
+		call: format!(
+			"live-{}",
+			CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+		),
+		cwd: root.to_string_lossy().into_owned(),
+	};
+	service
+		.dispatch(name, json!({"op":"call","context":context,"input":input}))
+		.await
+}
+
+#[tokio::test]
+async fn live_peer_reads_committed_edits_without_materialize() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	let before = git(&root, &["rev-parse", "HEAD"]);
+	let index = std::fs::read(root.join(".git/index")).unwrap();
+	assert_eq!(
+		tool_as(&service, &root, "agent-a", "read", json!({"path":"a.txt"})).await["error"],
+		false
+	);
+	let write = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"two"}),
+	)
+	.await;
+	assert_eq!(write["error"], false, "{write}");
+	let peer = tool_as(&service, &root, "agent-b", "read", json!({"path":"a.txt"})).await;
+	assert_eq!(peer["error"], false, "{peer}");
+	assert_eq!(peer["revision"]["view"], "live");
+	assert!(peer["content"].as_str().unwrap().contains("two"));
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:a.txt"]),
+		"two\n"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"one\n"
+	);
+	assert_eq!(git(&root, &["rev-parse", "HEAD"]), before);
+	assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+	assert_eq!(git(&root, &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn live_nonoverlapping_peer_edits_converge() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	std::fs::write(root.join("a.txt"), "alpha\nbeta\n").unwrap();
+	git(&root, &["add", "a.txt"]);
+	git(
+		&root,
+		&["-c", "commit.gpgsign=false", "commit", "-qm", "two lines"],
+	);
+	for session in ["agent-a", "agent-b"] {
+		assert_eq!(
+			tool_as(&service, &root, session, "read", json!({"path":"a.txt"})).await["error"],
+			false
+		);
+	}
+	let first = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"edit",
+		json!({"path":"a.txt","old":"alpha","new":"ALPHA"}),
+	)
+	.await;
+	assert_eq!(first["error"], false, "{first}");
+	let second = tool_as(
+		&service,
+		&root,
+		"agent-b",
+		"edit",
+		json!({"path":"a.txt","old":"beta","new":"BETA"}),
+	)
+	.await;
+	assert_eq!(second["error"], false, "{second}");
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:a.txt"]),
+		"ALPHA\nBETA\n"
+	);
+	assert_eq!(
+		tool_as(&service, &root, "agent-c", "read", json!({"path":"a.txt"})).await["error"],
+		false
+	);
+}
+
+#[tokio::test]
+async fn live_conflicting_edit_preserves_previous_commit() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	for session in ["agent-a", "agent-b"] {
+		tool_as(&service, &root, session, "read", json!({"path":"a.txt"})).await;
+	}
+	let first = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"two"}),
+	)
+	.await;
+	assert_eq!(first["error"], false, "{first}");
+	let live = git(&root, &["rev-parse", "refs/gitfs-live/current"]);
+	let conflict = tool_as(
+		&service,
+		&root,
+		"agent-b",
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"three"}),
+	)
+	.await;
+	assert_eq!(conflict["error"], true, "{conflict}");
+	assert_eq!(git(&root, &["rev-parse", "refs/gitfs-live/current"]), live);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:a.txt"]),
+		"two\n"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"one\n"
+	);
+}
+
+#[tokio::test]
+async fn live_peer_searches_new_files_before_materialization() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	let absent = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"read",
+		json!({"path":"new.txt"}),
+	)
+	.await;
+	assert_eq!(absent["error"], true, "{absent}");
+	let write = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"write",
+		json!({"path":"new.txt","text":"shared-marker\n"}),
+	)
+	.await;
+	assert_eq!(write["error"], false, "{write}");
+	assert!(!root.join("new.txt").exists());
+	let read = tool_as(
+		&service,
+		&root,
+		"agent-b",
+		"read",
+		json!({"path":"new.txt"}),
+	)
+	.await;
+	assert_eq!(read["error"], false, "{read}");
+	assert_eq!(read["revision"]["view"], "live");
+	assert!(read["content"].as_str().unwrap().contains("shared-marker"));
+	if has_rg() {
+		let glob = tool_as(
+			&service,
+			&root,
+			"agent-b",
+			"glob",
+			json!({"pattern":"*.txt"}),
+		)
+		.await;
+		assert_eq!(
+			glob["content"]["items"],
+			json!(["a.txt", "new.txt"]),
+			"{glob}"
+		);
+		let grep = tool_as(
+			&service,
+			&root,
+			"agent-b",
+			"grep",
+			json!({"pattern":"shared-marker"}),
+		)
+		.await;
+		assert_eq!(
+			grep["content"]["items"],
+			json!([{"path":"new.txt","line":1,"text":"shared-marker"}]),
+			"{grep}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn live_delete_hides_a_recreated_untracked_file_from_peers() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	let absent = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"read",
+		json!({"path":"new.txt"}),
+	)
+	.await;
+	assert_eq!(absent["error"], true, "{absent}");
+	let write = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"write",
+		json!({"path":"new.txt","text":"published\n"}),
+	)
+	.await;
+	assert_eq!(write["error"], false, "{write}");
+	let deleted = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"delete",
+		json!({"path":"new.txt"}),
+	)
+	.await;
+	assert_eq!(deleted["error"], false, "{deleted}");
+	std::fs::write(root.join("new.txt"), "foreign-recreation\n").unwrap();
+	let peer = tool_as(
+		&service,
+		&root,
+		"agent-b",
+		"read",
+		json!({"path":"new.txt"}),
+	)
+	.await;
+	assert_eq!(peer["error"], true, "{peer}");
+	if has_rg() {
+		let glob = tool_as(
+			&service,
+			&root,
+			"agent-b",
+			"glob",
+			json!({"pattern":"*.txt"}),
+		)
+		.await;
+		assert_eq!(glob["content"]["items"], json!(["a.txt"]), "{glob}");
+	}
+}
+
+#[tokio::test]
+async fn live_rollback_is_a_new_shared_commit_peers_can_read() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	tool_as(&service, &root, "s1", "read", json!({"path":"a.txt"})).await;
+	let write = tool_as(
+		&service,
+		&root,
+		"s1",
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"two"}),
+	)
+	.await;
+	assert_eq!(write["error"], false, "{write}");
+	let first = git(&root, &["rev-parse", "refs/gitfs-live/current"]);
+	let tip = git(&root, &["rev-parse", "refs/gitfs/s1"]);
+	let rollback = gitfs(
+		&service,
+		&root,
+		json!({"op":"rollback","commit":tip.trim()}),
+	)
+	.await;
+	assert_eq!(rollback["error"], false, "{rollback}");
+	assert_ne!(git(&root, &["rev-parse", "refs/gitfs-live/current"]), first);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:a.txt"]),
+		"one\n"
+	);
+	let peer = tool_as(&service, &root, "agent-b", "read", json!({"path":"a.txt"})).await;
+	assert_eq!(peer["error"], false, "{peer}");
+	assert!(peer["content"].as_str().unwrap().contains("1:one"));
+}
+
+#[tokio::test]
+async fn live_snapshot_pins_a_clean_worktree_and_refuses_unsafe_release() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	tool(&service, &root, "read", json!({"path":"a.txt"})).await;
+	let change = tool(
+		&service,
+		&root,
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"two"}),
+	)
+	.await;
+	assert_eq!(change["error"], false, "{change}");
+	let revision = git(&root, &["rev-parse", "refs/gitfs-live/current"]);
+	let created = gitfs(&service, &root, json!({"op":"snapshot"})).await;
+	assert_eq!(created["error"], false, "{created}");
+	let snapshot = PathBuf::from(created["body"]["path"].as_str().unwrap());
+	let id = created["body"]["id"].as_str().unwrap();
+	assert_eq!(created["body"]["revision"], revision.trim());
+	assert_eq!(
+		std::fs::read_to_string(snapshot.join("a.txt")).unwrap(),
+		"two\n"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"one\n"
+	);
+	std::fs::write(snapshot.join("a.txt"), "dirty\n").unwrap();
+	let denied = gitfs(&service, &root, json!({"op":"snapshot","id":id})).await;
+	assert_eq!(denied["error"], true, "{denied}");
+	assert!(snapshot.join("a.txt").exists());
+	std::fs::write(snapshot.join("a.txt"), "two\n").unwrap();
+	let foreign = crate::overlay::handle(
+		service.store.clone(),
+		json!({"op":"call","context":{"session":"agent-b","cwd":root},"input":{"op":"snapshot","id":id}}),
+	)
+	.await
+	.unwrap();
+	assert_eq!(foreign["error"], true, "{foreign}");
+	let released = gitfs(&service, &root, json!({"op":"snapshot","id":id})).await;
+	assert_eq!(released["error"], false, "{released}");
+	assert!(!snapshot.exists());
+}
+
+#[tokio::test]
+async fn live_reconciles_reviewed_head_without_losing_peer_edits() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	std::fs::write(root.join("b.txt"), "base\n").unwrap();
+	git(&root, &["add", "b.txt"]);
+	git(
+		&root,
+		&["-c", "commit.gpgsign=false", "commit", "-qm", "second file"],
+	);
+	tool_as(&service, &root, "agent-a", "read", json!({"path":"a.txt"})).await;
+	let edit = tool_as(
+		&service,
+		&root,
+		"agent-a",
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"two"}),
+	)
+	.await;
+	assert_eq!(edit["error"], false, "{edit}");
+	let old_live = git(&root, &["rev-parse", "refs/gitfs-live/current"]);
+	std::fs::write(root.join("b.txt"), "reviewed\n").unwrap();
+	git(&root, &["add", "b.txt"]);
+	git(
+		&root,
+		&[
+			"-c",
+			"commit.gpgsign=false",
+			"commit",
+			"-qm",
+			"reviewed change",
+		],
+	);
+	let b = tool_as(&service, &root, "agent-b", "read", json!({"path":"b.txt"})).await;
+	assert_eq!(b["error"], false, "{b}");
+	assert_eq!(b["content"], "1:reviewed\n");
+	let a = tool_as(&service, &root, "agent-b", "read", json!({"path":"a.txt"})).await;
+	assert_eq!(a["error"], false, "{a}");
+	assert!(a["content"].as_str().unwrap().contains("1:two"));
+	assert_ne!(
+		git(&root, &["rev-parse", "refs/gitfs-live/current"]),
+		old_live
+	);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:b.txt"]),
+		"reviewed\n"
+	);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:a.txt"]),
+		"two\n"
+	);
+}
+
+#[tokio::test]
+async fn live_capture_publishes_native_disk_changes_for_peers() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	std::fs::write(root.join("native.txt"), "captured\n").unwrap();
+	let captured = gitfs(
+		&service,
+		&root,
+		json!({"op":"capture","paths":["native.txt"]}),
+	)
+	.await;
+	assert_eq!(captured["error"], false, "{captured}");
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:native.txt"]),
+		"captured\n"
+	);
+	let peer = tool_as(
+		&service,
+		&root,
+		"agent-b",
+		"read",
+		json!({"path":"native.txt"}),
+	)
+	.await;
+	assert_eq!(peer["error"], false, "{peer}");
+	assert_eq!(peer["revision"]["view"], "live");
+	assert!(peer["content"].as_str().unwrap().contains("captured"));
+}
+
 fn has_rg() -> bool {
 	std::process::Command::new("rg")
 		.arg("--version")
@@ -325,7 +732,7 @@ async fn git_mode_commits_each_change_and_leaves_the_worktree_until_materialize(
 		let grep: Value = grep["content"].clone();
 		assert_eq!(
 			grep["items"],
-			json!([{"path":"a.txt","line":1,"text":"other"},{"path":"src/new.txt","line":1,"text":"fresh three"}])
+			json!([{"path":"a.txt","line":1,"text":"three"},{"path":"src/new.txt","line":1,"text":"fresh three"}])
 		);
 	}
 
@@ -759,7 +1166,7 @@ async fn fresh_session_reads_materialized_prior_session_changes() {
 		.await;
 	assert_eq!(read["error"], false, "{read}");
 	assert_eq!(read["content"], "updated instructions\n");
-	assert_eq!(read["revision"]["view"], "disk");
+	assert_eq!(read["revision"]["view"], "live");
 }
 
 #[tokio::test]

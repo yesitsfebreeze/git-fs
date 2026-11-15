@@ -115,7 +115,7 @@ fn single_calls_and_multiple_reads_edits_and_materializations_share_freshness() 
 	let mut server = Server::new(&root);
 	let tools = server.request("tools/list", json!({}));
 	let tools = tools["tools"].as_array().unwrap();
-	assert_eq!(tools.len(), 17);
+	assert_eq!(tools.len(), 18);
 	assert!(!tools.iter().any(|t| t["name"] == "batch"));
 	for tool in tools {
 		assert!(

@@ -1,5 +1,5 @@
-//! The Git session operations: the session branch behind `tool.write` and `tool.edit`. Every
-//! change there is one commit on `refs/gitfs/<session>`; this tool inspects
+//! The Git operations: each edit has a private session commit and a durable
+//! shared live commit. This tool inspects
 //! that branch (`ls`, `diff`), undoes a commit (`rollback`), copies owned
 //! files into the repository worktree, the one place builds and tests run
 //! (`materialize`), and pulls disk edits made outside the tools back in
@@ -21,12 +21,12 @@ use std::sync::Arc;
 pub(crate) fn describe() -> Value {
 	json!({
 		"name":"gitfs",
-		"description":"The session's Git branch: writes and edits commit to refs/gitfs/<session>, and the worktree stays untouched until materialize copies files in to run them; rollback undoes one commit, or puts one path back to session start; catchup moves the session onto trunk after trunk moved (replays paths trunk did not touch, drops ones trunk already holds, merges non-overlapping edits from two sessions, refuses only overlapping edits by path, empties the session when nothing is left). Ops: ls, diff, rollback, catchup, materialize, capture. Full guidance: `kern help fs`.",
+		"description":"The session's Git branch: writes and edits commit to refs/gitfs/<session>, and the worktree stays untouched until materialize copies files in to run them; rollback undoes one commit, or puts one path back to session start; catchup moves the session onto trunk after trunk moved (replays paths trunk did not touch, drops ones trunk already holds, merges non-overlapping edits from two sessions, refuses only overlapping edits by path, empties the session when nothing is left). Ops: ls, diff, rollback, catchup, materialize, capture, snapshot. Full guidance: `kern help fs`.",
 		"input_schema":{
 			"type":"object",
 			"required":["op"],
 			"properties":{
-				"op":{"type":"string","enum":["ls","diff","rollback","catchup","materialize","capture"]},
+				"op":{"type":"string","enum":["ls","diff","rollback","catchup","materialize","capture","snapshot"]},
 				"path":{"type":"string","minLength":1,"description":"Repo-relative path, no leading / or ..; absent answers the session-wide summary: every owned path with its status"},
 				"session":{"type":"string","minLength":1,"description":"Whose branch to list (ls); your own by default."},
 				"commit":{"type":"string","minLength":1,"description":"A commit of your session to undo (rollback; or give `path` instead to put that path back to its content at session start)."},
@@ -34,7 +34,8 @@ pub(crate) fn describe() -> Value {
 				"force":{"type":"boolean","description":"Overwrite newer on-disk files (materialize)."},
 				"offset":{"type":"integer","minimum":0},
 				"limit":{"type":"integer","minimum":1,"maximum":65536,"description":"Patch bytes per page (diff); below 128 a page still answers 128, so a page always moves past a multibyte character."},
-				"expected_revision":{"type":"string","description":"Required for diff continuation."}
+				"expected_revision":{"type":"string","description":"Required for diff continuation."},
+				"id":{"type":"string","description":"Release this session's previously generated snapshot; omit to create one."}
 			},
 			"additionalProperties":false
 		}
@@ -99,7 +100,7 @@ pub(crate) async fn handle_with_recorder(
 			}
 			let mutation = matches!(
 				args["input"]["op"].as_str(),
-				Some("rollback" | "catchup" | "capture" | "materialize")
+				Some("rollback" | "catchup" | "capture" | "materialize" | "snapshot")
 			);
 			let mut capture = if mutation {
 				Capture::from_context(&args["context"])?
@@ -133,6 +134,26 @@ pub(crate) async fn handle_with_recorder(
 fn dispatch(store: &crate::store::Store, session: &str, input: &Value) -> Result<Value> {
 	dispatch_captured(store, session, input, &mut Capture::default())
 }
+/// Mirror a rollback as another durable shared commit when that session's
+/// previous version is still current. Never undo a newer peer's change.
+fn publish_rollback(
+	store: &crate::store::Store,
+	session: &str,
+	rel: &str,
+	before: Option<&[u8]>,
+) -> Result<()> {
+	let path = Path::new(rel);
+	let after = store.read(session, path)?;
+	let live = store.live_content(path)?;
+	if live.as_deref() == before {
+		let mode = store.mode_for(session, path)?;
+		store.publish_live_rollback(session, path, before, after.as_deref(), &mode)?;
+	} else if live != after {
+		return Err(format!("rollback of {rel} conflicts with a newer live edit; reread before changing shared state"));
+	}
+	Ok(())
+}
+
 pub(crate) fn dispatch_captured(
 	store: &crate::store::Store,
 	session: &str,
@@ -160,16 +181,34 @@ pub(crate) fn dispatch_captured(
 		}
 		Some("rollback") => {
 			if let Some(path) = input["path"].as_str() {
+				let before = store.read(session, Path::new(path))?;
 				store.rollback_path_captured(session, path, capture)?;
+				publish_rollback(store, session, path, before.as_deref())?;
 				return ok(json!({"rolled_back":path,"restored":[path],"tip":store.tip(session)?}));
 			}
 			let commit = input["commit"]
 				.as_str()
 				.ok_or("rollback: commit required")?;
+			let mut before = std::collections::HashMap::new();
+			for (_, path) in store.session_paths(session)? {
+				before.insert(path.clone(), store.read(session, Path::new(&path))?);
+			}
 			let restored = store.rollback_captured(session, commit, capture)?;
+			for path in &restored {
+				publish_rollback(
+					store,
+					session,
+					path,
+					before.get(path).and_then(|bytes| bytes.as_deref()),
+				)?;
+			}
 			ok(json!({"rolled_back":commit,"restored":restored,"tip":store.tip(session)?}))
 		}
 		Some("catchup") => ok(store.catchup_captured(session, capture)?),
+		Some("snapshot") => match input["id"].as_str() {
+			Some(id) => ok(store.release_snapshot(session, id)?),
+			None => ok(store.create_snapshot(session)?),
+		},
 		Some("diff") => inspection::diff(store, session, input),
 		Some("materialize") => {
 			let paths = input["paths"].as_array().map(|a| {
@@ -236,6 +275,11 @@ fn capture_paths(
 		let result = (|| -> Result<bool> {
 			capture_path(store.root(), &rel)?;
 			let path = Path::new(&rel);
+			let before = if store.live_change(path)?.is_some() {
+				store.read(session, path)?.or(store.trunk_read(path)?)
+			} else {
+				store.trunk_read(path)?
+			};
 			let changed = match std::fs::read(store.root().join(&rel)) {
 				Ok(bytes) => {
 					let mode = store.mode_for(session, path)?;
@@ -253,6 +297,11 @@ fn capture_paths(
 				}
 				Err(e) => return Err(format!("read failed: {e}")),
 			};
+			if changed.is_some() {
+				let after = store.read(session, path)?;
+				let mode = store.mode_for(session, path)?;
+				store.publish_live(session, path, before.as_deref(), after.as_deref(), &mode)?;
+			}
 			store.note_materialized(session, &rel)?;
 			Ok(changed.is_some())
 		})();

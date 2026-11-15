@@ -13,7 +13,7 @@ pub fn guide(session: &str, owned: usize, mode: Mode) -> String {
 		.replace("A native Write or Edit", "A native apply_patch")
 		.replace("Bash build or test run", "exec_command build or test run")
 		.replace("Bash stays", "Shell execution stays")
-		+ "\nCodex hooks bind every git-fs MCP call to this session and workspace. Leave _git_fs to the hook. Stop and SessionEnd materialize; native shell writes are advisory, not sandboxed."
+		+ "\nCodex hooks bind every git-fs MCP call to this session and workspace. Leave _git_fs to the hook. Stop and SessionEnd preserve the shared checkout; use gitfs_snapshot to build; native shell writes are advisory, not sandboxed."
 }
 
 pub fn is_own_tool(payload: &Value) -> bool {

@@ -23,6 +23,7 @@ pub(crate) fn validate(tool: &str, input: &Value) -> Result<()> {
 		("gitfs", "ls") => (&[], &["session"]),
 		("gitfs", "rollback") => (&[], &["commit", "path"]),
 		("gitfs", "catchup") => (&[], &[]),
+		("gitfs", "snapshot") => (&[], &["id"]),
 		("integrate", "undo") => (&[], &[]),
 		("gitfs", "materialize") => (&[], &["paths", "force"]),
 		("gitfs", "capture") | ("integrate", "scan") => (&[], &["paths"]),
@@ -94,7 +95,7 @@ pub(crate) fn validate(tool: &str, input: &Value) -> Result<()> {
 			}
 			"path" => valid_path(value.as_str().ok_or("path must be a string")?)?,
 			"message" | "phase" | "expected_revision" | "remote" | "ref" | "commit"
-			| "operation_id" | "session" | "recipient_session"
+			| "operation_id" | "session" | "recipient_session" | "id"
 				if value.is_string() => {}
 			"expected_remote_head" if value.is_null() || value.is_string() => {}
 			"offset" if value.as_u64().is_some() => {}

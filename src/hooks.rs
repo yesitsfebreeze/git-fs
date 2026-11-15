@@ -5,7 +5,7 @@
 //! `Grep`, `Glob` or file-reading `Bash` call gets a note next to its result)
 //! and puts a path the session changed onto disk before a native `Read` sees
 //! it stale; `post-edit` mirrors a native Write or Edit that did run onto the
-//! session branch; `stop` materializes every owned path. A hook never fails
+//! session branch; `stop` leaves the shared checkout alone. A hook never fails
 //! the session: errors go to stderr and the exit code stays 0.
 
 use crate::provenance::Capture;
@@ -59,16 +59,16 @@ pub fn guide(session: &str, owned: usize, mode: Mode) -> String {
 		text.push_str("Mode local: writes land in the worktree directly.\n");
 	} else {
 		text.push_str(
-			"Writes through the git-fs tools stay on the branch until gitfs_materialize.\n",
+			"Every git-fs edit publishes a live Git commit peers can read immediately; disk stays unchanged.\n",
 		);
 	}
 	text.push_str(
 		"Use the git-fs tools (mcp__plugin_git-fs_git-fs__*) for files in this repository, not the native ones:\n\
-		 - read, not Read, cat or sed -n: answers from the branch before the worktree and records what you read, which is what makes your next edit fresh.\n\
+		 - read, not Read, cat or sed -n: answers from the shared live commit before disk and records what you read for safe edits.\n\
 		 - every tool accepts a single argument object or an items array of up to 32 argument objects. Read/search items can run concurrently (1-8); mutation items run in order and stop on error. Inspect every result and skipped item before continuing.\n\
-		 - edit, write and delete (remove a file after reading it), not Edit, Write or a heredoc: one commit each on the branch; refused when the bytes you last read are no longer current, except an edit whose old text is still unique after another agent's committed revision reached the shared worktree. A native Write or Edit inside the repository is blocked by the pre-tool hook with this reminder.\n\
-		 - grep, glob and search, not Grep, Glob, rg or find: see the branch, then the working directory, including uncommitted changes. The native ones see the disk only.\n\
-		 - gitfs_materialize before a Bash build or test run: copies owned paths to the worktree (Stop does it too). gitfs_capture pulls disk edits and deletions of owned paths back in; explicit paths adopt selected disk files and tracked deletions.\n\
+		 - edit, write and delete after reading, not Edit, Write or a heredoc: each change commits on your session and shared live ref; concurrent non-overlap merges, conflicts refuse. Native Write/Edit is blocked by the hook.\n\
+		 - grep, glob and search, not Grep, Glob, rg or find: see shared commits then local disk; native searches are disk-only.\n\
+		 - gitfs_snapshot {} before a build/test: returns a clean pinned checkout without disturbing peers; give its id to release after clean. gitfs_materialize is only for native tools requiring the common disk. Stop does not materialize. gitfs_capture adopts explicit disk changes.\n\
 		 - gitfs_ls and gitfs_diff to review, gitfs_catchup after trunk moved (non-overlapping changes to one file merge), integrate to commit the session onto trunk, push to publish.\n\
 		 - run git status and git diff if useful, but not git add or git commit: the session branch is your record, integrate publishes it, and a plain git command competes for the shared index.\n\
 		 Bash stays for builds, tests and everything that is not reading or writing project files.",
@@ -295,25 +295,9 @@ fn run_inner(action: &str, codex: bool) -> Result<(), String> {
 				Verdict::Note(text) => emit("PreToolUse", json!({"additionalContext": text})),
 			}
 		}
-		"stop" => {
-			if store.tip(&session)?.is_none() {
-				return Ok(());
-			}
-			let result =
-				store.materialize_captured(&session, None, false, &mut Capture::default())?;
-			if !result.applied.is_empty() {
-				note(&format!(
-					"materialized {} path(s) from refs/gitfs/{session}",
-					result.applied.len()
-				));
-			}
-			for (path, why) in &result.conflicts {
-				note(&format!("{path} left on disk as it is: {why}"));
-			}
-			for error in &result.errors {
-				note(error);
-			}
-		}
+		// A finished agent must not overwrite a peer's shared checkout.
+		// Its changes were already committed and published by the file tools.
+		"stop" => {}
 		other => return Err(format!("unknown hook action: {other}")),
 	}
 	Ok(())
@@ -325,23 +309,31 @@ fn mirror(
 	root: &Path,
 	rel: &str,
 ) -> Result<(), String> {
+	let path = Path::new(rel);
+	let before = if store.live_change(path)?.is_some() {
+		store.read(session, path)?.or(store.trunk_read(path)?)
+	} else {
+		store.trunk_read(path)?
+	};
 	let bytes = match std::fs::read(root.join(rel)) {
 		Ok(bytes) => bytes,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 			store.delete_blob_captured(
 				session,
-				Path::new(rel),
+				path,
 				&mut Capture::default(),
 				crate::change_record::Operation::Delete,
 			)?;
+			store.publish_live(session, path, before.as_deref(), None, "100644")?;
 			store.note_materialized(session, rel)?;
 			return Ok(());
 		}
 		Err(e) => return Err(format!("{rel}: native edit capture failed: {e}")),
 	};
 	let file_mode = store.mode_for(session, Path::new(rel))?;
-	if store.read(session, Path::new(rel))?.as_deref() != Some(bytes.as_slice()) {
-		store.write_blob(session, Path::new(rel), &bytes, &file_mode)?;
+	if store.read(session, path)?.as_deref() != Some(bytes.as_slice()) {
+		store.write_blob(session, path, &bytes, &file_mode)?;
+		store.publish_live(session, path, before.as_deref(), Some(&bytes), &file_mode)?;
 		store.note_materialized(session, rel)?;
 	}
 	Ok(())

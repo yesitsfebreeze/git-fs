@@ -9,9 +9,11 @@
   sibling agent's committed revision (on trunk or its session branch) reaches
   the shared worktree after this session's read, `edit` rebases onto it if its
   `old` text is still unique; an unknown hand edit is still refused.
-- **Branch-first reads and search.** `read`, `glob`, `grep` and `search`
-  (typed ripgrep stages with cursors) see the session's changes before the
-  worktree, so an agent searches what it wrote without materializing.
+- **Live shared reads and search.** `read`, `glob`, `grep` and `search`
+  (typed ripgrep stages with cursors) see `refs/gitfs-live/current` before
+  the session branch and worktree. Every tool-mediated successful edit or delete
+  publishes a shared commit without updating `HEAD`, index, or disk. Explicit
+  deletion tombstones hide recreated files until reconciled.
 - **The session branch.** `gitfs_ls`, `gitfs_diff`, `gitfs_rollback` (one
   commit, or one path back to session start), `gitfs_catchup` (rebase onto
   moved trunk after checking which owned paths trunk changed under you;
@@ -21,13 +23,15 @@
   session committed and materialized is merged instead of refused),
   `gitfs_capture` (pull disk changes back in; explicit paths can adopt
   additions, edits and tracked deletions, while omitted paths stay limited to
-  owned paths). Materialization and catchup report the
-  paths they merged under `merged`.
-- **Two sessions, one file.** An append to a file both sessions extend (a
-  ledger, a log, a table) is a union: `edit` rebases onto the sibling's
-  committed revision when its anchor is still unique, `catchup` and
-  `materialize` merge the two files line-wise, and two appends at the same
-  anchor both land. Only changes to the same lines refuse, naming the path.
+  owned paths), and `gitfs_snapshot` (create a detached checkout pinned to
+  the shared commit, or release it with its returned `id`). Materialization
+  and catchup report the paths they merged under `merged`.
+- **Parallel edits.** Each successful change advances one shared ref using a
+  compare-and-swap update. Disjoint file edits converge; non-overlapping text
+  changes merge three-way; overlapping changes refuse with the path named.
+  A stale session branch cannot silently overwrite its last published state.
+  When reviewed `HEAD` advances, non-conflicting changes are merged into live
+  as a two-parent commit; a real conflict requires manual reconciliation.
 - **Publication.** `integrate` previews and commits the session onto trunk
   with a secret scan, `push` runs a guarded push with `operation_id`
   idempotency and a private pre-push hook that also runs the repository's
@@ -43,17 +47,33 @@
   result naming the git-fs tool that sees the branch. A `Read` of a path the
   branch changed gets that path onto disk first. A native `Write` or `Edit`
   that did run (mode `local`, or outside the repository) is mirrored onto the
-  branch (`post-edit`); `Stop` materializes every owned path and reports what
-  it left alone. Images, PDFs and notebooks pass to native `Read` untouched.
+  branch (`post-edit`); `Stop` leaves the shared checkout unchanged. Use `gitfs_snapshot`
+  for builds or explicit `gitfs_materialize` when needed. Images, PDFs and notebooks pass to native `Read` untouched.
 
-Session commits live under `refs/gitfs/*`. `.git-fs/` stores session indexes, read
-records and the materialize ledger; git-fs adds it to `.git/info/exclude`.
+Session commits live under `refs/gitfs/*`; the latest locally shared source is
+`refs/gitfs-live/current`. `.git-fs/` holds session indexes, read records,
+materialization metadata and generated snapshot checkouts, excluded from Git.
+The live ref is local: remote publication still requires reviewed integration
+and the guarded push path.
 
 A project without `.git` needs none: the first write makes `.git-fs/` a git
 directory of its own that holds only the session branches and their objects.
 Every path a session writes counts as added, since there is no trunk to
 compare with; `integrate`, `gitfs_catchup` and `push` refuse for the same
 reason, and `gitfs_materialize` is how changes reach the worktree.
+
+## Isolated build and test snapshots
+
+Call `gitfs_snapshot {}` to create a clean detached worktree at the exact live
+commit. Its result includes `id`, absolute `path`, `revision` and `head`.
+Run the build in that path instead of materializing another agent's work into
+the shared checkout. The snapshot stays pinned if new edits arrive.
+
+Call `gitfs_snapshot {"id":"<returned id>"}` after testing. Only the same
+session can release its snapshot; Git refuses removal while it has tracked or
+untracked changes. Generated ignored build outputs may be removed with the
+checkout. Snapshots require a normal project Git repository (not a standalone
+`.git-fs` object store).
 
 ## Codex integration
 
@@ -67,8 +87,8 @@ The Codex adapter provides:
   and local mode pass through. Shell reads/writes receive the same advisory
   guidance as Claude; builds, tests and Git commands remain available.
 - `PostToolUse` capture of files from native patches that ran in local mode.
-- `Stop` and `SessionEnd` materialization of the session's owned paths, with
-  conflict protection.
+- `Stop` and `SessionEnd` keep the shared checkout untouched; use a pinned
+  `gitfs_snapshot` checkout or explicit materialization for native execution.
 - Per-call MCP routing: the hook supplies the originating session and workspace,
   replacing any model-supplied routing. Concurrent Codex sessions do not share
   `CURRENT`, and the MCP process's launch directory does not select the workspace.
@@ -200,7 +220,7 @@ call's edit fresh; the MCP server keeps that state for the whole session.
 ## Publication completion and handoff
 
 Saving a session branch, materializing files, integrating a trunk commit and
-pushing a remote ref are separate outcomes. A stop only materializes. Integration
+pushing a remote ref are separate outcomes. Stop leaves disk untouched. Integration
 returns `push: false`. Finish a requested delivery by pushing the exact integrated
 commit and observing a confirmed remote receipt.
 

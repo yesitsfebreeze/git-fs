@@ -1,7 +1,7 @@
 ---
 {
   "name": "git-fs",
-  "description": "Git session branches for AI agents: guarded reads, writes, edits and search on refs/gitfs/<session>, materialized to the worktree on your terms.",
+  "description": "Shared Git commits for collaborating agents: every edit publishes to refs/gitfs-live/current, reads/search see peer changes, snapshots isolate builds, and guarded review controls remote push.",
   "events": {
     "tool.gitfs.ls": {
       "description": "List a session branch, its owned paths and commits.",
@@ -250,6 +250,22 @@
         }
       }
     },
+    "tool.gitfs.snapshot": {
+      "description": "Create an isolated worktree pinned to the current shared live commit for builds and tests; give its returned id to release that session's clean snapshot.",
+      "schema": {
+        "type": "object",
+        "required": ["op"],
+        "properties": {
+          "op": {"type": "string", "enum": ["describe", "call", "cancel"]},
+          "input": {
+            "type": "object", "required": [],
+            "properties": {"id": {"type": "string", "minLength": 1, "description": "Release the exact snapshot created by this session; omit to create."}},
+            "additionalProperties": false
+          },
+          "context": {"type": "object"}
+        }
+      }
+    },
     "tool.integrate.integrate": {
       "description": "Preview or commit the guarded session integration workflow.",
       "schema": {
@@ -430,7 +446,7 @@
     "mode": {
       "type": "string",
       "default": "git",
-      "doc": "Where write, edit and delete publish. git: one commit per change on refs/gitfs/<session>, the worktree untouched until gitfs_materialize; reads and searches prefer the session's changes, then the working directory, including uncommitted edits and deletions. Read responses identify their revision and disk divergence. local: write the worktree directly. A workspace outside a Git repository keeps its session branches in the store directory, which is then a Git directory of its own."
+      "doc": "Where write, edit and delete publish. git: each tool change commits to its session branch and the local shared refs/gitfs-live/current; reads/search prefer the live commit, then session and disk; the worktree is unchanged until materialize. gitfs_snapshot makes isolated build/test worktrees pinned to live. Local mode writes directly to disk. Outside Git a standalone .git-fs store holds the branch objects."
     },
     "max_read_bytes": {
       "type": "integer",
