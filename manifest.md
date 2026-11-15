@@ -4,7 +4,7 @@
   "description": "Shared Git commits for collaborating agents: every edit publishes to refs/gitfs-live/current, reads/search see peer changes, snapshots isolate builds, and guarded review controls remote push.",
   "events": {
     "tool.gitfs.ls": {
-      "description": "List a session branch, its owned paths and commits.",
+      "description": "List a session branch, its owned paths and commits, plus read-only runtime identity and tool-schema fingerprint.",
       "schema": {
         "type": "object",
         "required": [

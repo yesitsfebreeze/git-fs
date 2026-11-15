@@ -217,6 +217,35 @@ git-fs tools
 Each `call` is its own process, so a read in one call does not make the next
 call's edit fresh; the MCP server keeps that state for the whole session.
 
+### Runtime identity and protocol negotiation
+
+MCP `initialize` negotiates the implemented revision `2025-06-18` (even when a
+client offers an unsupported revision), and rejects missing, blank or non-string
+`protocolVersion` with JSON-RPC `-32602`. The standard result `_meta` contains
+`gitfs/runtimeIdentity`; `git-fs call gitfs_ls` exposes the same `runtime`
+object inside its existing session summary. Neither inspection path creates a
+store or changes Git references.
+
+Identity schema version 1 reports the canonical workspace root; existing store
+root (null until created); `git`, `standalone` or `uninitialized` repository
+mode; configured `git`/`local` operation mode; session ID and resolution source;
+reviewed HEAD, session overlay and shared-live revision; binary package version,
+optional stamped build revision/time; supported MCP revisions; and a `sha256:`
+fingerprint of the advertised tool names and input schemas, with a
+`tool_schema_profile` naming the advertised schema variant. The `unknowns`
+array names unavailable fields: a Git checkout HEAD is not proof of the
+installed binary's build revision. The Codex MCP profile uses its own schema
+fingerprint because its tool input schemas include routing context. Before the
+first Codex `tools/call` supplies trusted hook routing, its `initialize` reports
+`binding_state: unbound`, unknown repository mode, and null workspace, store,
+session ID and revisions; it does **not** guess from the MCP process cwd. A
+normal stdio `initialize` and `ls` report `binding_state: bound`. An `ls`
+result records session source as `invocation_context`, since the call may have
+explicit host routing independent of the MCP process session. When `ls` asks
+for a peer branch, its top-level `session` names that inspected branch, while
+`runtime.session.id` remains the actual caller. Its fingerprint is for the
+standard tool schema; Codex `initialize` fingerprints the Codex schema variant.
+
 ## Publication completion and handoff
 
 Saving a session branch, materializing files, integrating a trunk commit and
@@ -349,6 +378,7 @@ reviewer's snapshot and response validation checks.
 | --- | --- |
 | `src/main.rs` | `mcp`, `hook <session-start|pre-tool|post-edit|stop>`, `call <tool> [json]`, `tools`; answers as the pre-push hook when git runs it under that name |
 | `src/mcp.rs` | stdio JSON-RPC server, requests in arrival order |
+| `src/runtime_identity.rs` | read-only workspace/build/session identity and deterministic MCP tool-schema fingerprint |
 | `src/batch.rs` | shared per-tool items handling, bounded parallel reads, ordered mutations and per-item results |
 | `src/hooks.rs` | shared session-start (guide), pre-tool (redirect, stale-read materialize), post-edit, stop |
 | `src/codex.rs` | Codex patch targets, host guidance and per-call MCP session/workspace routing |

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const PROTOCOL: &str = "2025-06-18";
+pub(crate) const PROTOCOL: &str = "2025-06-18";
 
 pub fn runtime() -> tokio::runtime::Runtime {
 	tokio::runtime::Builder::new_multi_thread()
@@ -32,27 +32,31 @@ pub fn workspace() -> Result<std::path::PathBuf, String> {
 /// `CURRENT` remains the fallback for a host whose hook and server do not
 /// share an ancestor (set `GIT_FS_SESSION` there to keep sessions apart).
 pub fn session() -> Result<String, String> {
+	resolved_session().map(|(session, _)| session)
+}
+
+pub(crate) fn resolved_session() -> Result<(String, &'static str), String> {
 	if let Ok(session) = std::env::var("GIT_FS_SESSION") {
 		if !session.trim().is_empty() {
-			return Ok(session);
+			return Ok((session, "environment"));
 		}
 	}
 	let store = crate::store_config()?;
 	// No repository and no store yet is not an error: the first write makes one.
-	let Ok(found) = store.at_readonly(&workspace()?) else {
-		return Ok("main".into());
+	let Some(found) = crate::runtime_identity::read_existing_store(&store, &workspace()?)? else {
+		return Ok(("main".into(), "fallback"));
 	};
 	let dir = found.root().join(store.directory());
 	if let Some(session) = crate::session_pin::resolve(&dir) {
-		return Ok(session);
+		return Ok((session, "session_pin"));
 	}
 	if let Ok(current) = std::fs::read_to_string(dir.join("CURRENT")) {
 		let current = current.trim();
 		if !current.is_empty() {
-			return Ok(current.to_owned());
+			return Ok((current.to_owned(), "current_file"));
 		}
 	}
-	Ok("main".into())
+	Ok(("main".into(), "fallback"))
 }
 
 pub fn context(run: &str, call: u64) -> Result<Context, String> {
@@ -67,7 +71,7 @@ pub fn context(run: &str, call: u64) -> Result<Context, String> {
 	Ok(context)
 }
 
-fn tools(codex: bool) -> Vec<Value> {
+pub(crate) fn tools(codex: bool) -> Vec<Value> {
 	crate::TOOLS
 		.iter()
 		.filter_map(|tool| crate::describe(tool).ok())
@@ -108,11 +112,31 @@ async fn dispatch(message: Value, calls: &AtomicU64, codex: bool) -> Option<Valu
 		Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": text}}))
 	};
 	match method.as_str() {
-		"initialize" => reply(json!({
-			"protocolVersion": params["protocolVersion"].as_str().unwrap_or(PROTOCOL),
-			"capabilities": {"tools": {}},
-			"serverInfo": {"name": "git-fs", "version": env!("CARGO_PKG_VERSION")},
-		})),
+		"initialize" => {
+			if !params.is_object()
+				|| params["protocolVersion"]
+					.as_str()
+					.is_none_or(|revision| revision.trim().is_empty())
+				|| !params["capabilities"].is_object()
+				|| params["clientInfo"]["name"]
+					.as_str()
+					.is_none_or(|name| name.trim().is_empty())
+				|| params["clientInfo"]["version"]
+					.as_str()
+					.is_none_or(|version| version.trim().is_empty())
+			{
+				return fail(-32602, "initialize requires protocolVersion, capabilities, and clientInfo name/version".into());
+			}
+			match crate::runtime_identity::inspect(codex) {
+				Ok(identity) => reply(json!({
+					"protocolVersion": PROTOCOL,
+					"capabilities": {"tools": {}},
+					"serverInfo": {"name": "git-fs", "version": env!("CARGO_PKG_VERSION")},
+					"_meta": {"gitfs/runtimeIdentity": identity},
+				})),
+				Err(error) => fail(-32603, error),
+			}
+		}
 		"ping" => reply(json!({})),
 		"tools/list" => reply(json!({"tools": tools(codex)})),
 		"tools/call" => {

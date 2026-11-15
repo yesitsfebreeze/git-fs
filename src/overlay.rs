@@ -162,21 +162,23 @@ pub(crate) fn dispatch_captured(
 ) -> Result<Value> {
 	match input["op"].as_str() {
 		Some("ls") => {
-			let session = match input["session"].as_str() {
+			let inspected_session = match input["session"].as_str() {
 				Some(other) if !crate::provenance::valid_session(other) => {
 					return err(format!("ls: invalid session {other}"))
 				}
 				Some(other) => other,
 				None => session,
 			};
-			let tip = store.tip(session)?;
-			let owned = store.owned_paths(session)?;
+			let tip = store.tip(inspected_session)?;
+			let owned = store.owned_paths(inspected_session)?;
+			let runtime = crate::runtime_identity::for_store(store, session, "invocation_context");
 			ok(json!({
-				"session":session,
-				"branch":store.branch(session),
+				"session":inspected_session,
+				"runtime":runtime,
+				"branch":store.branch(inspected_session),
 				"tip":tip,
 				"owned":owned.iter().map(|(s,p)| json!({"status":s.to_string(),"path":p})).collect::<Vec<_>>(),
-				"commits":store.session_commits(session, 50)?,
+				"commits":store.session_commits(inspected_session, 50)?,
 			}))
 		}
 		Some("rollback") => {

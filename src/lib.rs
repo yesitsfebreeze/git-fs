@@ -23,6 +23,7 @@ pub mod overlay;
 mod provenance;
 mod push;
 pub mod review;
+mod runtime_identity;
 mod search;
 mod secrets;
 pub mod service;
@@ -71,6 +72,10 @@ static FS: OnceLock<Fs> = OnceLock::new();
 
 fn fs() -> Result<&'static Fs> {
 	FS.get().ok_or_else(|| "git-fs not configured".to_owned())
+}
+
+pub(crate) fn configured_mode() -> Result<service::Mode> {
+	Ok(fs()?.service.config.mode)
 }
 
 /// The executable a push links as the repository's private pre-push hook:
