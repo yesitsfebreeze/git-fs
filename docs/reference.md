@@ -31,7 +31,10 @@
   changes merge three-way; overlapping changes refuse with the path named.
   A stale session branch cannot silently overwrite its last published state.
   When reviewed `HEAD` advances, non-conflicting changes are merged into live
-  as a two-parent commit; a real conflict requires manual reconciliation.
+  as a two-parent commit. On a path that cannot merge, reviewed `HEAD` wins:
+  a live version trunk already committed is superseded silently; any other is
+  named in the reconcile commit message and stays in its first parent. A
+  conflict never blocks edits to other paths.
 - **Publication.** `integrate` previews and commits the session onto trunk
   with a secret scan, `push` runs a guarded push with `operation_id`
   idempotency and a private pre-push hook that also runs the repository's

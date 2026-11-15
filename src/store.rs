@@ -402,7 +402,11 @@ impl Store {
 
 	/// Local writers share a commit chain; if reviewed HEAD advances,
 	/// merge non-overlapping head changes into a two-parent live commit.
-	/// Conflicts are explicit and leave both refs untouched.
+	/// Reviewed HEAD wins a path whose live edit cannot merge: a live version
+	/// trunk already committed is simply superseded, and any other one stays in
+	/// the reconcile commit's first parent, which the commit message names.
+	/// A conflict therefore never blocks edits to unrelated paths, and the
+	/// session branches that made the live edits still hold them.
 	fn reconcile_live_locked(&self) -> Result<Option<String>> {
 		let Some(live) = self.raw_live_tip()? else {
 			return Ok(None);
@@ -439,8 +443,10 @@ impl Store {
 						blob,
 					)),
 					None => {
-						conflicts.push(rel);
-						continue;
+						if !self.committed_since(&base, &head, &rel, mine.as_ref())? {
+							conflicts.push(rel);
+						}
+						continue; // reviewed HEAD's version stays
 					}
 				}
 			};
@@ -452,10 +458,11 @@ impl Store {
 				None => removes.push(path.to_path_buf()),
 			}
 		}
+		let mut message = "gitfs live: reconcile reviewed HEAD".to_owned();
 		if !conflicts.is_empty() {
-			return Err(format!(
-				"live revision conflicts with reviewed HEAD on {}; reconcile before editing",
-				conflicts.join(", ")
+			message.push_str(&format!(
+				"\n\nReviewed HEAD kept on conflicting paths; their live versions stay in first parent {live}:\n{}",
+				conflicts.join("\n")
 			));
 		}
 		let tree = self.apply("__live__", &self.tree_of(&head)?, &adds, &removes)?;
@@ -468,7 +475,7 @@ impl Store {
 				"-p",
 				&head,
 				"-m",
-				"gitfs live: reconcile reviewed HEAD",
+				&message,
 			])?)
 			.map_err(|e| e.to_string())?,
 		)?;
@@ -478,6 +485,30 @@ impl Store {
 		self.git(&["update-ref", LIVE_REF, &commit, &live])
 			.map_err(|e| format!("live reconcile outcome unknown at {commit}: {e}"))?;
 		Ok(Some(commit))
+	}
+
+	/// Whether some commit in `base..head` held `entry` at `rel`: trunk already
+	/// took that live version and moved on, so it is superseded, not a conflict.
+	fn committed_since(
+		&self,
+		base: &str,
+		head: &str,
+		rel: &str,
+		entry: Option<&(String, String)>,
+	) -> Result<bool> {
+		let Some((_, blob)) = entry else {
+			return Ok(false); // a live deletion is never superseded by a trunk edit
+		};
+		let found = self.git_str(&[
+			"log",
+			"-1",
+			"--format=%H",
+			&format!("--find-object={blob}"),
+			&format!("{base}..{head}"),
+			"--",
+			&literal(Path::new(rel)),
+		])?;
+		Ok(!found.trim().is_empty())
 	}
 
 	/// A path changed on the shared revision, including a published deletion.

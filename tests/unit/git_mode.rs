@@ -474,6 +474,66 @@ async fn live_reconciles_reviewed_head_without_losing_peer_edits() {
 	);
 }
 
+/// Publishes a.txt "two" live, then commits each of `trunk` to a.txt on HEAD.
+async fn live_edit_then_trunk(root: &Path, service: &Arc<Service>, trunk: &[&str]) -> String {
+	tool_as(service, root, "agent-a", "read", json!({"path":"a.txt"})).await;
+	let edit = tool_as(
+		service,
+		root,
+		"agent-a",
+		"edit",
+		json!({"path":"a.txt","old":"one","new":"two"}),
+	)
+	.await;
+	assert_eq!(edit["error"], false, "{edit}");
+	let old_live = git(root, &["rev-parse", "refs/gitfs-live/current"])
+		.trim()
+		.to_owned();
+	for text in trunk {
+		std::fs::write(root.join("a.txt"), text).unwrap();
+		git(root, &["add", "a.txt"]);
+		git(root, &["-c", "commit.gpgsign=false", "commit", "-qm", "trunk"]);
+	}
+	old_live
+}
+
+#[tokio::test]
+async fn live_reconcile_takes_trunk_when_it_already_committed_the_live_version() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	live_edit_then_trunk(&root, &service, &["two\n", "three\n"]).await;
+	let read = tool_as(&service, &root, "agent-b", "read", json!({"path":"a.txt"})).await;
+	assert_eq!(read["error"], false, "{read}");
+	assert_eq!(read["content"], "1:three\n");
+	let log = git(&root, &["log", "--format=%B", "refs/gitfs-live/current"]);
+	assert!(!log.contains("conflicting"), "{log}");
+}
+
+#[tokio::test]
+async fn live_conflict_keeps_trunk_and_never_blocks_other_paths() {
+	let (_dir, root, service, _) = fixture(Mode::Git, true);
+	let old_live = live_edit_then_trunk(&root, &service, &["three\n"]).await;
+	let other = tool_as(
+		&service,
+		&root,
+		"agent-b",
+		"write",
+		json!({"path":"fresh.txt","text":"fresh\n"}),
+	)
+	.await;
+	assert_eq!(other["error"], false, "{other}");
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:a.txt"]),
+		"three\n"
+	);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:fresh.txt"]),
+		"fresh\n"
+	);
+	assert_eq!(git(&root, &["show", &format!("{old_live}:a.txt")]), "two\n");
+	let log = git(&root, &["log", "--format=%B", "refs/gitfs-live/current"]);
+	assert!(log.contains(&old_live) && log.contains("a.txt"), "{log}");
+}
+
 #[tokio::test]
 async fn live_capture_publishes_native_disk_changes_for_peers() {
 	let (_dir, root, service, _) = fixture(Mode::Git, true);
