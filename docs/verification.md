@@ -50,3 +50,50 @@ cargo fmt --all -- --check
 cargo test --locked --test verification_snapshot
 cargo test --locked
 ```
+
+## Candidate-bound command verification (GFS-04)
+
+Git-FS consumes receipts from a separately configured, host-owned check runner;
+it does **not** schedule checks, run an agent, or accept approval JSON in an MCP
+tool argument. Configure `gitfs.verificationPolicy` in repository-local Git
+config as a versioned JSON policy such as:
+
+```json
+{"schema":"gitfs-verification-policy/v1","runner_id":"overwatch-runner","receipt_dir":"D:/trusted-gitfs-receipts","checks":[{"id":"unit","definition":"cargo test --locked","required":true}],"environment_allowlist":[],"reuse":"exact-candidate"}
+```
+
+The absolute receipt directory must exist **outside the repository** and must
+be writable only by the trusted runner/store. The runner should create a fresh
+`gitfs_snapshot {"kind":"candidate"}` with the exact source object from the
+current integration preview, run the declared checks inside that detached
+checkout, record actual stdout/stderr, and place mutable build outputs outside
+the candidate checkout. Each run uses distinct `run_id`/revision-keyed artifact
+filenames to prevent one parallel session from overwriting another's logs.
+
+The runner deposits `<review_revision>.json` in the configured receipt store,
+with schema `gitfs-verification-receipt/v1`, canonical `preview` and matching
+`source`, `session`, `run_id`, runner ID/revision, `review_revision`, policy and
+check-definition SHA-256 digests, platform, toolchain, dependency versions or
+digests, environment allowlist, limitations, and one record per declared check.
+Each check records its ID, SHA-256 of its exact configured definition, status
+`passed`, `input_integrity: unchanged`, SHA-256 and absolute trusted-store
+paths of stdout/stderr, plus explicit `output_digests`. Files must remain
+bounded regular files in that directory and unchanged when later verified.
+The full canonical preview must hash to the review revision, including subject,
+author, source repository/branch/HEAD/index/overlay/tree and policy fingerprint.
+
+A configured policy fails closed on missing, incomplete, failed, cancelled,
+timed-out, stale, cross-run or modified evidence. All configured checks are
+currently required; `required: false` is rejected rather than silently
+granting optional-check semantics. Publication independently revalidates the
+receipt before the commit transaction and in both Git-FS push range checks and
+`gitfs review-check`, even when no command-review policy is configured.
+Existing secret checks, model gate and external command-review continue to run.
+
+**Trust boundary:** repository-local configuration and files are not
+cryptographic attestation. Same-UID or filesystem writers that can modify the
+trusted receipt directory or Git config can forge evidence; control these with
+host ACLs and isolated runner identities. A candidate checkout is not an
+execution sandbox. The current `check_range` API receives Git old/new OIDs but
+not the destination ref; the checked preview records the source branch, while
+destination-ref enforcement remains the native push adapter's responsibility.

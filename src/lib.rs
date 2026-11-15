@@ -30,6 +30,7 @@ pub mod service;
 mod session_pin;
 pub mod store;
 mod tool_result;
+pub mod verification;
 
 pub use service::document;
 

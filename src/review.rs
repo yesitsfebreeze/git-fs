@@ -479,10 +479,10 @@ pub(crate) async fn run(
 /// Verify the exact integrated commit against current repository policy. No
 /// policy preserves the existing behavior. This does not attest test execution.
 pub fn check_commit(root: &Path, commit: &str) -> Result<()> {
-	let Some(configured) = policy(root)? else {
-		return Ok(());
-	};
-	check_commit_with_policy(root, commit, &configured)
+	if let Some(configured) = policy(root)? {
+		check_commit_with_policy(root, commit, &configured)?;
+	}
+	crate::verification::check_commit(root, commit)
 }
 
 fn check_commit_with_policy(root: &Path, commit: &str, configured: &Policy) -> Result<()> {
@@ -554,7 +554,9 @@ fn check_commit_with_policy(root: &Path, commit: &str, configured: &Policy) -> R
 
 /// Every newly published commit must carry its own current review evidence.
 pub fn check_range(root: &Path, old: &str, new: &str) -> Result<()> {
-	let Some(configured) = policy(root)? else {
+	let configured = policy(root)?;
+	let verification_policy = crate::verification::policy_fingerprint(root)?;
+	if configured.is_none() && verification_policy.is_none() {
 		return Ok(());
 	};
 	let oid = |value: &str| {
@@ -573,9 +575,14 @@ pub fn check_range(root: &Path, old: &str, new: &str) -> Result<()> {
 		return Err("review push exceeds 256 commits; publish a smaller range".into());
 	}
 	for commit in commits.lines() {
-		check_commit_with_policy(root, commit, &configured)?;
+		if let Some(policy) = &configured {
+			check_commit_with_policy(root, commit, policy)?;
+		}
+		crate::verification::check_commit(root, commit)?;
 	}
-	if policy(root)?.as_ref() != Some(&configured) {
+	if policy(root)? != configured
+		|| crate::verification::policy_fingerprint(root)? != verification_policy
+	{
 		return Err("review policy changed while checking publication".into());
 	}
 	Ok(())

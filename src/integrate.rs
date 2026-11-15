@@ -426,9 +426,13 @@ async fn integrate(
 	}
 	let force = input["force_secrets"].as_bool().unwrap_or(false) || cfg.force_secrets;
 	let command_review = crate::review::policy(store.root())?;
+	let verification_policy = crate::verification::policy_fingerprint(store.root())?;
 	let mut tree = preview_tree(cfg, &review, session, &subject, force)?;
 	if let Some(policy) = &command_review {
 		tree["command_review"] = serde_json::to_value(policy).map_err(|e| e.to_string())?;
+	}
+	if let Some(fingerprint) = &verification_policy {
+		tree["verification_policy"] = fingerprint.clone();
 	}
 	let revision = format!(
 		"{:x}",
@@ -474,7 +478,14 @@ async fn integrate(
 		)
 		.await?;
 	}
+	crate::verification::validate_candidate(
+		store.root(),
+		session,
+		&serde_json::to_value(&review).map_err(|e| e.to_string())?,
+		&revision,
+	)?;
 	let store = store.clone();
+	let verification_revision = revision.clone();
 	let result_session = session.to_owned();
 	let session = session.to_owned();
 	let name = cfg.author_name.clone();
@@ -488,6 +499,15 @@ async fn integrate(
 		if crate::review::policy(store.root())? != command_review {
 			return Err("review policy changed before publication; preview again".into());
 		}
+		if crate::verification::policy_fingerprint(store.root())? != verification_policy {
+			return Err("verification policy changed before publication; preview again".into());
+		}
+		crate::verification::validate_candidate(
+			store.root(),
+			&session,
+			&serde_json::to_value(&review).map_err(|e| e.to_string())?,
+			&verification_revision,
+		)?;
 		let commit = store.commit_reviewed(&session, &review, &message, &name, &email, &cancel)?;
 		// The commit is on the ref; a sync that fails leaves the paths in `kept`.
 		let worktree = store
