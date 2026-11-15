@@ -19,4 +19,6 @@
 /CLAUDE.local.md
 /hooks/hooks.json
 
-.overwatch/
+.overwatch/*
+!.overwatch/vault/
+.overwatch/vault/.obsidian/

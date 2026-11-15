@@ -1,0 +1,254 @@
+{
+  "source": {
+    "version": 1,
+    "algorithm": "sha256",
+    "excluded": [
+      "00 Meta/Plan Tasks.md"
+    ],
+    "files": [
+      {
+        "path": "00 Meta/Dashboard.md",
+        "sha256": "f650be1f3850f9c00c0fddb575cd40e28be5a8f784b14b5bb15ee544ce6b347a"
+      },
+      {
+        "path": "00 Meta/Git-FS Improvement Research 2026-11-14.md",
+        "sha256": "1adce219d19cf99e00081154ac74f1e9624af5c8feb77b2bdd4775ceaa9d75cf"
+      },
+      {
+        "path": "00 Meta/PRD Template.md",
+        "sha256": "951031cdaf18363a28022f5fc21ef4188e2db183364751226d450b2a2cc05b3b"
+      },
+      {
+        "path": "00 Meta/PRDs.md",
+        "sha256": "a8a7dc6f6c3eef1dc26bf0fedc6f36ecec4055a2cf257f7f9df01c00c8e95896"
+      },
+      {
+        "path": "00 Meta/Plan.md",
+        "sha256": "dceb423861726edb7ecb6c7b0a1284d59d8c2320194d4cd54d13cb87589cd182"
+      },
+      {
+        "path": "00 Meta/Spec Template.md",
+        "sha256": "4a4f2450c643b361644c866b4a1800841389e36324ce742316fd45cfb9ca2fda"
+      },
+      {
+        "path": "01 Specs/GFS Live Shared Commit Acceptance.md",
+        "sha256": "9158f94d0808f3ba1ee60b136b24d165b83fa3a5eda4aa3a33eb0751aa9d1342"
+      },
+      {
+        "path": "01 Specs/GFS-01 Runtime Identity and Protocol Negotiation.md",
+        "sha256": "fda5e86d0c43e8b245a0026a15a15dbe06652a9c3d137466df270c2623409083"
+      },
+      {
+        "path": "01 Specs/GFS-02 Stable Session and Workspace Binding.md",
+        "sha256": "e615f70b927bca8b6e78221701104e8df57619c4c655dfeb5ccfd3550de4f318"
+      },
+      {
+        "path": "01 Specs/GFS-03 Exact Integration Candidate Snapshots.md",
+        "sha256": "43e1baa903e652202ed9cf1677097b6b3a809504008fe2bbe840abe624d80a97"
+      },
+      {
+        "path": "01 Specs/GFS-04 Verification Receipts Bound to the Candidate.md",
+        "sha256": "7967ab4cdd2b9628af5f41d0e353afdbf837bb6253eda6f85ffef943527320db"
+      },
+      {
+        "path": "01 Specs/GFS-05 Honest Integration Outcomes and Recovery.md",
+        "sha256": "9a60e35f5f5e3f17dd4ed4a59e23d8569a9a73b6e05b3589786e44367d425154"
+      },
+      {
+        "path": "01 Specs/GFS-06 Concurrent Native Acceptance and Adoption Handoffs.md",
+        "sha256": "a1c2ddb596ae35afde3fb4aad50f042ef0c0f77c2159098988e15dca22b17be1"
+      },
+      {
+        "path": "02 PRDs/Live Shared Agent Commits.md",
+        "sha256": "17d2583cc073d9120d6e1b8e4a2326583abdd72c3edee1d4929ac5a942a40f59"
+      },
+      {
+        "path": "02 PRDs/Reliable Concurrent Git-FS Contracts.md",
+        "sha256": "fa2454800914553dacb43a30bd65930ba5dbffc0b6c10f59c839f9235e99fb47"
+      },
+      {
+        "path": "Home.md",
+        "sha256": "41c7c550975ea47f42cdda541ff93cc6b409919d2f33847b0d8482efc94db4d2"
+      }
+    ]
+  },
+  "progress": {
+    "implemented": 3,
+    "proven": 3,
+    "partial": 0,
+    "target": 4,
+    "proposed": 0,
+    "deferred": 0,
+    "open-question": 0,
+    "total": 7,
+    "open": 4,
+    "ready": 0,
+    "scoped": 0,
+    "effort": 4
+  },
+  "parallel": 1,
+  "critical": 4,
+  "clashes": [],
+  "rows": [
+    {
+      "name": "GFS-03 Exact Integration Candidate Snapshots",
+      "path": "01 Specs/GFS-03 Exact Integration Candidate Snapshots.md",
+      "category": "build",
+      "status": "target",
+      "owner": "agent@57e9ee09",
+      "since": "2026-11-15T21:12:10.232Z",
+      "heartbeat": "2026-11-15T21:56:42.879Z",
+      "blocked": "",
+      "effort": 1,
+      "start": 0,
+      "end": 1,
+      "wave": 1,
+      "after": [],
+      "paths": [
+        "src/store.rs",
+        "src/snapshot.rs",
+        "src/lib.rs",
+        "src/overlay.rs",
+        "manifest.md",
+        "tests/verification_snapshot.rs",
+        "docs/verification.md"
+      ],
+      "held": "claimed",
+      "mark": "",
+      "open": 6,
+      "stale": false,
+      "rank": 13.305516191543202
+    },
+    {
+      "name": "GFS-04 Verification Receipts Bound to the Candidate",
+      "path": "01 Specs/GFS-04 Verification Receipts Bound to the Candidate.md",
+      "category": "protocol",
+      "status": "target",
+      "owner": "",
+      "since": "",
+      "heartbeat": "",
+      "blocked": "",
+      "effort": 1,
+      "start": 1,
+      "end": 2,
+      "wave": 2,
+      "after": [
+        "GFS-03 Exact Integration Candidate Snapshots"
+      ],
+      "paths": [
+        "src/review.rs",
+        "src/integrate.rs",
+        "src/verification.rs",
+        "src/lib.rs",
+        "manifest.md",
+        "tests/verification_receipt.rs",
+        "docs/verification.md"
+      ],
+      "held": "waiting",
+      "mark": "",
+      "open": 6,
+      "stale": true,
+      "rank": 0.45
+    },
+    {
+      "name": "GFS-05 Honest Integration Outcomes and Recovery",
+      "path": "01 Specs/GFS-05 Honest Integration Outcomes and Recovery.md",
+      "category": "behavior",
+      "status": "target",
+      "owner": "",
+      "since": "",
+      "heartbeat": "",
+      "blocked": "",
+      "effort": 1,
+      "start": 2,
+      "end": 3,
+      "wave": 3,
+      "after": [
+        "GFS-04 Verification Receipts Bound to the Candidate"
+      ],
+      "paths": [
+        "src/integrate.rs",
+        "src/store.rs",
+        "src/push.rs",
+        "manifest.md",
+        "tests/unit/integrate/tests.rs",
+        "tests/unit/store/tests.rs",
+        "tests/integration_recovery.rs",
+        "tests/guarded_push.rs",
+        "docs/reference.md"
+      ],
+      "held": "waiting",
+      "mark": "",
+      "open": 6,
+      "stale": true,
+      "rank": 0.45
+    },
+    {
+      "name": "GFS-06 Concurrent Native Acceptance and Adoption Handoffs",
+      "path": "01 Specs/GFS-06 Concurrent Native Acceptance and Adoption Handoffs.md",
+      "category": "acceptance",
+      "status": "target",
+      "owner": "",
+      "since": "",
+      "heartbeat": "",
+      "blocked": "",
+      "effort": 1,
+      "start": 3,
+      "end": 4,
+      "wave": 4,
+      "after": [
+        "GFS-05 Honest Integration Outcomes and Recovery"
+      ],
+      "paths": [
+        "tests/concurrent_workflow.rs",
+        "tests/support/concurrent_workflow",
+        "tests/runtime_identity.rs",
+        "tests/session_routing.rs",
+        "tests/verification_snapshot.rs",
+        "tests/verification_receipt.rs",
+        "tests/integration_recovery.rs",
+        "tests/guarded_push.rs",
+        "tests/review_gate.rs",
+        "tests/tool_items.rs",
+        "src/limits.rs",
+        "src/store.rs",
+        "src/integrate.rs",
+        "justfile",
+        "docs/reference.md",
+        "docs/integration-handoffs.md"
+      ],
+      "held": "waiting",
+      "mark": "",
+      "open": 7,
+      "stale": true,
+      "rank": 0.45
+    }
+  ],
+  "done": [
+    {
+      "name": "GFS Live Shared Commit Acceptance",
+      "path": "01 Specs/GFS Live Shared Commit Acceptance.md",
+      "category": "acceptance",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-15"
+    },
+    {
+      "name": "GFS-01 Runtime Identity and Protocol Negotiation",
+      "path": "01 Specs/GFS-01 Runtime Identity and Protocol Negotiation.md",
+      "category": "protocol",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-15"
+    },
+    {
+      "name": "GFS-02 Stable Session and Workspace Binding",
+      "path": "01 Specs/GFS-02 Stable Session and Workspace Binding.md",
+      "category": "behavior",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-15"
+    }
+  ],
+  "warnings": []
+}
