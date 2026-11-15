@@ -492,7 +492,10 @@ async fn live_edit_then_trunk(root: &Path, service: &Arc<Service>, trunk: &[&str
 	for text in trunk {
 		std::fs::write(root.join("a.txt"), text).unwrap();
 		git(root, &["add", "a.txt"]);
-		git(root, &["-c", "commit.gpgsign=false", "commit", "-qm", "trunk"]);
+		git(
+			root,
+			&["-c", "commit.gpgsign=false", "commit", "-qm", "trunk"],
+		);
 	}
 	old_live
 }
