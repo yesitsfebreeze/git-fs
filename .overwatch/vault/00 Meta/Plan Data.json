@@ -44,7 +44,7 @@
       },
       {
         "path": "01 Specs/GFS-03 Exact Integration Candidate Snapshots.md",
-        "sha256": "43e1baa903e652202ed9cf1677097b6b3a809504008fe2bbe840abe624d80a97"
+        "sha256": "4abbf211e2d62116694088c218d418d73ed5a1f000ccae703413eb40bc5ff3b0"
       },
       {
         "path": "01 Specs/GFS-04 Verification Receipts Bound to the Candidate.md",
@@ -73,52 +73,23 @@
     ]
   },
   "progress": {
-    "implemented": 3,
-    "proven": 3,
+    "implemented": 4,
+    "proven": 4,
     "partial": 0,
-    "target": 4,
+    "target": 3,
     "proposed": 0,
     "deferred": 0,
     "open-question": 0,
     "total": 7,
-    "open": 4,
-    "ready": 0,
-    "scoped": 0,
-    "effort": 4
+    "open": 3,
+    "ready": 1,
+    "scoped": 1,
+    "effort": 3
   },
   "parallel": 1,
-  "critical": 4,
+  "critical": 3,
   "clashes": [],
   "rows": [
-    {
-      "name": "GFS-03 Exact Integration Candidate Snapshots",
-      "path": "01 Specs/GFS-03 Exact Integration Candidate Snapshots.md",
-      "category": "build",
-      "status": "target",
-      "owner": "agent@57e9ee09",
-      "since": "2026-11-15T21:12:10.232Z",
-      "heartbeat": "2026-11-15T21:56:42.879Z",
-      "blocked": "",
-      "effort": 1,
-      "start": 0,
-      "end": 1,
-      "wave": 1,
-      "after": [],
-      "paths": [
-        "src/store.rs",
-        "src/snapshot.rs",
-        "src/lib.rs",
-        "src/overlay.rs",
-        "manifest.md",
-        "tests/verification_snapshot.rs",
-        "docs/verification.md"
-      ],
-      "held": "claimed",
-      "mark": "",
-      "open": 6,
-      "stale": false,
-      "rank": 13.305516191543202
-    },
     {
       "name": "GFS-04 Verification Receipts Bound to the Candidate",
       "path": "01 Specs/GFS-04 Verification Receipts Bound to the Candidate.md",
@@ -129,12 +100,10 @@
       "heartbeat": "",
       "blocked": "",
       "effort": 1,
-      "start": 1,
-      "end": 2,
-      "wave": 2,
-      "after": [
-        "GFS-03 Exact Integration Candidate Snapshots"
-      ],
+      "start": 0,
+      "end": 1,
+      "wave": 1,
+      "after": [],
       "paths": [
         "src/review.rs",
         "src/integrate.rs",
@@ -144,11 +113,11 @@
         "tests/verification_receipt.rs",
         "docs/verification.md"
       ],
-      "held": "waiting",
+      "held": "",
       "mark": "",
       "open": 6,
       "stale": true,
-      "rank": 0.45
+      "rank": 12.605516191543202
     },
     {
       "name": "GFS-05 Honest Integration Outcomes and Recovery",
@@ -160,9 +129,9 @@
       "heartbeat": "",
       "blocked": "",
       "effort": 1,
-      "start": 2,
-      "end": 3,
-      "wave": 3,
+      "start": 1,
+      "end": 2,
+      "wave": 2,
       "after": [
         "GFS-04 Verification Receipts Bound to the Candidate"
       ],
@@ -193,9 +162,9 @@
       "heartbeat": "",
       "blocked": "",
       "effort": 1,
-      "start": 3,
-      "end": 4,
-      "wave": 4,
+      "start": 2,
+      "end": 3,
+      "wave": 3,
       "after": [
         "GFS-05 Honest Integration Outcomes and Recovery"
       ],
@@ -245,6 +214,14 @@
       "name": "GFS-02 Stable Session and Workspace Binding",
       "path": "01 Specs/GFS-02 Stable Session and Workspace Binding.md",
       "category": "behavior",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-15"
+    },
+    {
+      "name": "GFS-03 Exact Integration Candidate Snapshots",
+      "path": "01 Specs/GFS-03 Exact Integration Candidate Snapshots.md",
+      "category": "build",
       "effort": 1,
       "proven": true,
       "updated": "2026-11-15"
