@@ -48,15 +48,31 @@
       },
       {
         "path": "01 Specs/GFS-04 Verification Receipts Bound to the Candidate.md",
-        "sha256": "7967ab4cdd2b9628af5f41d0e353afdbf837bb6253eda6f85ffef943527320db"
+        "sha256": "3fe5988a3724fa98bb88f8571907dc4ec6ffb14723847c5a4d1de4ee74db533d"
       },
       {
         "path": "01 Specs/GFS-05 Honest Integration Outcomes and Recovery.md",
-        "sha256": "9a60e35f5f5e3f17dd4ed4a59e23d8569a9a73b6e05b3589786e44367d425154"
+        "sha256": "c1004941317de40ab2d7883c64fb209bc4159ebc9df4f92004f14ad5707eff39"
       },
       {
         "path": "01 Specs/GFS-06 Concurrent Native Acceptance and Adoption Handoffs.md",
-        "sha256": "a1c2ddb596ae35afde3fb4aad50f042ef0c0f77c2159098988e15dca22b17be1"
+        "sha256": "b076c25ae16fc4c4b26e33107acaf0a2ab932c2b81e5927431e936d24bbd584b"
+      },
+      {
+        "path": "01 Specs/GFS-07 Safe Versioned Runtime Staging and Adoption.md",
+        "sha256": "6cce3c5ca3a02c4f2ca3b1390ee70ffa6209583332530a7de6e40beae114e7c7"
+      },
+      {
+        "path": "01 Specs/GFS-08 Candidate Snapshot MCP Contract Exposure.md",
+        "sha256": "a30dace2f35e294cb842651086cd4fade44358475032b4bcf8f0517d61229b57"
+      },
+      {
+        "path": "01 Specs/GFS-09 Candidate Snapshot Commit-Tree Stdin Closure.md",
+        "sha256": "14c8604e97c03f391ac95c0c112570f95a51a5dec7e54bd869fabe10ca746299"
+      },
+      {
+        "path": "01 Specs/GFS-10 Opt-in Version-Pinned Fresh MCP Client.md",
+        "sha256": "d5271bff293d996ea504e696e54945f94517d7037d6171a31c88cf1fe7a89a73"
       },
       {
         "path": "02 PRDs/Live Shared Agent Commits.md",
@@ -73,126 +89,23 @@
     ]
   },
   "progress": {
-    "implemented": 4,
-    "proven": 4,
+    "implemented": 11,
+    "proven": 11,
     "partial": 0,
-    "target": 3,
+    "target": 0,
     "proposed": 0,
     "deferred": 0,
     "open-question": 0,
-    "total": 7,
-    "open": 3,
-    "ready": 1,
-    "scoped": 1,
-    "effort": 3
+    "total": 11,
+    "open": 0,
+    "ready": 0,
+    "scoped": 0,
+    "effort": 0
   },
-  "parallel": 1,
-  "critical": 3,
+  "parallel": 0,
+  "critical": 0,
   "clashes": [],
-  "rows": [
-    {
-      "name": "GFS-04 Verification Receipts Bound to the Candidate",
-      "path": "01 Specs/GFS-04 Verification Receipts Bound to the Candidate.md",
-      "category": "protocol",
-      "status": "target",
-      "owner": "",
-      "since": "",
-      "heartbeat": "",
-      "blocked": "",
-      "effort": 1,
-      "start": 0,
-      "end": 1,
-      "wave": 1,
-      "after": [],
-      "paths": [
-        "src/review.rs",
-        "src/integrate.rs",
-        "src/verification.rs",
-        "src/lib.rs",
-        "manifest.md",
-        "tests/verification_receipt.rs",
-        "docs/verification.md"
-      ],
-      "held": "",
-      "mark": "",
-      "open": 6,
-      "stale": true,
-      "rank": 12.605516191543202
-    },
-    {
-      "name": "GFS-05 Honest Integration Outcomes and Recovery",
-      "path": "01 Specs/GFS-05 Honest Integration Outcomes and Recovery.md",
-      "category": "behavior",
-      "status": "target",
-      "owner": "",
-      "since": "",
-      "heartbeat": "",
-      "blocked": "",
-      "effort": 1,
-      "start": 1,
-      "end": 2,
-      "wave": 2,
-      "after": [
-        "GFS-04 Verification Receipts Bound to the Candidate"
-      ],
-      "paths": [
-        "src/integrate.rs",
-        "src/store.rs",
-        "src/push.rs",
-        "manifest.md",
-        "tests/unit/integrate/tests.rs",
-        "tests/unit/store/tests.rs",
-        "tests/integration_recovery.rs",
-        "tests/guarded_push.rs",
-        "docs/reference.md"
-      ],
-      "held": "waiting",
-      "mark": "",
-      "open": 6,
-      "stale": true,
-      "rank": 0.45
-    },
-    {
-      "name": "GFS-06 Concurrent Native Acceptance and Adoption Handoffs",
-      "path": "01 Specs/GFS-06 Concurrent Native Acceptance and Adoption Handoffs.md",
-      "category": "acceptance",
-      "status": "target",
-      "owner": "",
-      "since": "",
-      "heartbeat": "",
-      "blocked": "",
-      "effort": 1,
-      "start": 2,
-      "end": 3,
-      "wave": 3,
-      "after": [
-        "GFS-05 Honest Integration Outcomes and Recovery"
-      ],
-      "paths": [
-        "tests/concurrent_workflow.rs",
-        "tests/support/concurrent_workflow",
-        "tests/runtime_identity.rs",
-        "tests/session_routing.rs",
-        "tests/verification_snapshot.rs",
-        "tests/verification_receipt.rs",
-        "tests/integration_recovery.rs",
-        "tests/guarded_push.rs",
-        "tests/review_gate.rs",
-        "tests/tool_items.rs",
-        "src/limits.rs",
-        "src/store.rs",
-        "src/integrate.rs",
-        "justfile",
-        "docs/reference.md",
-        "docs/integration-handoffs.md"
-      ],
-      "held": "waiting",
-      "mark": "",
-      "open": 7,
-      "stale": true,
-      "rank": 0.45
-    }
-  ],
+  "rows": [],
   "done": [
     {
       "name": "GFS Live Shared Commit Acceptance",
@@ -225,6 +138,62 @@
       "effort": 1,
       "proven": true,
       "updated": "2026-11-15"
+    },
+    {
+      "name": "GFS-04 Verification Receipts Bound to the Candidate",
+      "path": "01 Specs/GFS-04 Verification Receipts Bound to the Candidate.md",
+      "category": "protocol",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-15"
+    },
+    {
+      "name": "GFS-05 Honest Integration Outcomes and Recovery",
+      "path": "01 Specs/GFS-05 Honest Integration Outcomes and Recovery.md",
+      "category": "behavior",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-16"
+    },
+    {
+      "name": "GFS-06 Concurrent Native Acceptance and Adoption Handoffs",
+      "path": "01 Specs/GFS-06 Concurrent Native Acceptance and Adoption Handoffs.md",
+      "category": "acceptance",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-16"
+    },
+    {
+      "name": "GFS-07 Safe Versioned Runtime Staging and Adoption",
+      "path": "01 Specs/GFS-07 Safe Versioned Runtime Staging and Adoption.md",
+      "category": "build",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-16"
+    },
+    {
+      "name": "GFS-08 Candidate Snapshot MCP Contract Exposure",
+      "path": "01 Specs/GFS-08 Candidate Snapshot MCP Contract Exposure.md",
+      "category": "protocol",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-16"
+    },
+    {
+      "name": "GFS-09 Candidate Snapshot Commit-Tree Stdin Closure",
+      "path": "01 Specs/GFS-09 Candidate Snapshot Commit-Tree Stdin Closure.md",
+      "category": "behavior",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-16"
+    },
+    {
+      "name": "GFS-10 Opt-in Version-Pinned Fresh MCP Client",
+      "path": "01 Specs/GFS-10 Opt-in Version-Pinned Fresh MCP Client.md",
+      "category": "build",
+      "effort": 1,
+      "proven": true,
+      "updated": "2026-11-16"
     }
   ],
   "warnings": []
