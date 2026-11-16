@@ -295,7 +295,8 @@
                 "enum": [
                   "preview",
                   "commit",
-                  "reconcile"
+                  "reconcile",
+                  "retry_sync"
                 ]
               },
               "expected_revision": {

@@ -2,7 +2,7 @@
 
 use crate::bridge::Ctx;
 use crate::secrets;
-use crate::store::{Owned, Store, StoreConfig};
+use crate::store::{IntegrationAttempt, Owned, Store, StoreConfig};
 use crate::tool_result::success as ok;
 use crate::Result;
 use serde_json::{json, Value};
@@ -136,7 +136,7 @@ pub(crate) fn describe() -> Value {
 			"properties":{
 				"op":{"type":"string","enum":["integrate","push","undo","scan"]},
 				"message":{"type":"string","description":"Reviewed commit subject; never bypasses a required gate."},
-				"phase":{"type":"string","enum":["preview","commit","reconcile","handoff"]},
+				"phase":{"type":"string","enum":["preview","commit","reconcile","retry_sync","handoff"]},
 				"expected_revision":{"type":"string"},
 				"remote":{"type":"string"},"ref":{"type":"string"},"commit":{"type":"string"},
 				"expected_remote_head":{"type":["string","null"]},"operation_id":{"type":"string"},
@@ -357,6 +357,56 @@ fn preview_tree(
 	)
 }
 
+fn integration_outcome(attempt: &IntegrationAttempt, proven: bool) -> Value {
+	let (synchronization, next_action) = if !proven {
+		("unknown", "reconcile")
+	} else if let Some(worktree) = &attempt.worktree {
+		if worktree["error"].as_str().is_some() {
+			("failed", "retry_sync")
+		} else if worktree["kept"]
+			.as_array()
+			.is_some_and(|paths| !paths.is_empty())
+		{
+			("kept", "inspect_kept")
+		} else if worktree["synced"]
+			.as_array()
+			.is_some_and(|paths| paths.len() == attempt.review.owned.len())
+		{
+			("synchronized", "none")
+		} else {
+			("pending", "retry_sync")
+		}
+	} else {
+		("pending", "retry_sync")
+	};
+	json!({
+		"schema":"gitfs-integration-outcome/v1",
+		"operation_id":attempt.revision,
+		"binding":{
+			"repository":attempt.review.repository,
+			"session":attempt.session,
+			"branch":attempt.review.branch,
+			"parent":attempt.review.head,
+			"tree":attempt.review.tree,
+			"consumed":attempt.review.overlay,
+		},
+		"publication":if proven {"committed"} else {"unknown"},
+		"synchronization":synchronization,
+		"next_action":next_action,
+	})
+}
+
+fn legacy_integration_outcome(revision: &str) -> Value {
+	json!({
+		"schema":"gitfs-integration-outcome/v1",
+		"operation_id":revision,
+		"publication":"committed",
+		"synchronization":"unknown",
+		"next_action":"inspect",
+		"binding":null,
+		"limitations":["legacy integration has no stored source binding or sync evidence"]
+	})
+}
 async fn integrate(
 	host: Ctx,
 	cfg: &Config,
@@ -366,7 +416,7 @@ async fn integrate(
 	cancel: Arc<AtomicBool>,
 ) -> Result<Value> {
 	let phase = input["phase"].as_str().unwrap_or("preview");
-	if !["preview", "commit", "reconcile"].contains(&phase) {
+	if !["preview", "commit", "reconcile", "retry_sync"].contains(&phase) {
 		return err("unknown integrate phase");
 	}
 	let author = identity(cfg)?;
@@ -377,28 +427,87 @@ async fn integrate(
 	// already landed.
 	if phase != "preview" {
 		let expected = input["expected_revision"].as_str();
-		if phase == "reconcile" && expected.is_none() {
-			return err("reconcile needs the expected_revision its preview returned");
+		if (phase == "reconcile" || phase == "retry_sync") && expected.is_none() {
+			return err("recovery requires the expected_revision its preview returned");
 		}
 		if let Some(expected) = expected {
-			let found = {
+			let (found, attempt) = {
 				let store = store.clone();
 				let expected = expected.to_owned();
-				tokio::task::spawn_blocking(move || store.find_integrated(&expected))
-					.await
-					.map_err(|e| e.to_string())??
+				tokio::task::spawn_blocking(move || -> Result<_> {
+					let found = store.find_integrated(&expected)?;
+					let attempt = store.integration_attempt(&expected)?;
+					Ok((found, attempt))
+				})
+				.await
+				.map_err(|e| e.to_string())??
 			};
+			if attempt
+				.as_ref()
+				.is_some_and(|intent| intent.session != session)
+			{
+				return err("integration recovery belongs to a different session");
+			}
 			if let Some(found) = found {
-				let mut receipt = json!({"phase":phase,"session":found["session"],"committed":found["committed"],"consumed":found["consumed"],"tree":found["tree"],"parent":found["parent"],"branch":store.branch_name()?.unwrap_or_default(),"subject":found["subject"],"author":author,"review_revision":expected,"push":false});
+				if found["session"].as_str() != Some(session) {
+					return err("published revision belongs to another session");
+				}
+				let mut worktree = None;
+				let outcome = if phase == "retry_sync" {
+					let Some(mut intent) = attempt else {
+						return err("legacy integration has no safe synchronization recovery");
+					};
+					let commit = found["committed"]
+						.as_str()
+						.ok_or("missing published commit")?
+						.to_owned();
+					let store = store.clone();
+					let (updated, synced) = tokio::task::spawn_blocking(move || -> Result<_> {
+						let synced = store.retry_integrated_sync(&intent, &commit)?;
+						intent.committed = Some(commit);
+						intent.worktree = Some(synced.clone());
+						store.save_integration_attempt(&intent)?;
+						Ok((intent, synced))
+					})
+					.await
+					.map_err(|e| e.to_string())??;
+					worktree = Some(synced);
+					integration_outcome(&updated, true)
+				} else if let Some(attempt) = &attempt {
+					integration_outcome(attempt, true)
+				} else {
+					legacy_integration_outcome(expected)
+				};
+				let mut receipt = json!({
+					"phase":phase,"session":found["session"],"committed":found["committed"],
+					"consumed":found["consumed"],"tree":found["tree"],"parent":found["parent"],
+					"branch":found["branch"],"subject":found["subject"],
+					"author":author,"review_revision":expected,"push":false,"outcome":outcome
+				});
 				if phase == "reconcile" {
 					receipt["integrated"] = json!(true);
 				}
+				if let Some(worktree) = worktree {
+					receipt["worktree"] = worktree;
+				}
 				return ok(receipt);
+			}
+			if let Some(attempt) = attempt {
+				if phase == "reconcile" {
+					return ok(json!({
+						"phase":"reconcile","integrated":null,"review_revision":expected,
+						"push":false,"outcome":integration_outcome(&attempt, false)
+					}));
+				}
+				return err("integration publication outcome unknown; reconcile before retry, never redispatch");
 			}
 			if phase == "reconcile" {
 				return ok(
 					json!({"phase":"reconcile","integrated":false,"review_revision":expected,"push":false}),
 				);
+			}
+			if phase == "retry_sync" {
+				return err("no proven integration commit to synchronize");
 			}
 		}
 	}
@@ -494,8 +603,9 @@ async fn integrate(
 	let tree = review.tree.clone();
 	let branch = review.branch.clone();
 	let consumed = review.overlay.clone();
+	let subject_for_intent = subject.clone();
 	let message = format!("{subject}\n\n{}", receipt(&session, &revision, &consumed));
-	let (commit, worktree) = tokio::task::spawn_blocking(move || -> Result<_> {
+	let (commit, worktree, outcome) = tokio::task::spawn_blocking(move || -> Result<_> {
 		if crate::review::policy(store.root())? != command_review {
 			return Err("review policy changed before publication; preview again".into());
 		}
@@ -508,17 +618,34 @@ async fn integrate(
 			&serde_json::to_value(&review).map_err(|e| e.to_string())?,
 			&verification_revision,
 		)?;
+		let mut attempt = IntegrationAttempt {
+			schema: "gitfs-integration-attempt/v1".into(),
+			revision: verification_revision.clone(),
+			session: session.clone(),
+			review: review.clone(),
+			subject: subject_for_intent.clone(),
+			author_name: name.clone(),
+			author_email: email.clone(),
+			committed: None,
+			worktree: None,
+		};
+		// Durable before any update-ref dispatch: ambiguous replies never re-commit.
+		store.save_integration_attempt(&attempt)?;
 		let commit = store.commit_reviewed(&session, &review, &message, &name, &email, &cancel)?;
-		// The commit is on the ref; a sync that fails leaves the paths in `kept`.
+		attempt.committed = Some(commit.clone());
+		store.save_integration_attempt(&attempt)?;
 		let worktree = store
-			.sync_integrated(&review.head, &commit, &review.owned)
+			.retry_integrated_sync(&attempt, &commit)
 			.unwrap_or_else(|e| json!({"synced":[],"kept":[],"error":e}));
-		Ok((commit, worktree))
+		attempt.worktree = Some(worktree.clone());
+		store.save_integration_attempt(&attempt)?;
+		let outcome = integration_outcome(&attempt, true);
+		Ok((commit, worktree, outcome))
 	})
 	.await
 	.map_err(|e| format!("publication outcome unknown; reconcile before retry: {e}"))??;
 	ok(
-		json!({"phase":"commit","session":result_session,"committed":commit,"consumed":consumed,"tree":tree,"parent":parent,"branch":branch,"subject":subject,"author":author,"review_revision":revision,"push":false,"worktree":worktree}),
+		json!({"phase":"commit","session":result_session,"committed":commit,"consumed":consumed,"tree":tree,"parent":parent,"branch":branch,"subject":subject,"author":author,"review_revision":revision,"push":false,"worktree":worktree,"outcome":outcome}),
 	)
 }
 

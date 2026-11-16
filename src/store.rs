@@ -33,6 +33,21 @@ pub struct ReviewedTree {
 	pub owned: Vec<Owned>,
 }
 
+/// Durable, operation-bound recovery state. Written before any ref transaction.
+/// An absent commit is intentionally ambiguous, never permission to dispatch again.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationAttempt {
+	pub schema: String,
+	pub revision: String,
+	pub session: String,
+	pub review: ReviewedTree,
+	pub subject: String,
+	pub author_name: String,
+	pub author_email: String,
+	pub committed: Option<String>,
+	pub worktree: Option<Value>,
+}
+
 fn publication_failure(
 	dispatched: bool,
 	commit: &str,
@@ -2192,9 +2207,14 @@ impl Store {
 	/// consumed session tip are trailers on the commit, so a replayed integrate
 	/// answers the same receipt instead of committing a second time.
 	pub fn find_integrated(&self, revision: &str) -> Result<Option<Value>> {
-		if revision.is_empty() || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+		if revision.len() != 64 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
 			return Ok(None);
 		}
+		let attempt = self.integration_attempt(revision)?;
+		let reference = attempt
+			.as_ref()
+			.map(|intent| format!("refs/heads/{}", intent.review.branch))
+			.unwrap_or_else(|| "HEAD".to_owned());
 		let out = run_tolerant(
 			&self.root,
 			self.git_dir.as_deref(),
@@ -2205,7 +2225,7 @@ impl Store {
 				"--fixed-strings",
 				&format!("--grep=Gitfs-Review: {revision}"),
 				"--format=%H%x00%T%x00%P%x00%s%x00%b",
-				"HEAD",
+				&reference,
 			],
 		)?;
 		let Some(text) = trimmed_opt(lossy(out)) else {
@@ -2228,6 +2248,37 @@ impl Store {
 				.find_map(|line| line.trim().strip_prefix(key).map(|v| v.trim().to_owned()))
 				.unwrap_or_default()
 		};
+		if trailer("Gitfs-Review:") != revision {
+			return Ok(None);
+		}
+		if let Some(intent) = &attempt {
+			let authors = self.git_str(&["show", "-s", "--format=%an%x00%ae", &commit])?;
+			let mut names = authors.trim_end().split('\0');
+			let parents = self.git_str(&["rev-list", "--parents", "-n", "1", &commit])?;
+			if tree != intent.review.tree
+				|| parent != intent.review.head
+				|| subject != intent.subject
+				|| trailer("Gitfs-Session:") != intent.session
+				|| trailer("Gitfs-Consumed:") != intent.review.overlay
+				|| names.next() != Some(intent.author_name.as_str())
+				|| names.next() != Some(intent.author_email.as_str())
+				|| parents.split_whitespace().count() != 2
+				|| intent
+					.committed
+					.as_deref()
+					.is_some_and(|known| known != commit)
+				|| self
+					.git(&["merge-base", "--is-ancestor", &commit, &reference])
+					.is_err()
+			{
+				return Ok(None);
+			}
+			return Ok(Some(json!({
+				"committed":commit,"tree":tree,"parent":parent,"subject":subject,
+				"session":intent.session,"consumed":intent.review.overlay,
+				"branch":intent.review.branch,"journaled":true,
+			})));
+		}
 		Ok(Some(json!({
 			"committed":commit,
 			"tree":tree,
@@ -2574,6 +2625,27 @@ impl Store {
 	/// and untracked files in the way, are left alone and named in `kept`.
 	pub fn sync_integrated(&self, parent: &str, commit: &str, owned: &[Owned]) -> Result<Value> {
 		let _repo = self.mutation_lock("repository")?;
+		self.sync_integrated_locked(parent, commit, owned)
+	}
+
+	/// Retries only the already-proven commit, never a second ref transaction.
+	pub(crate) fn retry_integrated_sync(
+		&self,
+		attempt: &IntegrationAttempt,
+		commit: &str,
+	) -> Result<Value> {
+		let _repo = self.mutation_lock("repository")?;
+		if self.branch_name()?.as_deref() != Some(&attempt.review.branch)
+			|| self.head()?.as_deref() != Some(commit)
+		{
+			return Err(
+				"original integration branch/HEAD is not checked out; retry refused".into(),
+			);
+		}
+		self.sync_integrated_locked(&attempt.review.head, commit, &attempt.review.owned)
+	}
+
+	fn sync_integrated_locked(&self, parent: &str, commit: &str, owned: &[Owned]) -> Result<Value> {
 		let mut synced = Vec::new();
 		let mut kept = Vec::new();
 		for (status, rel) in owned {
@@ -2593,6 +2665,16 @@ impl Store {
 					.is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
 				None => false,
 			};
+			// Idempotent after a lost synchronization ACK: exact index AND disk
+			// already at the commit are safe, including completed deletions.
+			if materialized
+				&& self
+					.git(&["diff", "--cached", "--quiet", commit, "--", &spec])
+					.is_ok()
+			{
+				synced.push(rel.clone());
+				continue;
+			}
 			if index_unchanged && materialized {
 				let done = match entry {
 					Some((mode, sha)) => self.index_update(&[
@@ -2939,6 +3021,83 @@ impl Store {
 		let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
 		std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
 		std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+	}
+}
+
+// Integration intent survives process restarts and is never garbage-collected while
+// the ref transaction could be in flight. Git remains the authority for commits.
+impl Store {
+	pub(crate) fn integration_attempt(&self, revision: &str) -> Result<Option<IntegrationAttempt>> {
+		if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+			return Ok(None);
+		}
+		let file = self.dir.join(format!("integration-{revision}.json"));
+		let metadata = match std::fs::symlink_metadata(&file) {
+			Ok(metadata) => metadata,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(format!("cannot stat integration recovery: {error}")),
+		};
+		if !metadata.file_type().is_file() || metadata.len() > 4 * 1024 * 1024 {
+			return Err("unsafe or oversized integration recovery record".into());
+		}
+		let text = match std::fs::read_to_string(file) {
+			Ok(text) => text,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(format!("cannot read integration recovery: {error}")),
+		};
+		let attempt: IntegrationAttempt = serde_json::from_str(&text)
+			.map_err(|error| format!("invalid integration recovery: {error}"))?;
+		if attempt.schema != "gitfs-integration-attempt/v1"
+			|| attempt.revision != revision
+			|| attempt.session.is_empty()
+			|| attempt.review.repository != self.repository_identity()?
+			|| attempt.review.branch.is_empty()
+			|| attempt.review.overlay.is_empty()
+		{
+			return Err("integration recovery binding mismatch; refusing publication".into());
+		}
+		Ok(Some(attempt))
+	}
+
+	pub(crate) fn save_integration_attempt(&self, attempt: &IntegrationAttempt) -> Result<()> {
+		if attempt.revision.len() != 64
+			|| !attempt
+				.revision
+				.bytes()
+				.all(|byte| byte.is_ascii_hexdigit())
+			|| attempt.schema != "gitfs-integration-attempt/v1"
+			|| attempt.review.repository != self.repository_identity()?
+		{
+			return Err("invalid integration recovery binding".into());
+		}
+		let _lock = self.mutation_lock("repository")?;
+		if let Some(prior) = self.integration_attempt(&attempt.revision)? {
+			if prior.schema != attempt.schema
+				|| prior.revision != attempt.revision
+				|| prior.session != attempt.session
+				|| prior.review != attempt.review
+				|| prior.subject != attempt.subject
+				|| prior.author_name != attempt.author_name
+				|| prior.author_email != attempt.author_email
+				|| prior.committed.is_some() && prior.committed != attempt.committed
+				|| prior.worktree.is_some() && attempt.worktree.is_none()
+			{
+				return Err("integration recovery is already bound to another outcome".into());
+			}
+		} else if attempt.committed.is_some() || attempt.worktree.is_some() {
+			return Err("cannot record integration result without durable intent".into());
+		}
+		std::fs::create_dir_all(&self.dir).map_err(|error| error.to_string())?;
+		let bytes = serde_json::to_vec_pretty(attempt).map_err(|error| error.to_string())?;
+		if bytes.len() > 4 * 1024 * 1024 {
+			return Err("integration recovery exceeds size limit".into());
+		}
+		crate::hook::atomic_write(
+			&self
+				.dir
+				.join(format!("integration-{}.json", attempt.revision)),
+			&bytes,
+		)
 	}
 }
 

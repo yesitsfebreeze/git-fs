@@ -1183,3 +1183,117 @@ fn catchup_refuses_a_ref_with_no_shared_history() {
 	let refused = catchup(&store, "c5").unwrap_err();
 	assert!(refused.contains("shares no history"), "{refused}");
 }
+
+#[test]
+fn guarded_integration_sync_refuses_a_branch_switch_before_touching_index_or_disk() {
+	let (dir, store) = new_repo();
+	store
+		.write_blob("s", Path::new("new.txt"), b"new\n", "100644")
+		.unwrap();
+	let review = store.reviewed_tree("s").unwrap();
+	let commit = store
+		.commit_reviewed(
+			"s",
+			&review,
+			"publish\n\nIntegrated-by: gitfs",
+			"a",
+			"a@b",
+			&AtomicBool::new(false),
+		)
+		.unwrap();
+	let intent = IntegrationAttempt {
+		schema: "gitfs-integration-attempt/v1".into(),
+		revision: "a".repeat(64),
+		session: "s".into(),
+		review: review.clone(),
+		subject: "publish".into(),
+		author_name: "a".into(),
+		author_email: "a@b".into(),
+		committed: Some(commit.clone()),
+		worktree: None,
+	};
+	let old_index = store.git_str(&["ls-files", "--stage"]).unwrap();
+	let old_disk = std::fs::read(dir.path().join("README")).unwrap();
+	store
+		.git_str(&["checkout", "-q", "-b", "other", &review.head])
+		.unwrap();
+	let switched_index = store.git_str(&["ls-files", "--stage"]).unwrap();
+	let switched_disk = std::fs::read(dir.path().join("README")).unwrap();
+	assert_eq!(old_index, switched_index);
+	assert_eq!(old_disk, switched_disk);
+	let error = store.retry_integrated_sync(&intent, &commit).unwrap_err();
+	assert!(error.contains("branch/HEAD"), "{error}");
+	assert_eq!(
+		store.git_str(&["rev-parse", "HEAD"]).unwrap().trim(),
+		review.head
+	);
+	assert_eq!(
+		store.git_str(&["ls-files", "--stage"]).unwrap(),
+		switched_index
+	);
+	assert_eq!(
+		std::fs::read(dir.path().join("README")).unwrap(),
+		switched_disk
+	);
+	assert!(!dir.path().join("new.txt").exists());
+
+	store.git_str(&["checkout", "-q", &review.branch]).unwrap();
+	assert_eq!(
+		store.git_str(&["rev-parse", "HEAD"]).unwrap().trim(),
+		commit
+	);
+	let sync = store.retry_integrated_sync(&intent, &commit).unwrap();
+	assert_eq!(sync["synced"], json!(["new.txt"]), "{sync}");
+	assert_eq!(sync["kept"], json!([]), "{sync}");
+	assert_eq!(std::fs::read(dir.path().join("new.txt")).unwrap(), b"new\n");
+}
+
+#[test]
+fn committed_ref_is_recovered_after_lost_post_ref_journal_ack() {
+	let (dir, store) = new_repo();
+	store
+		.write_blob("s", Path::new("lost.txt"), b"published\n", "100644")
+		.unwrap();
+	let review = store.reviewed_tree("s").unwrap();
+	let revision = "f".repeat(64);
+	let attempt = IntegrationAttempt {
+		schema: "gitfs-integration-attempt/v1".into(),
+		revision: revision.clone(),
+		session: "s".into(),
+		review: review.clone(),
+		subject: "recover".into(),
+		author_name: "a".into(),
+		author_email: "a@b".into(),
+		committed: None,
+		worktree: None,
+	};
+	store.save_integration_attempt(&attempt).unwrap();
+	let message = format!("recover\n\nIntegrated-by: gitfs\nGitfs-Session: s\nGitfs-Review: {revision}\nGitfs-Consumed: {}\n", review.overlay);
+	let commit = store
+		.commit_reviewed("s", &review, &message, "a", "a@b", &AtomicBool::new(false))
+		.unwrap();
+	// Simulate the process dying after update-ref before recording the commit ACK.
+	let reopened = StoreConfig::new(".kern/gitfs").at(dir.path()).unwrap();
+	assert_eq!(
+		reopened
+			.integration_attempt(&revision)
+			.unwrap()
+			.unwrap()
+			.committed,
+		None
+	);
+	let before = reopened
+		.git_str(&["rev-list", "--count", &review.branch])
+		.unwrap();
+	let recovered = reopened.find_integrated(&revision).unwrap().unwrap();
+	assert_eq!(recovered["committed"], commit, "{recovered}");
+	assert_eq!(recovered["branch"], review.branch, "{recovered}");
+	assert_eq!(recovered["journaled"], true, "{recovered}");
+	assert_eq!(
+		reopened
+			.git_str(&["rev-list", "--count", &review.branch])
+			.unwrap(),
+		before
+	);
+	assert!(!dir.path().join("lost.txt").exists());
+}

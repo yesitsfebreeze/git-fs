@@ -265,6 +265,31 @@ pushing a remote ref are separate outcomes. Stop leaves disk untouched. Integrat
 returns `push: false`. Finish a requested delivery by pushing the exact integrated
 commit and observing a confirmed remote receipt.
 
+Integration recovery uses the preview's `expected_revision` as its immutable
+operation ID. Before publishing a reviewed ref transaction, git-fs durably
+records its exact repository, session, original branch, parent, tree, overlay,
+owned paths and commit identity. A replay or
+`integrate {phase:"reconcile",expected_revision}` checks Git ancestry and the
+original branch/ref, even after process restart, checkout or HEAD advancement.
+Only an exact matching commit proves `publication:"committed"`; unresolved
+attempts return `publication:"unknown"` and `integrated:null`. No automatic
+second commit or push is dispatched.
+
+Every new integration receipt has `outcome.schema:
+"gitfs-integration-outcome/v1"`, `operation_id`, `binding`, `publication`,
+`synchronization`, and `next_action`. Synchronization is
+`synchronized`, `kept` (foreign disk/index changes preserved), `failed`,
+`pending`, or `unknown`. A proved commit can use
+`integrate {phase:"retry_sync",expected_revision}` only while the original
+branch is checked out at that exact commit. It rechecks each path against disk
+and index, recognizes already-applied writes/deletions without modifying them,
+and never creates a second commit or remote push. Fix conflicts before
+retrying; `reconcile` is read-only. Old commits without an intent record
+expose unavailable binding/sync evidence rather than guessing. No unresolved
+journal is automatically discarded. The guarantee is conservative Git-level
+process recovery, not globally exactly-once execution or protection from
+sudden filesystem power loss.
+
 An originating session can authorize a different session to finish one reviewed
 push without giving it the originating identity:
 
