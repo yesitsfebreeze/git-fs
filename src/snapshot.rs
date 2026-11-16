@@ -234,6 +234,8 @@ impl Store {
 				&review.tree,
 				"-p",
 				&review.head,
+				"-m",
+				"git-fs candidate snapshot",
 			])?
 			.trim()
 			.to_owned();
