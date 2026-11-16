@@ -394,6 +394,12 @@ reviewer's snapshot and response validation checks.
 
 ## Known ceilings
 
+- Batched tool calls accept 1–32 items. Read-item concurrency defaults to 4
+  and is bounded to 1–8 by the advertised MCP input schema; writes execute
+  sequentially and stop on first error, with unexecuted items marked skipped.
+- Source/provenance byte caps and push budget come from the installed
+  document's declared limits; inspect the active identity/policy rather
+  than assuming a checkout or a previous process retained those values.
 - Session pins are written per ancestor process id, so two hosts in one
   checkout keep their own sessions. A host whose hook and MCP server share no
   ancestor, or whose process ids were reused after a crash, falls back to
@@ -429,6 +435,11 @@ reviewer's snapshot and response validation checks.
 | `tests/unit/` | the suite, mounted by `#[path]` from each module |
 
 ## Development
+
+For deterministic two-process native Windows/Unix acceptance, the Unix-only
+review-gate hook fixture, exact source SHA/tree comparison, and independent
+Overwatch/hub adapter acceptance contracts, see
+[native integration handoffs](integration-handoffs.md).
 
 `just check` runs formatting, Clippy and the Rust tests. `just build` places the
 release binary in `bin/git-fs`, with build artifacts in `~/.cache/git-fs/target`.

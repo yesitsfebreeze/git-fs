@@ -45,8 +45,12 @@ fn private_push_hook_and_cli_reject_forged_review_trailers() {
 	let result = root.join("hook-result");
 	let invoke = || {
 		let mut child = Command::new(&hook)
+			.arg("origin")
+			.arg("file:///unused.git")
 			.current_dir(root)
 			.env("GITFS_PUSH_HOOK", "1")
+			.env("GITFS_PUSH_USER_HOOKS", root.join(".git/hooks"))
+			.env("GITFS_PUSH_REMOTE", "origin")
 			.env("GITFS_PUSH_OLD", &old)
 			.env("GITFS_PUSH_NEW", &new)
 			.env("GITFS_PUSH_REF", "refs/heads/main")
