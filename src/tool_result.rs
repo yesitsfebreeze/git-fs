@@ -23,7 +23,16 @@ pub(crate) fn validate(tool: &str, input: &Value) -> Result<()> {
 		("gitfs", "ls") => (&[], &["session"]),
 		("gitfs", "rollback") => (&[], &["commit", "path"]),
 		("gitfs", "catchup") => (&[], &[]),
-		("gitfs", "snapshot") => (&[], &["id"]),
+		("gitfs", "snapshot") => (
+			&[],
+			&[
+				"id",
+				"kind",
+				"expected_tree",
+				"expected_review",
+				"capability",
+			],
+		),
 		("integrate", "undo") => (&[], &[]),
 		("gitfs", "materialize") => (&[], &["paths", "force"]),
 		("gitfs", "capture") | ("integrate", "scan") => (&[], &["paths"]),
@@ -95,8 +104,10 @@ pub(crate) fn validate(tool: &str, input: &Value) -> Result<()> {
 			}
 			"path" => valid_path(value.as_str().ok_or("path must be a string")?)?,
 			"message" | "phase" | "expected_revision" | "remote" | "ref" | "commit"
-			| "operation_id" | "session" | "recipient_session" | "id"
+			| "operation_id" | "session" | "recipient_session" | "id" | "kind"
+			| "expected_tree" | "capability"
 				if value.is_string() => {}
+			"expected_review" if value.is_object() => {}
 			"expected_remote_head" if value.is_null() || value.is_string() => {}
 			"offset" if value.as_u64().is_some() => {}
 			"limit" if value.as_u64().is_some_and(|n| (1..=65536).contains(&n)) => {}

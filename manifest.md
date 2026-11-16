@@ -251,7 +251,7 @@
       }
     },
     "tool.gitfs.snapshot": {
-      "description": "Create an isolated worktree pinned to the current shared live commit for builds and tests; give its returned id to release that session's clean snapshot.",
+      "description": "Create an isolated live-tip worktree or an exact reviewed integration-candidate worktree; give its returned id to release a live snapshot, or id and capability for a candidate snapshot.",
       "schema": {
         "type": "object",
         "required": ["op"],
@@ -259,7 +259,13 @@
           "op": {"type": "string", "enum": ["describe", "call", "cancel"]},
           "input": {
             "type": "object", "required": [],
-            "properties": {"id": {"type": "string", "minLength": 1, "description": "Release the exact snapshot created by this session; omit to create."}},
+            "properties": {
+              "id": {"type": "string", "minLength": 1, "description": "Release a snapshot created by this session; omit to create."},
+              "kind": {"type": "string", "enum": ["live", "candidate"], "description": "Live-tip by default; candidate exports the exact reviewed integration tree."},
+              "expected_tree": {"type": "string", "minLength": 40, "description": "Require the candidate's exact reviewed Git tree id."},
+              "expected_review": {"type": "object", "description": "Require the exact ReviewedTree returned by integration preview."},
+              "capability": {"type": "string", "minLength": 64, "description": "Candidate release requires the unforgeable capability returned on creation."}
+            },
             "additionalProperties": false
           },
           "context": {"type": "object"}
