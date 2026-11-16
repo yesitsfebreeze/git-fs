@@ -21,7 +21,12 @@ struct Peer {
 
 impl Peer {
 	fn start(root: &Path, name: &str) -> Self {
+		Self::start_env(root, name, &[])
+	}
+
+	fn start_env(root: &Path, name: &str, env: &[(&str, &str)]) -> Self {
 		let mut child = Command::new(env!("CARGO_BIN_EXE_git-fs"))
+			.envs(env.iter().copied())
 			.arg("mcp")
 			.current_dir(root)
 			.env("GIT_FS_DISK", root)
@@ -568,4 +573,148 @@ fn two_peer_candidate_snapshots_are_exact_isolated_and_capability_scoped() {
 	);
 	assert!(!a_path.exists());
 	assert!(!b_path.exists());
+}
+
+/// Lines `<pid> <point> <pass|wait>` the server's test-only checkpoints wrote.
+fn trace(dir: &Path) -> Vec<String> {
+	std::fs::read_to_string(dir.join("trace"))
+		.unwrap_or_default()
+		.lines()
+		.map(str::to_owned)
+		.collect()
+}
+
+/// Event wait, not a timing choice: returns once the server reports `line`.
+fn await_trace(dir: &Path, line: &str) {
+	let deadline = Instant::now() + RPC_TIMEOUT;
+	while !trace(dir).iter().any(|l| l == line) {
+		assert!(
+			Instant::now() < deadline,
+			"never reached {line}: {:?}",
+			trace(dir)
+		);
+		std::thread::yield_now();
+	}
+}
+
+fn release(dir: &Path, point: &str, pid: u32) {
+	std::fs::write(dir.join(format!("{point}.{pid}.go")), "").unwrap();
+}
+
+fn barrier_peers(root: &Path, barrier: &Path, pause: &str) -> (Peer, Peer) {
+	let dir = barrier.to_str().unwrap();
+	let a = Peer::start_env(
+		root,
+		"barrier-a",
+		&[
+			("GITFS_TEST_BARRIER_DIR", dir),
+			("GITFS_TEST_BARRIER_PAUSE", pause),
+		],
+	);
+	let b = Peer::start_env(root, "barrier-b", &[("GITFS_TEST_BARRIER_DIR", dir)]);
+	(a, b)
+}
+
+#[test]
+fn barrier_replays_peer_publication_between_preimage_check_and_live_recheck() {
+	let (_dir, root) = repo();
+	let barrier = tempfile::tempdir().unwrap();
+	let (mut a, mut b) = barrier_peers(&root, barrier.path(), "preimage");
+	let (pa, pb) = (a.child.id(), b.child.id());
+	a.ok("read", json!({"path":"alpha.txt"}));
+	b.ok("read", json!({"path":"alpha.txt"}));
+	let base = git(&root, &["rev-parse", "HEAD"]);
+
+	// Schedule: A passes its handler preimage check and stops before the
+	// locked live re-check; B publishes the same line; A resumes.
+	let refused = std::thread::scope(|scope| {
+		let a_edit = scope.spawn(|| {
+			a.call(
+				"edit",
+				json!({"path":"alpha.txt","old":"before","new":"loser"}),
+			)
+		});
+		await_trace(barrier.path(), &format!("{pa} preimage wait"));
+		b.ok(
+			"edit",
+			json!({"path":"alpha.txt","old":"before","new":"winner"}),
+		);
+		release(barrier.path(), "preimage", pa);
+		a_edit.join().unwrap()
+	});
+	assert_eq!(refused["isError"], true, "{refused}");
+	assert!(
+		refused["content"][0]["text"]
+			.as_str()
+			.unwrap()
+			.contains("live conflict"),
+		"{refused}"
+	);
+	let order: Vec<_> = trace(barrier.path())
+		.into_iter()
+		.filter(|l| l.contains(" preimage ") || l.contains(" publish "))
+		.collect();
+	assert_eq!(
+		order,
+		[
+			format!("{pa} preimage wait"),
+			format!("{pb} preimage pass"),
+			format!("{pb} publish pass"),
+		],
+		"A must never reach publication"
+	);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:alpha.txt"]),
+		"winner"
+	);
+	assert_eq!(git(&root, &["rev-parse", "HEAD"]), base);
+	assert_eq!(
+		std::fs::read_to_string(root.join("alpha.txt")).unwrap(),
+		"before\n"
+	);
+}
+
+#[test]
+fn barrier_holds_peer_behind_locked_publication_then_both_disjoint_edits_land() {
+	let (_dir, root) = repo();
+	let barrier = tempfile::tempdir().unwrap();
+	let (mut a, mut b) = barrier_peers(&root, barrier.path(), "publish");
+	let (pa, pb) = (a.child.id(), b.child.id());
+	a.ok("read", json!({"path":"alpha.txt"}));
+	b.ok("read", json!({"path":"beta.txt"}));
+
+	// Schedule: A holds the repository lock at its ref publication; B's
+	// disjoint edit reaches the lock and must wait; A publishes, then B.
+	std::thread::scope(|scope| {
+		let a_edit =
+			scope.spawn(|| a.ok("edit", json!({"path":"alpha.txt","old":"before","new":"a"})));
+		await_trace(barrier.path(), &format!("{pa} publish wait"));
+		let b_edit =
+			scope.spawn(|| b.ok("edit", json!({"path":"beta.txt","old":"before","new":"b"})));
+		await_trace(barrier.path(), &format!("{pb} preimage pass"));
+		assert!(!trace(barrier.path()).contains(&format!("{pb} publish pass")));
+		release(barrier.path(), "publish", pa);
+		a_edit.join().unwrap();
+		b_edit.join().unwrap();
+	});
+	let publishes: Vec<_> = trace(barrier.path())
+		.into_iter()
+		.filter(|l| l.contains(" publish "))
+		.collect();
+	assert_eq!(
+		publishes,
+		[format!("{pa} publish wait"), format!("{pb} publish pass")]
+	);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:alpha.txt"]),
+		"a"
+	);
+	assert_eq!(
+		git(&root, &["show", "refs/gitfs-live/current:beta.txt"]),
+		"b"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("beta.txt")).unwrap(),
+		"before\n"
+	);
 }

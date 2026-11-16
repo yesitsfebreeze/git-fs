@@ -441,5 +441,14 @@ review-gate hook fixture, exact source SHA/tree comparison, and independent
 Overwatch/hub adapter acceptance contracts, see
 [native integration handoffs](integration-handoffs.md).
 
+Test-only schedule points: a harness that launches `git-fs` with
+`GITFS_TEST_BARRIER_DIR=<dir>` gets one `<pid> <point> <pass|wait>` line per
+reached point in `<dir>/trace`, for `route`, `preimage` (before the locked
+live re-check), `publish` (live ref update, lock held), `snapshot` and `sync`
+(disk/index synchronization). Points listed in `GITFS_TEST_BARRIER_PAUSE`
+(comma-separated) wait until the harness creates `<dir>/<point>.<pid>.go`, at
+most 30 s, then fail closed. Unset, the points do nothing. Never set these on
+a production client.
+
 `just check` runs formatting, Clippy and the Rust tests. `just build` places the
 release binary in `bin/git-fs`, with build artifacts in `~/.cache/git-fs/target`.

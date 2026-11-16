@@ -119,6 +119,7 @@ impl StoreConfig {
 	/// directory inside it) and the runtime store dir under it. A directory
 	/// outside every repository gets a store that is its own git directory.
 	pub fn at(&self, cwd: &Path) -> Result<Store> {
+		checkpoint("route")?;
 		let store = match self.at_readonly(cwd) {
 			Ok(store) => store,
 			Err(_) => self.init_standalone(cwd)?,
@@ -660,6 +661,7 @@ impl Store {
 		if self.git_dir.is_some() {
 			return Err("snapshots require a project Git repository".into());
 		}
+		checkpoint("snapshot")?;
 		let _repo = self.mutation_lock("repository")?;
 		let revision = self
 			.reconcile_live_locked()?
@@ -1508,6 +1510,9 @@ impl Store {
 		mode: &str,
 		explicit_delete: bool,
 	) -> Result<Option<String>> {
+		// The caller's preimage was checked before this lock; the schedule point
+		// lets tests interleave a peer between that check and this re-check.
+		checkpoint("preimage")?;
 		let _repository = self.mutation_lock("repository")?;
 		let previous = self.reconcile_live_locked()?;
 		let parent = previous.clone().or(self.head()?);
@@ -1589,6 +1594,7 @@ impl Store {
 				self.tip(session)?.unwrap_or_default()
 			),
 		)?;
+		checkpoint("publish")?;
 		self.git(&[
 			"update-ref",
 			LIVE_REF,
@@ -2624,6 +2630,7 @@ impl Store {
 	/// a later plain `git commit` undoing it. Independent disk or staged changes,
 	/// and untracked files in the way, are left alone and named in `kept`.
 	pub fn sync_integrated(&self, parent: &str, commit: &str, owned: &[Owned]) -> Result<Value> {
+		checkpoint("sync")?;
 		let _repo = self.mutation_lock("repository")?;
 		self.sync_integrated_locked(parent, commit, owned)
 	}
@@ -3263,4 +3270,41 @@ fn exclude_private(root: &Path, store_dir: &str) {
 	text.push_str(&line);
 	text.push('\n');
 	let _ = std::fs::write(&exclude, text);
+}
+
+/// Test-only deterministic schedule point, inert unless the launching harness
+/// sets GITFS_TEST_BARRIER_DIR. Every point appends `<pid> <point>` to
+/// `trace`; a point named in GITFS_TEST_BARRIER_PAUSE (comma list) then waits
+/// until the harness creates `<point>.<pid>.go`, so a schedule is replayed by
+/// event order, never by timing.
+fn checkpoint(point: &str) -> Result<()> {
+	let Some(dir) = std::env::var_os("GITFS_TEST_BARRIER_DIR") else {
+		return Ok(());
+	};
+	let dir = PathBuf::from(dir);
+	let pid = std::process::id();
+	let pause = std::env::var("GITFS_TEST_BARRIER_PAUSE").unwrap_or_default();
+	let paused = pause.split(',').any(|p| p == point);
+	let go = dir.join(format!("{point}.{pid}.go"));
+	{
+		use std::io::Write;
+		let mut trace = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(dir.join("trace"))
+			.map_err(|e| format!("barrier trace: {e}"))?;
+		let state = if paused { "wait" } else { "pass" };
+		writeln!(trace, "{pid} {point} {state}").map_err(|e| format!("barrier trace: {e}"))?;
+	}
+	if !paused {
+		return Ok(());
+	}
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+	while std::fs::remove_file(&go).is_err() {
+		if std::time::Instant::now() > deadline {
+			return Err(format!("barrier {point} never released"));
+		}
+		std::thread::sleep(std::time::Duration::from_millis(5));
+	}
+	Ok(())
 }

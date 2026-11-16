@@ -130,3 +130,38 @@ Linux Ubuntu pre-integration on exact source tree 3daafc89c775eed6
 max 102,918 us, three expected refusals, zero automatic conflict retries.
 Measurements are non-gating diagnostics, not timing assertions; compiler-
 inclusive test wall time is not per-RPC latency.
+
+## Final same-source acceptance (2026-11-16)
+
+Deterministic schedule points (`GITFS_TEST_BARRIER_DIR`, see the reference
+Development section) now let `concurrent_workflow` replay two in-process
+races by event order: a peer publishing the same line between A's handler
+preimage check and its locked live re-check (A refused with `live conflict`,
+never reaches `publish`), and a disjoint peer held behind A's locked
+publication (both land, in trace order). Git inspects refs, blobs, HEAD and
+disk afterwards.
+
+Live commit 415ebe6d1076f2a66f04a083385b416a915c2db4, tree
+cf690ba4833d6790e9a55321d97deb9c57a36edc. Source and policy blob lists
+(src, tests, Cargo.toml, Cargo.lock, justfile, build.rs; blob ID + path)
+hash to d01665694fab3578eff7fc8cf6d5bb2ae7f0404397c98394b435bbea91d49647 on
+both machines; justfile blob b6169113d69c23aea9a672a64585b58add8c1726,
+Cargo.lock blob 863636809174385827b10069a2fdb95f8321035b. The Linux
+write-tree (d4ed92467afb) differs only by CRLF normalization of vault notes.
+
+- Windows 11 26200, rustc/cargo 1.99.0: fmt, strict Clippy, the eight
+  targeted suites (concurrent_workflow 7/7), full `cargo test` and release
+  build all pass. review_gate runs 0 tests here; that is not Unix coverage.
+- Ubuntu WSL2 6.18, rustc/cargo 1.100.0: strict Clippy, the eight targeted
+  suites, review_gate 1/1, full `cargo test` (193 unit) and release build
+  pass. `cargo fmt --check` FAILS only on the untouched src/mcp.rs and
+  tests/unit/integrate/tests.rs (rustfmt 1.11 vs 1.10, caveat above);
+  repository-wide Unix fmt stays a limitation until the formatter is pinned.
+
+Windows non-gating snapshot, all seven native tests, 13 process lifetimes:
+87 timed stdio RPCs, per-peer p50 400-1,430 ms, max 4,357 ms (a paused
+barrier peer); seven expected fail-closed replies, zero automatic conflict
+retries.
+
+GitHub issue #1 and the Overwatch/hub adoption items above remain open; no
+external post or close was made.
