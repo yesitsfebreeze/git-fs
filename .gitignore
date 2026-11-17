@@ -22,3 +22,10 @@
 .overwatch/*
 !.overwatch/vault/
 .overwatch/vault/.obsidian/
+
+# The overwatch Obsidian plugin keeps its runtime state (the server key, the lock, usage) in the vault; only its config, evidence and the hook record are shared.
+docs/vault/.obsidian/plugins/overwatch
+docs/vault/.overwatch/*
+!docs/vault/.overwatch/config.json
+!docs/vault/.overwatch/evidence/
+!docs/vault/.overwatch/hooks.json
