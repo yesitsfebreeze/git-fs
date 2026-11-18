@@ -66,9 +66,9 @@ fn publication_failure(
 /// How long a shared-index update waits for `.git/index.lock` held by someone
 /// else. Git's own readers (`git status` from an editor, a prompt or the buffer
 /// git provider) take the lock for a few milliseconds to refresh stat data, so
-/// a single attempt refuses whenever one of them is mid-refresh. Git-fs never
-/// holds this lock itself: the integrate commit is built from a tree, not the
-/// index, so the index is only touched by the post-integrate sync, briefly.
+/// a single attempt refuses whenever one of them is mid-refresh. Review and
+/// publication never hold this lock; only the batched post-integrate sync
+/// acquires it, once, while preserving unrelated staged changes.
 const INDEX_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Attempts at a shared-index update: a lock held longer is a real writer, and
 /// the path stays in `kept` instead of blocking every other agent.
@@ -80,6 +80,62 @@ struct MutationLock(std::fs::File);
 impl Drop for MutationLock {
 	fn drop(&mut self) {
 		let _ = self.0.unlock();
+	}
+}
+
+/// Git's index lock is held only for post-publication synchronization, never
+/// for review or committing. One atomic replacement prevents a batch from
+/// overwriting a peer's staging changes between checking and updating a path.
+struct SharedIndexLock {
+	path: PathBuf,
+	file: Option<std::fs::File>,
+	published: bool,
+}
+impl SharedIndexLock {
+	fn acquire(index: &Path) -> Result<Option<Self>> {
+		let mut path = index.as_os_str().to_os_string();
+		path.push(".lock");
+		let path = PathBuf::from(path);
+		for attempt in 0..INDEX_ATTEMPTS {
+			if attempt > 0 {
+				std::thread::sleep(INDEX_PATIENCE / INDEX_ATTEMPTS as u32);
+			}
+			match std::fs::OpenOptions::new()
+				.write(true)
+				.create_new(true)
+				.open(&path)
+			{
+				Ok(file) => {
+					return Ok(Some(Self {
+						path,
+						file: Some(file),
+						published: false,
+					}))
+				}
+				Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+				Err(error) => return Err(format!("cannot acquire shared index lock: {error}")),
+			}
+		}
+		Ok(None)
+	}
+	fn publish(mut self, index: &Path, bytes: &[u8]) -> Result<()> {
+		use std::io::Write;
+		let mut file = self.file.take().ok_or("shared index lock is closed")?;
+		file.write_all(bytes).map_err(|e| e.to_string())?;
+		file.sync_all().map_err(|e| e.to_string())?;
+		drop(file);
+		std::fs::rename(&self.path, index)
+			.map_err(|e| format!("cannot publish shared index: {e}"))?;
+		self.published = true;
+		Ok(())
+	}
+}
+impl Drop for SharedIndexLock {
+	fn drop(&mut self) {
+		drop(self.file.take());
+		if !self.published {
+			let _ = std::fs::remove_file(&self.path);
+		}
 	}
 }
 
@@ -303,20 +359,34 @@ fn run(
 	stdin: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
 	let mut cmd = git_cmd(root, git_dir, args, index)?;
-	if stdin.is_some() {
-		cmd.stdin(Stdio::piped());
-	}
+	cmd.stdin(if stdin.is_some() {
+		Stdio::piped()
+	} else {
+		Stdio::null()
+	});
 	cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 	let mut child = cmd.spawn().map_err(|e| format!("git spawn failed: {e}"))?;
-	if let Some(bytes) = stdin {
-		use std::io::Write;
-		if let Some(mut si) = child.stdin.take() {
-			si.write_all(bytes).map_err(|e| format!("git stdin: {e}"))?;
+	// Batch commands can fill stdout before they finish reading stdin. Drain
+	// output while feeding input, including on Windows' small pipe buffers.
+	let out = std::thread::scope(|scope| -> Result<_> {
+		let writer = stdin.and_then(|bytes| {
+			child.stdin.take().map(|mut input| {
+				scope.spawn(move || {
+					use std::io::Write;
+					input
+						.write_all(bytes)
+						.map_err(|e| format!("git stdin: {e}"))
+				})
+			})
+		});
+		let output = child
+			.wait_with_output()
+			.map_err(|e| format!("git wait failed: {e}"));
+		if let Some(writer) = writer {
+			writer.join().map_err(|_| "git stdin writer panicked")??;
 		}
-	}
-	let out = child
-		.wait_with_output()
-		.map_err(|e| format!("git wait failed: {e}"))?;
+		output
+	})?;
 	if !out.status.success() {
 		let err = String::from_utf8_lossy(&out.stderr);
 		return Err(format!("git {:?} failed: {}", args, err.trim()));
@@ -541,7 +611,7 @@ impl Store {
 			None => None,
 		};
 		if current == trunk {
-			if current.is_none() && self.explicit_live_deletion(rel)? {
+			if current.is_none() && self.explicit_live_deletion(&live, rel)? {
 				return Ok(Some(None));
 			}
 			return Ok(None);
@@ -554,15 +624,12 @@ impl Store {
 
 	/// An explicit deletion remains visible even when deleting a newly added
 	/// file makes its tree identical to HEAD. A rollback deletion is not explicit.
-	fn explicit_live_deletion(&self, rel: &Path) -> Result<bool> {
-		if self.live_tip()?.is_none() {
-			return Ok(false);
-		}
+	fn explicit_live_deletion(&self, live: &str, rel: &Path) -> Result<bool> {
 		let value = self.git_str(&[
 			"log",
 			"-1",
 			"--format=%(trailers:key=Gitfs-Deletion,valueonly)",
-			LIVE_REF,
+			live,
 			"--",
 			&literal(rel),
 		])?;
@@ -649,8 +716,14 @@ impl Store {
 		let mut paths = parse_name_status(&changed);
 		// A newly added file that was subsequently deleted has no net tree
 		// diff against HEAD. Preserve its explicit tombstone for peer searches.
+		// Only explicit deletion commits can contribute these paths. Enumerating
+		// every historical deletion first makes each search launch thousands of
+		// Git probes in repositories with large, unrelated deletion history.
+		// Keep older explicit records too: HEAD advancement does not settle a
+		// tombstone while a stale disk copy may still need hiding.
 		let deleted = self.git(&[
 			"log",
+			"--grep=^Gitfs-Deletion: true$",
 			"--format=",
 			"--name-only",
 			"--diff-filter=D",
@@ -658,13 +731,16 @@ impl Store {
 			"-z",
 			&live,
 		])?;
-		for name in deleted.split(|byte| *byte == 0) {
-			let name = String::from_utf8_lossy(name);
-			let name = name.trim_start_matches(['\r', '\n']);
-			if name.is_empty() || paths.iter().any(|(_, path)| path == name) {
-				continue;
-			}
-			if self.explicit_live_deletion(Path::new(name))? {
+		let mut seen: std::collections::HashSet<String> =
+			paths.iter().map(|(_, path)| path.clone()).collect();
+		for name in deleted
+			.split(|byte| *byte == 0)
+			.filter(|name| !name.is_empty())
+		{
+			let name = std::str::from_utf8(name).map_err(|_| "live path is not UTF-8")?;
+			if seen.insert(name.to_owned())
+				&& self.explicit_live_deletion(&live, Path::new(name))?
+			{
 				paths.push(('D', name.to_owned()));
 			}
 		}
@@ -1438,29 +1514,25 @@ impl Store {
 				None,
 			)?;
 		}
+		let mut updates = Vec::new();
 		for (mode, blob, rel) in adds {
-			run(
-				&self.root,
-				self.git_dir.as_deref(),
-				&[
-					"update-index",
-					"--add",
-					"--cacheinfo",
-					mode,
-					blob,
-					&printable(rel),
-				],
-				Some(&index),
-				None,
-			)?;
+			updates.extend_from_slice(format!("{mode} {blob}\t{}\0", printable(rel)).as_bytes());
 		}
+		// Mode zero removes a path. Match the repository's object-id width.
+		let width = adds
+			.first()
+			.map_or(base_tree.len().max(40), |(_, blob, _)| blob.len());
+		let zero = "0".repeat(width);
 		for rel in removes {
+			updates.extend_from_slice(format!("0 {zero}\t{}\0", printable(rel)).as_bytes());
+		}
+		if !updates.is_empty() {
 			run(
 				&self.root,
 				self.git_dir.as_deref(),
-				&["update-index", "--force-remove", "--", &printable(rel)],
+				&["update-index", "-z", "--index-info"],
 				Some(&index),
-				None,
+				Some(&updates),
 			)?;
 		}
 		let out = run(
@@ -2200,25 +2272,35 @@ impl Store {
 	pub fn stale_paths(&self, session: &str, head: &str) -> Result<Vec<String>> {
 		let reads: HashMap<String, String> = self.load_json(&format!("{session}.reads.json"))?;
 		let fallback = self.merge_base(session)?;
+		let mut moved_by_base = HashMap::<String, std::collections::HashSet<Vec<u8>>>::new();
 		let mut stale = Vec::new();
 		for (_, rel) in self.owned_paths(session)? {
-			let Some(base) = reads.get(&rel).cloned().or_else(|| fallback.clone()) else {
+			let Some(base) = reads.get(&rel).or(fallback.as_ref()) else {
 				continue;
 			};
 			if base == head {
 				continue;
 			}
-			let moved = self.git(&[
-				"diff",
-				"--name-only",
-				"--no-renames",
-				"-z",
-				&base,
-				head,
-				"--",
-				&literal(Path::new(&rel)),
-			])?;
-			if !moved.is_empty() {
+			if !moved_by_base.contains_key(base) {
+				let moved = self.git(&[
+					"diff",
+					"--name-only",
+					"--no-renames",
+					"-z",
+					base,
+					head,
+					"--",
+				])?;
+				moved_by_base.insert(
+					base.clone(),
+					moved
+						.split(|b| *b == 0)
+						.filter(|p| !p.is_empty())
+						.map(|p| p.to_vec())
+						.collect(),
+				);
+			}
+			if moved_by_base[base].contains(rel.as_bytes()) {
 				stale.push(rel);
 			}
 		}
@@ -2354,6 +2436,8 @@ impl Store {
 	/// path trunk moved since the session read it, so there is nothing to
 	/// reconcile here.
 	fn overlay_onto(&self, session: &str, head_tree: &str, owned: &[Owned]) -> Result<String> {
+		let tip = self.tip(session)?.ok_or("session has no overlay")?;
+		let entries = self.entries_at(&tip)?;
 		let mut adds = Vec::new();
 		let mut removes = Vec::new();
 		for (status, rel) in owned {
@@ -2362,10 +2446,10 @@ impl Store {
 				removes.push(path);
 				continue;
 			}
-			let (blob, mode) = self
-				.blob_for(session, &path)?
+			let (mode, blob) = entries
+				.get(rel.as_bytes())
 				.ok_or_else(|| format!("{rel} is owned but missing from the session branch"))?;
-			adds.push((mode, blob, path));
+			adds.push((mode.clone(), blob.clone(), path));
 		}
 		self.apply(session, head_tree, &adds, &removes)
 	}
@@ -2670,113 +2754,160 @@ impl Store {
 	}
 
 	fn sync_integrated_locked(&self, parent: &str, commit: &str, owned: &[Owned]) -> Result<Value> {
+		let index = self.shared_index()?;
+		let Some(lock) = SharedIndexLock::acquire(&index)? else {
+			return Ok(
+				json!({"synced": [], "kept": owned.iter().map(|(_, path)| path).collect::<Vec<_>>()}),
+			);
+		};
+		// Snapshot the index only after taking Git's lock. All checks and the
+		// batched update use this private copy; a peer's staged paths survive.
+		let private = self
+			.dir
+			.join(format!("integration-sync-{}.idx", std::process::id()));
+		match std::fs::copy(&index, &private) {
+			Ok(_) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				match std::fs::remove_file(&private) {
+					Ok(()) => {}
+					Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+					Err(e) => return Err(e.to_string()),
+				}
+				run(
+					&self.root,
+					self.git_dir.as_deref(),
+					&["read-tree", "--empty"],
+					Some(&private),
+					None,
+				)?;
+			}
+			Err(error) => return Err(format!("cannot snapshot shared index: {error}")),
+		}
+		let changed = |revision: &str| -> Result<std::collections::HashSet<Vec<u8>>> {
+			let bytes = run(
+				&self.root,
+				self.git_dir.as_deref(),
+				&[
+					"diff",
+					"--cached",
+					"--name-only",
+					"--no-renames",
+					"-z",
+					revision,
+					"--",
+				],
+				Some(&private),
+				None,
+			)?;
+			Ok(bytes
+				.split(|b| *b == 0)
+				.filter(|p| !p.is_empty())
+				.map(|p| p.to_vec())
+				.collect())
+		};
+		let from_parent = changed(parent)?;
+		let from_commit = changed(commit)?;
+		let entries = self.entries_at(commit)?;
+		let mut updates = Vec::new();
 		let mut synced = Vec::new();
 		let mut kept = Vec::new();
 		for (status, rel) in owned {
 			let path = Path::new(rel);
-			let spec = literal(path);
-			let index_unchanged = self
-				.git(&["diff", "--cached", "--quiet", parent, "--", &spec])
-				.is_ok();
-			let entry = self.entry_at(commit, path)?;
-			let materialized = match &entry {
-				Some((_, sha)) => {
-					std::fs::symlink_metadata(self.root.join(path)).is_ok_and(|m| m.is_file())
-						&& std::fs::read(self.root.join(path)).ok()
-							== Some(self.git(&["cat-file", "blob", sha])?)
+			let disk = self.root.join(path);
+			let entry = entries.get(rel.as_bytes());
+			let content = entry
+				.map(|(_, sha)| self.git(&["cat-file", "blob", sha]))
+				.transpose()?;
+			let materialized = match &content {
+				Some(bytes) => {
+					std::fs::symlink_metadata(&disk).is_ok_and(|m| m.is_file())
+						&& std::fs::read(&disk).ok().as_ref() == Some(bytes)
 				}
-				None if *status == 'D' => std::fs::symlink_metadata(self.root.join(path))
+				None if *status == 'D' => std::fs::symlink_metadata(&disk)
 					.is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
 				None => false,
 			};
-			// Idempotent after a lost synchronization ACK: exact index AND disk
-			// already at the commit are safe, including completed deletions.
-			if materialized
-				&& self
-					.git(&["diff", "--cached", "--quiet", commit, "--", &spec])
-					.is_ok()
-			{
+			if materialized && !from_commit.contains(rel.as_bytes()) {
 				synced.push(rel.clone());
 				continue;
 			}
-			if index_unchanged && materialized {
-				let done = match entry {
-					Some((mode, sha)) => self.index_update(&[
-						"update-index",
-						"--add",
-						"--cacheinfo",
-						&format!("{mode},{sha},{}", printable(path)),
-					]),
-					None => self.index_update(&[
-						"update-index",
-						"--force-remove",
-						"--",
-						&printable(path),
-					]),
-				};
-				if done {
-					synced.push(rel.clone());
-				} else {
-					kept.push(rel.clone());
-				}
-				continue;
-			}
-			let untouched = index_unchanged
-				&& self.git(&["diff", "--quiet", parent, "--", &spec]).is_ok()
-				&& (*status != 'A' || !self.root.join(path).exists());
-			let done = untouched && self.sync_path(commit, *status, path);
-			if done {
-				synced.push(rel.clone());
-			} else {
+			if from_parent.contains(rel.as_bytes()) {
 				kept.push(rel.clone());
+				continue;
 			}
+			if !materialized {
+				// Retain Git's filter/mode-aware check immediately before a disk
+				// write. Already materialized paths need no per-file diff.
+				let untouched = (*status != 'A' || !disk.exists())
+					&& run(
+						&self.root,
+						self.git_dir.as_deref(),
+						&["diff", "--quiet", parent, "--", &literal(path)],
+						Some(&private),
+						None,
+					)
+					.is_ok();
+				let written = untouched
+					&& match (&entry, &content) {
+						(Some((mode, _)), Some(bytes)) => {
+							self.write_disk(&disk, bytes, mode).is_ok()
+						}
+						(None, None) if *status == 'D' => match std::fs::remove_file(&disk) {
+							Ok(()) => true,
+							Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+						},
+						_ => false,
+					};
+				if !written {
+					kept.push(rel.clone());
+					continue;
+				}
+			}
+			match entry {
+				Some((mode, sha)) => {
+					updates.extend_from_slice(format!("{mode} {sha}\t{rel}\0").as_bytes())
+				}
+				None => updates.extend_from_slice(
+					format!("0 {}\t{rel}\0", "0".repeat(commit.len())).as_bytes(),
+				),
+			}
+			synced.push(rel.clone());
+		}
+		if !updates.is_empty() {
+			run(
+				&self.root,
+				self.git_dir.as_deref(),
+				&["update-index", "-z", "--index-info"],
+				Some(&private),
+				Some(&updates),
+			)?;
+			lock.publish(&index, &std::fs::read(&private).map_err(|e| e.to_string())?)?;
 		}
 		Ok(json!({"synced": synced, "kept": kept}))
 	}
 
-	/// Put one integrated path on disk and in the shared index. Deletion removes
-	/// the index record first and then the file; anything else writes the blob's
-	/// exact bytes and stages that blob by sha, never by re-reading the worktree.
-	fn sync_path(&self, commit: &str, status: char, path: &Path) -> bool {
-		let spec = printable(path);
-		if status == 'D' {
-			return self.index_update(&["update-index", "--force-remove", "--", &spec])
-				&& match std::fs::remove_file(self.root.join(path)) {
-					Ok(()) => true,
-					Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-				};
-		}
-		let Some((mode, sha)) = self.entry_at(commit, path).ok().flatten() else {
-			return false;
-		};
-		let Ok(content) = self.git(&["cat-file", "blob", &sha]) else {
-			return false;
-		};
-		if self
-			.write_disk(&self.root.join(path), &content, &mode)
-			.is_err()
-		{
-			return false;
-		}
-		self.index_update(&[
-			"update-index",
-			"--add",
-			"--cacheinfo",
-			&format!("{mode},{sha},{spec}"),
-		])
-	}
-
-	/// Update the shared index through plumbing, retrying while another git
-	/// process holds `.git/index.lock` for a few milliseconds. Failing leaves
-	/// the path in `kept`; it never blocks another agent's git command.
-	fn index_update(&self, args: &[&str]) -> bool {
-		let pause = INDEX_PATIENCE / INDEX_ATTEMPTS as u32;
-		(0..INDEX_ATTEMPTS).any(|attempt| {
-			if attempt > 0 {
-				std::thread::sleep(pause);
+	/// Read immutable tree metadata once for operations over many paths.
+	fn entries_at(&self, rev: &str) -> Result<HashMap<Vec<u8>, (String, String)>> {
+		let listing = self.git(&["ls-tree", "-rz", "--full-tree", rev])?;
+		let mut entries = HashMap::new();
+		for row in listing.split(|b| *b == 0).filter(|row| !row.is_empty()) {
+			let tab = row
+				.iter()
+				.position(|b| *b == b'\t')
+				.ok_or("invalid Git tree entry")?;
+			let header = std::str::from_utf8(&row[..tab]).map_err(|e| e.to_string())?;
+			let fields: Vec<_> = header.split_whitespace().collect();
+			if fields.len() != 3 {
+				return Err("invalid Git tree entry".into());
 			}
-			self.git(args).is_ok()
-		})
+			if fields[1] == "blob" {
+				entries.insert(
+					row[tab + 1..].to_vec(),
+					(fields[0].to_owned(), fields[2].to_owned()),
+				);
+			}
+		}
+		Ok(entries)
 	}
 
 	/// The (mode, blob) a revision holds for a path.

@@ -118,6 +118,15 @@ fn verify_checkout(root: &Path, commit: &str, tree: &str, entries: &[TreeFile]) 
 		return Err("candidate checkout tree differs from integration review".into());
 	}
 	let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+	let index = super::run(root, None, &["ls-files", "--stage", "-z"], None, None)?;
+	let stages: std::collections::HashSet<_> = index
+		.split(|b| *b == 0)
+		.filter(|row| !row.is_empty())
+		.collect();
+	if stages.len() != entries.len() {
+		return Err("candidate checkout has unexpected Git index entries".into());
+	}
+	let mut paths = Vec::new();
 	for file in entries {
 		let path = root.join(&file.path);
 		let metadata = fs::symlink_metadata(&path)
@@ -135,16 +144,22 @@ fn verify_checkout(root: &Path, commit: &str, tree: &str, entries: &[TreeFile]) 
 		{
 			return Err(format!("candidate file {} escapes checkout", file.path));
 		}
-		let actual = git_at(root, &["hash-object", "--no-filters", "--", &file.path])?;
-		if actual != file.oid {
-			return Err(format!(
-				"candidate file {} was transformed by checkout/EOL/filter",
-				file.path
-			));
+		// --stdin-paths accepts Git's C-style quoted paths. Quote control bytes
+		// and quotes explicitly; NUL-framed index records keep names literal.
+		paths.push(b'"');
+		for byte in file.path.bytes() {
+			match byte {
+				b'"' | b'\\' => {
+					paths.push(b'\\');
+					paths.push(byte);
+				}
+				0..=31 | 127 => paths.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+				_ => paths.push(byte),
+			}
 		}
-		let stage = git_at(root, &["ls-files", "--stage", "--", &file.path])?;
-		let expected = format!("{} {} 0\t", file.mode, file.oid);
-		if !stage.starts_with(&expected) || stage.lines().count() != 1 {
+		paths.extend_from_slice(b"\"\n");
+		let expected = format!("{} {} 0\t{}", file.mode, file.oid, file.path);
+		if !stages.contains(expected.as_bytes()) {
 			return Err(format!(
 				"candidate file {} has unexpected Git mode/index",
 				file.path
@@ -160,6 +175,26 @@ fn verify_checkout(root: &Path, commit: &str, tree: &str, entries: &[TreeFile]) 
 					file.path
 				));
 			}
+		}
+	}
+	let hashes = super::run(
+		root,
+		None,
+		&["hash-object", "--no-filters", "--stdin-paths"],
+		None,
+		Some(&paths),
+	)?;
+	let hashes = std::str::from_utf8(&hashes).map_err(|e| e.to_string())?;
+	let hashes: Vec<_> = hashes.lines().collect();
+	if hashes.len() != entries.len() {
+		return Err("candidate hash result count differs from tree".into());
+	}
+	for (file, actual) in entries.iter().zip(hashes) {
+		if actual != file.oid {
+			return Err(format!(
+				"candidate file {} was transformed by checkout/EOL/filter",
+				file.path
+			));
 		}
 	}
 	if !git_at(root, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
