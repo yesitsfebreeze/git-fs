@@ -13,11 +13,15 @@ struct Server {
 
 impl Server {
 	fn new(root: &Path) -> Self {
+		Self::with_session(root, "items-test")
+	}
+
+	fn with_session(root: &Path, session: &str) -> Self {
 		let mut child = Command::new(env!("CARGO_BIN_EXE_git-fs"))
 			.arg("mcp")
 			.current_dir(root)
 			.env("GIT_FS_DISK", root)
-			.env("GIT_FS_SESSION", "items-test")
+			.env("GIT_FS_SESSION", session)
 			.env("GIT_FS_CONFIG", "{}")
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
@@ -160,6 +164,158 @@ fn single_calls_and_multiple_reads_edits_and_materializations_share_freshness() 
 	);
 	for file in ["a.txt", "b.txt"] {
 		assert_eq!(std::fs::read_to_string(root.join(file)).unwrap(), "after\n");
+	}
+}
+
+#[test]
+fn native_write_and_edit_argument_names_are_accepted() {
+	let dir = repo();
+	let root = dir.path().canonicalize().unwrap();
+	let mut server = Server::new(&root);
+	server.ok("write", json!({"path": "new.txt", "content": "native\n"}));
+	server.ok("read", json!({"path": "a.txt"}));
+	server.ok(
+		"edit",
+		json!({"path": "a.txt", "old_string": "before", "new_string": "after"}),
+	);
+	server.ok("read", json!({"path": "b.txt"}));
+	server.ok(
+		"edit",
+		json!({"path": "b.txt", "oldText": "before", "newText": "twice", "replace_all": true}),
+	);
+	server.ok(
+		"gitfs_materialize",
+		json!({"paths": ["new.txt", "a.txt", "b.txt"]}),
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("new.txt")).unwrap(),
+		"native\n"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("a.txt")).unwrap(),
+		"after\n"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("b.txt")).unwrap(),
+		"twice\n"
+	);
+	let conflicting_write = server.call(
+		"write",
+		json!({"path": "new.txt", "text": "one", "content": "two"}),
+	);
+	assert_eq!(conflicting_write["isError"], true);
+	let conflicting_edit = server.call(
+		"edit",
+		json!({"path": "a.txt", "old": "after", "old_string": "before", "new": "x"}),
+	);
+	assert_eq!(conflicting_edit["isError"], true);
+}
+
+#[test]
+fn whitespace_folded_edit_applies_once_and_reports_the_line() {
+	let dir = repo();
+	let root = dir.path().canonicalize().unwrap();
+	let mut server = Server::new(&root);
+	server.ok(
+		"write",
+		json!({"path": "ws.txt", "content": "one\nlet x = 1;  \ntwo\n"}),
+	);
+	server.ok("read", json!({"path": "ws.txt"}));
+	let edited = server.ok(
+		"edit",
+		json!({"path": "ws.txt", "old": "let x = 1;\n", "new": "let x = 2;\n"}),
+	);
+	let message = edited["content"][0]["text"].as_str().unwrap();
+	assert!(message.contains("whitespace folded at line 2"), "{message}");
+	server.ok("gitfs_materialize", json!({"paths": ["ws.txt"]}));
+	assert_eq!(
+		std::fs::read_to_string(root.join("ws.txt")).unwrap(),
+		"one\nlet x = 2;\ntwo\n"
+	);
+	server.ok(
+		"write",
+		json!({"path": "twice.txt", "content": "a b\na  b\n"}),
+	);
+	server.ok("read", json!({"path": "twice.txt"}));
+	let refused = server.call(
+		"edit",
+		json!({"path": "twice.txt", "old": "a\tb\n", "new": "c\n"}),
+	);
+	assert_eq!(refused["isError"], true);
+	let message = refused["content"][0]["text"].as_str().unwrap();
+	assert!(
+		message.contains("folding whitespace matches 2 places"),
+		"{message}"
+	);
+}
+
+#[test]
+fn a_private_commit_equal_to_live_does_not_block_the_next_edit() {
+	let dir = repo();
+	let root = dir.path().canonicalize().unwrap();
+	let mut session = Server::with_session(&root, "peer-s");
+	let mut peer = Server::with_session(&root, "peer-a");
+	session.ok("read", json!({"path": "a.txt"}));
+	session.ok("write", json!({"path": "a.txt", "text": "A\n"}));
+	session.ok("read", json!({"path": "a.txt"}));
+	session.ok("write", json!({"path": "a.txt", "text": "B\n"}));
+	peer.ok("read", json!({"path": "a.txt"}));
+	peer.ok("write", json!({"path": "a.txt", "text": "C\n"}));
+	session.ok("read", json!({"path": "a.txt"}));
+	// The session branch moves from B to C; live already holds C, so no live
+	// commit names this newer tip. The private bytes equal live, so the next
+	// edit is not blocked by an unpublished copy.
+	session.ok("write", json!({"path": "a.txt", "text": "C\n"}));
+	let edited = session.ok("edit", json!({"path": "a.txt", "old": "C\n", "new": "D\n"}));
+	assert_eq!(edited["isError"], false);
+	session.ok("gitfs_materialize", json!({"paths": ["a.txt"]}));
+	assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "D\n");
+}
+
+#[test]
+fn whole_reads_answer_up_to_two_thousand_lines() {
+	let dir = repo();
+	let root = dir.path().canonicalize().unwrap();
+	let mut server = Server::new(&root);
+	let long = (1..=2000)
+		.map(|i| format!("line {i}\n"))
+		.collect::<String>();
+	server.ok("write", json!({"path": "long.txt", "content": long}));
+	let read = server.ok("read", json!({"path": "long.txt"}));
+	let text = read["content"][0]["text"].as_str().unwrap();
+	assert!(
+		text.contains("2000:line 2000"),
+		"{}",
+		&text[text.len().saturating_sub(200)..]
+	);
+	let too_long = (1..=2001)
+		.map(|i| format!("line {i}\n"))
+		.collect::<String>();
+	server.ok(
+		"write",
+		json!({"path": "too-long.txt", "content": too_long}),
+	);
+	let refused = server.call("read", json!({"path": "too-long.txt"}));
+	assert_eq!(refused["isError"], true);
+	let message = refused["content"][0]["text"].as_str().unwrap();
+	assert!(message.contains("over the 2000 allowed"), "{message}");
+}
+
+#[test]
+fn batch_results_carry_elapsed_time() {
+	let dir = repo();
+	let root = dir.path().canonicalize().unwrap();
+	let mut server = Server::new(&root);
+	let reads = content(&server.ok(
+		"read",
+		json!({"items": [{"path": "a.txt"}, {"path": "b.txt"}], "concurrency": 2}),
+	));
+	for index in 0..2 {
+		assert!(
+			reads["results"][index]["elapsed_ms"].is_u64(),
+			"{}",
+			reads["results"][index]
+		);
 	}
 }
 

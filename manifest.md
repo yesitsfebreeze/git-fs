@@ -471,7 +471,7 @@
     },
     "max_whole_read_lines": {
       "type": "integer",
-      "default": 350,
+      "default": 2000,
       "min": 1,
       "max": 5000000,
       "doc": "Lines a file may have before a read with neither offset nor limit is refused and pointed at a range or a grep."
@@ -524,6 +524,13 @@
       "min": 100,
       "max": 3600000,
       "doc": "How long a search may run before it is stopped."
+    },
+    "max_batch_wait_ms": {
+      "type": "integer",
+      "default": 100000,
+      "min": 100,
+      "max": 600000,
+      "doc": "How long a multiple-item read, glob, grep or search call may run before unfinished items answer as deadline results and unstarted items are skipped. Keep it below the client's own tool deadline."
     },
     "max_search_backend_bytes": {
       "type": "integer",

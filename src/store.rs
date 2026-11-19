@@ -580,6 +580,17 @@ impl Store {
 		}
 	}
 
+	/// File content on this session's branch, or None when it has no such path.
+	pub fn session_content(&self, session: &str, rel: &Path) -> Result<Option<Vec<u8>>, String> {
+		let Some(tip) = self.tip(session)? else {
+			return Ok(None);
+		};
+		match self.entry_at(&tip, rel)? {
+			Some((_, blob)) => self.git(&["cat-file", "blob", &blob]).map(Some),
+			None => Ok(None),
+		}
+	}
+
 	/// The latest published private tip for this session is recorded in the
 	/// shared commit. A private write made since then is not silently replaced
 	/// by an edit of the shared view.
@@ -605,16 +616,22 @@ impl Store {
 			if overlay.is_empty() || self.tip(session)?.as_deref() == Some(overlay) {
 				return Ok(false);
 			}
-			return self
-				.git(&[
-					"diff",
-					"--name-only",
-					overlay,
-					&self.branch(session),
-					"--",
-					&literal(rel),
-				])
-				.map(|paths| !paths.is_empty());
+			let unpublished = self.git(&[
+				"diff",
+				"--name-only",
+				overlay,
+				&self.branch(session),
+				"--",
+				&literal(rel),
+			])?;
+			if unpublished.is_empty() {
+				return Ok(false);
+			}
+			// Bytes the live revision already carries are published in effect,
+			// even when no live commit names this session's newer tip: a
+			// reconcile may have merged them into a commit without an overlay
+			// line. Only a copy live does not hold is unpublished.
+			return Ok(self.live_content(rel)? != self.session_content(session, rel)?);
 		}
 		Ok(false)
 	}

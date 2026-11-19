@@ -19,7 +19,7 @@ working tree, index, or reviewed `main` branch.
 - **Collaborate live.** Reads and searches see the shared commit; independent edits merge, conflicting edits refuse without overwriting a peer.
 - **Keep ownership.** Session branches still record provenance, rollback, and review history.
 - **Build independently.** `gitfs_snapshot` creates a detached worktree pinned to one exact live commit.
-- **Review before release.** Integration and remote push remain separate, guarded operations.
+- **Review before release.** Integration and remote push remain separate, guarded operations. A change planned as stacked pull requests maps onto one ordered series of integrations and branch pushes from a single session; see [stacked pull requests](docs/stacked-prs.md).
 - **Batch work.** Every tool accepts one item or an `items` array; read/search items run concurrently.
 
 ## Install

@@ -3,8 +3,10 @@
 ## What you get
 
 - **Guarded writes.** `write`, `edit` and `delete` are refused unless the bytes the
-  session last read are still current. A whole-file read of more than 350 lines
-  is refused; read a range or grep. `edit` replaces one exact unique match, all
+  session last read are still current. A whole-file read of more than 2000 lines
+  is refused; read a range or grep. A read that races a peer publication retries
+  up to three times and then names the ref that moved, rather than sending the
+  caller back to repeat the call. `edit` replaces one exact unique match, all
   matches with `all`, or an `edits` array in one all-or-nothing commit. When a
   sibling agent's committed revision (on trunk or its session branch) reaches
   the shared worktree after this session's read, `edit` rebases onto it if its
@@ -169,7 +171,12 @@ true if an item failed. Single-item calls keep their original response shape;
 even a one-element `items` array returns the multiple-item response.
 
 `read`, `glob`, `grep` and `search` run independent items concurrently (four by
-default; `concurrency` may be 1–8). They continue after individual errors.
+default; `concurrency` may be 1–8). They continue after individual errors. The
+whole call shares one budget, `max_batch_wait_ms` (100 s by default, below the
+client's own tool deadline). Every result carries `elapsed_ms`; an item still
+running when the budget expires answers as a deadline result with
+`deadline: true`, and items that never started are `skipped: true`, so the call
+returns instead of being cut off by the client.
 Every other tool executes items sequentially and stops at the first error;
 remaining entries have `skipped: true`. Successful earlier operations remain
 applied. Inspect every result and retry only what is needed.
@@ -264,6 +271,10 @@ Saving a session branch, materializing files, integrating a trunk commit and
 pushing a remote ref are separate outcomes. Stop leaves disk untouched. Integration
 returns `push: false`. Finish a requested delivery by pushing the exact integrated
 commit and observing a confirmed remote receipt.
+
+A change planned as stacked pull requests maps onto an ordered series of
+integrations and branch pushes from one session; see [stacked pull
+requests](stacked-prs.md) for the sequence and its limits.
 
 Integration recovery uses the preview's `expected_revision` as its immutable
 operation ID. Before publishing a reviewed ref transaction, git-fs durably

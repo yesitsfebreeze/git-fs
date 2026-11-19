@@ -1,9 +1,13 @@
 //! Per-tool multiple-item calls. Read-only file operations may run concurrently;
 //! mutations run in order and stop after the first failure.
 use crate::service::Context;
+use futures::future::{join_all, LocalBoxFuture};
+use futures::FutureExt;
+#[cfg(test)]
 use futures::{stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 const MAX_ITEMS: usize = 32;
 const MAX_CONCURRENCY: usize = 8;
@@ -52,7 +56,7 @@ pub fn describe(tool: &str, mut description: Value) -> Value {
 		"oneOf": [single, multiple]
 	});
 	let behavior = if parallel(tool) {
-		"Items run concurrently (default 4, maximum 8); results stay in input order."
+		"Items run concurrently (default 4, maximum 8) under one batch budget; results stay in input order and carry elapsed_ms. An item still running at the budget answers as a deadline result, and later items are skipped."
 	} else {
 		"Items run sequentially and stop on the first error; remaining items are reported as skipped."
 	};
@@ -105,11 +109,64 @@ fn parse(tool: &str, input: Value) -> Result<Input, String> {
 	Ok(input)
 }
 
+#[cfg(test)]
 async fn collect<F: std::future::Future<Output = Value>>(
 	jobs: impl IntoIterator<Item = F>,
 	concurrency: usize,
 ) -> Vec<Value> {
 	stream::iter(jobs).buffered(concurrency).collect().await
+}
+
+/// Run read-only items with at most `concurrency` in flight under one wall-clock
+/// budget. A later item never starts after the budget; an item still running when
+/// it expires answers as a deadline result, so the whole call returns inside the
+/// client's own tool deadline.
+async fn bounded(
+	mut jobs: Vec<LocalBoxFuture<'static, Value>>,
+	concurrency: usize,
+	budget: Duration,
+) -> Vec<Value> {
+	let budget_ms = budget.as_millis() as u64;
+	let deadline = Instant::now() + budget;
+	let mut results = Vec::with_capacity(jobs.len());
+	let mut next = 0;
+	for chunk in jobs.chunks_mut(concurrency) {
+		let first = next;
+		next += chunk.len();
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		if remaining.is_zero() {
+			for offset in 0..chunk.len() {
+				results.push(json!({
+					"index": first + offset,
+					"skipped": true,
+					"elapsed_ms": 0,
+					"result": {"error": true, "content": "skipped: the batch deadline passed before this item started"}
+				}));
+			}
+			continue;
+		}
+		let finished = join_all(chunk.iter_mut().enumerate().map(|(offset, job)| {
+			let index = first + offset;
+			async move {
+				let began = Instant::now();
+				match tokio::time::timeout(remaining, job).await {
+					Ok(mut value) => {
+						value["elapsed_ms"] = json!(began.elapsed().as_millis() as u64);
+						value
+					}
+					Err(_) => json!({
+						"index": index,
+						"deadline": true,
+						"elapsed_ms": began.elapsed().as_millis() as u64,
+						"result": {"error": true, "content": format!("deadline: item exceeded the {budget_ms} ms batch budget; rerun it alone")}
+					}),
+				}
+			}
+		}))
+		.await;
+		results.extend(finished);
+	}
+	results
 }
 
 pub async fn run(tool: &str, input: Value, context: &Context) -> Result<Value, String> {
@@ -123,25 +180,41 @@ pub async fn run(tool: &str, input: Value, context: &Context) -> Result<Value, S
 		child.validate()?;
 		children.push(child);
 	}
-	let jobs = input.items.into_iter().zip(children).enumerate().map(
-		|(index, (arguments, child))| async move {
-			let result = crate::call_single(tool, Value::Object(arguments), &child)
-				.await
-				.unwrap_or_else(crate::tool_result::failure);
-			json!({"index": index, "result": result})
-		},
-	);
+	let jobs: Vec<LocalBoxFuture<'static, Value>> = input
+		.items
+		.into_iter()
+		.zip(children)
+		.enumerate()
+		.map(|(index, (arguments, child))| {
+			let tool = tool.to_owned();
+			async move {
+				let result = crate::call_single(&tool, Value::Object(arguments), &child)
+					.await
+					.unwrap_or_else(crate::tool_result::failure);
+				json!({"index": index, "result": result})
+			}
+			.boxed_local()
+		})
+		.collect();
 	let results = if parallel(tool) {
-		collect(jobs, input.concurrency.unwrap_or(4)).await
+		let budget = crate::fs()?.service.config.max_batch_wait_ms;
+		bounded(
+			jobs,
+			input.concurrency.unwrap_or(4),
+			Duration::from_millis(budget),
+		)
+		.await
 	} else {
 		let mut stopped = false;
 		let mut results = Vec::new();
-		for (index, job) in jobs.enumerate() {
+		for (index, job) in jobs.into_iter().enumerate() {
 			if stopped {
-				results.push(json!({"index": index, "skipped": true,
+				results.push(json!({"index": index, "skipped": true, "elapsed_ms": 0,
 					"result": {"error": true, "content": "skipped after an earlier item failed"}}));
 			} else {
-				let result = job.await;
+				let began = Instant::now();
+				let mut result = job.await;
+				result["elapsed_ms"] = json!(began.elapsed().as_millis() as u64);
 				stopped = result["result"]["error"] == true;
 				results.push(result);
 			}
@@ -189,6 +262,31 @@ mod tests {
 			.unwrap();
 		assert_eq!(results, (0..6).map(|i| json!(i)).collect::<Vec<_>>());
 		assert_eq!(peak.load(Ordering::SeqCst), 2);
+	}
+
+	#[tokio::test]
+	async fn a_slow_item_is_cut_at_the_budget_and_later_items_are_skipped() {
+		let jobs: Vec<LocalBoxFuture<'static, Value>> = vec![
+			async { json!({"index": 0, "result": {"error": false, "content": "ok"}}) }
+				.boxed_local(),
+			async {
+				tokio::time::sleep(Duration::from_secs(30)).await;
+				json!({"index": 1})
+			}
+			.boxed_local(),
+			async { json!({"index": 2, "result": {"error": false, "content": "ok"}}) }
+				.boxed_local(),
+		];
+		let began = Instant::now();
+		let results = bounded(jobs, 1, Duration::from_millis(100)).await;
+		assert!(
+			began.elapsed() < Duration::from_secs(5),
+			"the call waited for the slow item"
+		);
+		assert!(results[0]["elapsed_ms"].is_u64(), "{}", results[0]);
+		assert_eq!(results[1]["deadline"], true, "{}", results[1]);
+		assert_eq!(results[2]["skipped"], true, "{}", results[2]);
+		assert_eq!(results.len(), 3);
 	}
 
 	#[test]
