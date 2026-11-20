@@ -208,6 +208,85 @@ fn read_failures_report_partial_success_and_preserve_failed_overlay() {
 }
 
 #[test]
+fn bulk_capture_commits_a_move_once_and_is_idempotent() {
+	let dir = tempfile::tempdir().unwrap();
+	git(dir.path(), &["init", "-q"]);
+	std::fs::create_dir(dir.path().join("old")).unwrap();
+	for n in 0..40 {
+		std::fs::write(dir.path().join("old").join(format!("f{n}")), "before\n").unwrap();
+	}
+	git(dir.path(), &["add", "."]);
+	git(
+		dir.path(),
+		&["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+	);
+	let store = StoreConfig::new(".kern/gitfs").at(dir.path()).unwrap();
+	let head = git(dir.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::create_dir(dir.path().join("new")).unwrap();
+	let mut paths = Vec::new();
+	for n in 0..40 {
+		std::fs::remove_file(dir.path().join("old").join(format!("f{n}"))).unwrap();
+		std::fs::write(dir.path().join("new").join(format!("f{n}")), "after\n").unwrap();
+		paths.push(format!("old/f{n}"));
+		paths.push(format!("new/f{n}"));
+	}
+	let out = dispatch(&store, "s", &json!({"op":"capture","paths":paths})).unwrap();
+	assert_eq!(out["error"], false, "{out}");
+	assert_eq!(payload(out)["captured"].as_array().unwrap().len(), 80);
+	assert_eq!(
+		git(
+			dir.path(),
+			&["rev-list", "--count", &format!("{head}..refs/gitfs/s")]
+		),
+		"1\n"
+	);
+	assert_eq!(
+		git(
+			dir.path(),
+			&[
+				"rev-list",
+				"--count",
+				&format!("{head}..refs/gitfs-live/current")
+			]
+		),
+		"1\n"
+	);
+	assert_eq!(
+		store.read("s", Path::new("new/f0")).unwrap().unwrap(),
+		b"after\n"
+	);
+	assert!(store.read("s", Path::new("old/f0")).unwrap().is_none());
+	let tip = store.tip("s").unwrap();
+	let out = dispatch(
+		&store,
+		"s",
+		&json!({"op":"capture","paths":["new/f0","old/f0"]}),
+	)
+	.unwrap();
+	assert_eq!(payload(out)["captured"], json!([]));
+	assert_eq!(store.tip("s").unwrap(), tip);
+}
+
+#[test]
+fn bulk_capture_reports_per_path_errors_beside_adopted_paths() {
+	let (dir, store) = fixture();
+	std::fs::remove_file(dir.path().join("A")).unwrap();
+	std::fs::remove_file(dir.path().join("B")).unwrap();
+	std::fs::create_dir(dir.path().join("B")).unwrap();
+	let out = dispatch(&store, "s", &json!({"op":"capture"})).unwrap();
+	assert_eq!(out["error"], true);
+	let out = payload(out);
+	assert_eq!(out["captured"], json!(["A"]));
+	assert_eq!(out["errors"].as_array().unwrap().len(), 1);
+	assert!(out["errors"][0].as_str().unwrap().starts_with("B: "));
+	assert!(store.read("s", Path::new("A")).unwrap().is_none());
+	assert_eq!(
+		store.read("s", Path::new("B")).unwrap().unwrap(),
+		b"overlay-B"
+	);
+}
+
+#[test]
 fn selected_capture_records_only_new_commits_and_retains_partial_evidence() {
 	let (dir, store) = fixture();
 	let mut capture = crate::provenance::Capture::from_context(&json!({"session":"s"})).unwrap();

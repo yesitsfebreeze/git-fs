@@ -9,7 +9,6 @@
 #[path = "inspection.rs"]
 mod inspection;
 
-use crate::change_record::Operation;
 use crate::provenance::{Capture, Recorder};
 use crate::store::StoreConfig;
 use crate::tool_result::success as ok;
@@ -269,6 +268,7 @@ fn capture_paths(
 			.collect::<Result<_>>()?,
 		None => owned.iter().map(|(_, path)| path.clone()).collect(),
 	};
+	let mut seen = std::collections::HashSet::new();
 	let mut selected = Vec::new();
 	for path in requested {
 		let rel = if explicit.is_some() {
@@ -276,62 +276,47 @@ fn capture_paths(
 		} else {
 			path
 		};
-		if selected.contains(&rel) {
-			continue;
+		if seen.insert(rel.clone()) {
+			selected.push(rel);
 		}
-		if explicit.is_some()
-			&& !store.root().join(&rel).exists()
-			&& !owned.iter().any(|(_, p)| p == &rel)
-			&& store.selected_blob(session, Path::new(&rel))?.is_none()
-		{
-			return Err(format!(
-				"capture: missing path is not tracked by this session or trunk: {rel}"
-			));
-		}
-		selected.push(rel);
 	}
-	let mut saved = Vec::new();
+	if explicit.is_some() {
+		let missing: Vec<String> = selected
+			.iter()
+			.filter(|rel| {
+				!store.root().join(*rel).exists() && !owned.iter().any(|(_, path)| path == *rel)
+			})
+			.cloned()
+			.collect();
+		if !missing.is_empty() {
+			for (rel, tracked) in missing.iter().zip(store.capture_tracks(session, &missing)?) {
+				if !tracked {
+					return Err(format!(
+						"capture: missing path is not tracked by this session or trunk: {rel}"
+					));
+				}
+			}
+		}
+	}
+	let mut readable = Vec::with_capacity(selected.len());
 	let mut errors = Vec::new();
 	for rel in selected {
-		let result = (|| -> Result<bool> {
+		let read = (|| -> Result<Option<Vec<u8>>> {
 			capture_path(store.root(), &rel)?;
-			let path = Path::new(&rel);
-			let before = if store.live_change(path)?.is_some() {
-				store.read(session, path)?.or(store.trunk_read(path)?)
-			} else {
-				store.trunk_read(path)?
-			};
-			let changed = match std::fs::read(store.root().join(&rel)) {
-				Ok(bytes) => {
-					let mode = store.mode_for(session, path)?;
-					store.write_blob_captured(
-						session,
-						path,
-						&bytes,
-						&mode,
-						capture,
-						Operation::Capture,
-					)?
-				}
-				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-					store.delete_blob_captured(session, path, capture, Operation::Capture)?
-				}
-				Err(e) => return Err(format!("read failed: {e}")),
-			};
-			if changed.is_some() {
-				let after = store.read(session, path)?;
-				let mode = store.mode_for(session, path)?;
-				store.publish_live(session, path, before.as_deref(), after.as_deref(), &mode)?;
+			match std::fs::read(store.root().join(&rel)) {
+				Ok(bytes) => Ok(Some(bytes)),
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+				Err(e) => Err(format!("read failed: {e}")),
 			}
-			store.note_materialized(session, &rel)?;
-			Ok(changed.is_some())
 		})();
-		match result {
-			Ok(true) => saved.push(rel),
-			Ok(false) => {}
+		match read {
+			Ok(content) => readable.push((rel, content)),
 			Err(error) => errors.push(format!("{rel}: {error}")),
 		}
 	}
+	// One session commit and one live commit for the whole batch.
+	let (saved, batch_errors) = store.capture_batch(session, &readable, capture)?;
+	errors.extend(batch_errors);
 	let mut result = ok(json!({"captured":saved,"errors":errors}))?;
 	result["error"] = json!(!errors.is_empty());
 	Ok(result)

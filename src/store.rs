@@ -10,12 +10,12 @@ mod snapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::change_record::{Operation, Storage, Version};
+use crate::change_record::{Evidence, Operation, Storage, Version};
 use crate::provenance::{self, Capture};
 use crate::Result;
 
@@ -309,6 +309,29 @@ fn trimmed_opt(s: String) -> Option<String> {
 /// `git update-index --cacheinfo` rejects a `\` path as an invalid path on Windows.
 fn printable(p: &Path) -> String {
 	p.to_string_lossy().replace('\\', "/")
+}
+
+/// Executable mode or a plain file: the only two Git modes a session writes.
+fn normalize_mode(mode: &str) -> String {
+	if mode == "100755" {
+		"100755".into()
+	} else {
+		"100644".into()
+	}
+}
+
+/// A new file's mode from disk; Windows has no executable bit, so a plain file.
+fn disk_mode(disk: &Path) -> String {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		if std::fs::metadata(disk).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+		{
+			return "100755".into();
+		}
+	}
+	let _ = disk;
+	"100644".into()
 }
 
 /// Base git command: fixed identity, hooks disabled, optional private index.
@@ -881,22 +904,9 @@ impl Store {
 	/// untracked one), else a plain file.
 	pub fn mode_for(&self, session: &str, rel: &Path) -> Result<String> {
 		if let Some((_, mode)) = self.selected_blob(session, rel)? {
-			return Ok(if mode == "100755" {
-				mode
-			} else {
-				"100644".into()
-			});
+			return Ok(normalize_mode(&mode));
 		}
-		#[cfg(unix)]
-		{
-			use std::os::unix::fs::PermissionsExt;
-			if std::fs::metadata(self.root.join(rel))
-				.is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-			{
-				return Ok("100755".into());
-			}
-		}
-		Ok("100644".into())
+		Ok(disk_mode(&self.root.join(rel)))
 	}
 
 	/// Read a session blob. None when the session never wrote that path.
@@ -1590,6 +1600,33 @@ impl Store {
 		self.publish_live_with_intent(session, rel, before, after, mode, false)
 	}
 
+	/// The content a live publication stores for one path when the shared
+	/// revision moved: `after`, a three-way merge with it, or a refusal.
+	fn merge_live(
+		&self,
+		rel: &Path,
+		before: Option<&[u8]>,
+		after: Option<&[u8]>,
+		current: Option<&[u8]>,
+	) -> Result<Option<Vec<u8>>> {
+		match (before, after, current) {
+			(Some(base), Some(ours), Some(theirs)) => crate::merge::merge3(base, ours, theirs)?
+				.ok_or_else(|| {
+					format!(
+						"live conflict in {}; read the latest revision",
+						rel.display()
+					)
+				})
+				.map(Some),
+			(None, Some(ours), Some(theirs)) if ours == theirs => Ok(Some(ours.to_vec())),
+			(Some(_), None, None) => Ok(None),
+			_ => Err(format!(
+				"live conflict in {}; read the latest revision",
+				rel.display()
+			)),
+		}
+	}
+
 	fn publish_live_with_intent(
 		&self,
 		session: &str,
@@ -1632,24 +1669,7 @@ impl Store {
 		let proposed = if current.as_deref() == before || standalone || sibling {
 			after.map(|bytes| bytes.to_vec())
 		} else {
-			match (before, after, current.as_deref()) {
-				(Some(base), Some(ours), Some(theirs)) => crate::merge::merge3(base, ours, theirs)?
-					.ok_or_else(|| {
-						format!(
-							"live conflict in {}; read the latest revision",
-							rel.display()
-						)
-					})
-					.map(Some)?,
-				(None, Some(ours), Some(theirs)) if ours == theirs => Some(ours.to_vec()),
-				(Some(_), None, None) => None,
-				_ => {
-					return Err(format!(
-						"live conflict in {}; read the latest revision",
-						rel.display()
-					))
-				}
-			}
+			self.merge_live(rel, before, after, current.as_deref())?
 		};
 		if proposed.as_deref() == current.as_deref() {
 			return Ok(previous);
@@ -1901,6 +1921,472 @@ impl Store {
 		}
 		capture.keep(evidence);
 		Ok(Some(commit))
+	}
+
+	/// Adopt many disk paths in one session commit and one live commit, so a
+	/// bulk move or rewrite costs two commits instead of two per path.
+	/// `paths` carries each repository-relative path and the bytes read from
+	/// disk (`None` when the file is absent there). Content is hashed before
+	/// any lock, so peers wait only for the commits. Returns the paths whose
+	/// captured content changed, in input order, and the per-path errors; an
+	/// errored path is neither captured nor published.
+	pub(crate) fn capture_batch(
+		&self,
+		session: &str,
+		paths: &[(String, Option<Vec<u8>>)],
+		capture: &mut Capture,
+	) -> Result<(Vec<String>, Vec<String>)> {
+		capture.check_session(session)?;
+		if paths.is_empty() {
+			return Ok((Vec::new(), Vec::new()));
+		}
+		let mut errors = Vec::new();
+		let mut blobs: Vec<Option<String>> = vec![None; paths.len()];
+		let additions: Vec<(usize, &str)> = paths
+			.iter()
+			.enumerate()
+			.filter_map(|(index, (rel, content))| content.as_ref().map(|_| (index, rel.as_str())))
+			.collect();
+		// One Git process hashes every addition: a spawn per file is the whole
+		// cost of a bulk capture on Windows. `--stdin-paths` is newline
+		// delimited, so a path holding one (Unix only) falls back to one call
+		// each, as does a failed run.
+		let batchable =
+			!additions.is_empty() && additions.iter().all(|(_, rel)| !rel.contains('\n'));
+		let batched = if batchable {
+			run(
+				&self.root,
+				self.git_dir.as_deref(),
+				&["hash-object", "-w", "--stdin-paths"],
+				None,
+				Some(
+					additions
+						.iter()
+						.map(|(_, rel)| *rel)
+						.collect::<Vec<_>>()
+						.join("\n")
+						.as_bytes(),
+				),
+			)
+			.ok()
+			.and_then(|out| {
+				let listed: Vec<String> = String::from_utf8_lossy(&out)
+					.lines()
+					.map(str::to_owned)
+					.collect();
+				(listed.len() == additions.len()).then_some(listed)
+			})
+		} else {
+			None
+		};
+		match batched {
+			Some(listed) => {
+				for ((index, _), sha) in additions.iter().zip(listed) {
+					blobs[*index] = Some(sha);
+				}
+			}
+			None => {
+				for (index, rel) in &additions {
+					let bytes = paths[*index].1.as_deref().unwrap_or_default();
+					match self.hash_object(bytes) {
+						Ok(blob) => blobs[*index] = Some(blob),
+						Err(error) => errors.push(format!("{rel}: {error}")),
+					}
+				}
+			}
+		}
+		let _repo = self.mutation_lock("repository")?;
+		let _session = self.mutation_lock(&format!("session:{session}"))?;
+		let branch = self.branch(session);
+		let prev = self.tip(session)?;
+		let head = self.head()?;
+		let base_tree = match &prev {
+			Some(_) => self.tree_of(&branch)?,
+			None => match &head {
+				Some(head) => self.tree_of(head)?,
+				None => String::new(),
+			},
+		};
+		let base = if base_tree.is_empty() {
+			HashMap::new()
+		} else {
+			self.entries_at(&base_tree)?
+		};
+		let gitlinks = if base_tree.is_empty() {
+			HashSet::new()
+		} else {
+			self.gitlinks(&base_tree)?
+		};
+		let owned = self.owned_paths(session)?;
+		let mut adds = Vec::new();
+		let mut removes = Vec::new();
+		// Per path: the entry adopted (None when the path errored), and for a
+		// changed path its preimage, capture entry and evidence.
+		let mut adopted: Vec<Option<Option<String>>> = Vec::with_capacity(paths.len());
+		let mut changed: Vec<(
+			usize,
+			Option<(String, String)>,
+			Option<(String, String)>,
+			Option<Evidence>,
+		)> = Vec::new();
+		for (index, (rel, content)) in paths.iter().enumerate() {
+			if content.is_some() && blobs[index].is_none() {
+				adopted.push(None);
+				continue;
+			}
+			let path = Path::new(rel);
+			let inside = path
+				.ancestors()
+				.skip(1)
+				.filter(|a| !a.as_os_str().is_empty())
+				.find_map(|a| a.to_str().and_then(|a| gitlinks.get(a)));
+			if let Some(sub) = inside {
+				errors.push(format!(
+					"{rel}: is inside the git submodule `{sub}`: fs sessions branch this repository only; edit it in the `{sub}` checkout, commit and push there, then bump the gitlink here"
+				));
+				adopted.push(None);
+				continue;
+			}
+			let existing = base.get(rel.as_bytes()).cloned();
+			let entry = match content {
+				Some(_) => Some((
+					self.capture_mode(existing.as_ref(), path),
+					blobs[index].clone().unwrap_or_default(),
+				)),
+				None => None,
+			};
+			if entry == existing {
+				adopted.push(Some(existing.map(|(_, sha)| sha)));
+				continue;
+			}
+			let mut evidence =
+				capture.reserve(self, path, Operation::Capture, Storage::GitfsOverlay)?;
+			if let Some(evidence) = &mut evidence {
+				evidence.overlay_commit.before = prev.clone();
+				if let Some((_, sha)) = &existing {
+					evidence.before = Version::GitObject { value: sha.clone() };
+				}
+			}
+			match &entry {
+				Some((mode, blob)) => adds.push((mode.clone(), blob.clone(), path.to_path_buf())),
+				None => removes.push(path.to_path_buf()),
+			}
+			adopted.push(Some(entry.as_ref().map(|(_, sha)| sha.clone())));
+			changed.push((index, existing, entry, evidence));
+		}
+		let commit = if adds.is_empty() && removes.is_empty() {
+			None
+		} else {
+			let tree = self.apply(session, &base_tree, &adds, &removes)?;
+			if tree == base_tree {
+				None
+			} else {
+				let deletion = if removes.is_empty() {
+					""
+				} else {
+					"\nGitfs-Deletion: true"
+				};
+				let parent = prev.clone().or_else(|| head.clone());
+				let subject = match changed.as_slice() {
+					[(index, _, Some(_), _)] => {
+						format!("gitfs: save {}", printable(Path::new(&paths[*index].0)))
+					}
+					[(index, _, None, _)] => {
+						format!("gitfs: delete {}", printable(Path::new(&paths[*index].0)))
+					}
+					_ => format!("gitfs: capture {} paths", changed.len()),
+				};
+				let commit = self.commit_tree(
+					&tree,
+					parent.as_deref(),
+					&format!("{subject}\n\nGitfs-Session: {session}{deletion}"),
+				)?;
+				if let Err(error) = self.update_branch(&branch, &commit, prev.as_deref()) {
+					capture.uncertain();
+					return Err(format!(
+						"overlay publication outcome unknown for {commit}: {error}; do not automatically retry"
+					));
+				}
+				Some(commit)
+			}
+		};
+		if let Some(commit) = &commit {
+			for (_, _, entry, evidence) in changed.iter_mut() {
+				let Some(mut evidence) = evidence.take() else {
+					continue;
+				};
+				if let Some((_, blob)) = entry {
+					evidence.after = Version::GitObject {
+						value: blob.clone(),
+					};
+				}
+				evidence.overlay_commit.after = Some(commit.clone());
+				evidence.validate(session)?;
+				capture.keep(Some(evidence));
+			}
+			if let Some(head) = &head {
+				let fresh: Vec<String> = changed
+					.iter()
+					.map(|(index, _, _, _)| paths[*index].0.clone())
+					.filter(|rel| !owned.iter().any(|(_, owned)| owned == rel))
+					.collect();
+				if !fresh.is_empty() {
+					let name = format!("{session}.reads.json");
+					let mut reads: HashMap<String, String> = self.load_json(&name)?;
+					for rel in fresh {
+						reads.insert(rel, head.clone());
+					}
+					self.save_json(&name, &reads)?;
+				}
+			}
+		}
+		let mut live_failed = HashSet::new();
+		if let Some(session_commit) = &commit {
+			checkpoint("preimage")?;
+			let previous = self.reconcile_live_locked()?;
+			let parent = previous.clone().or_else(|| head.clone());
+			let tree = match &parent {
+				Some(parent) => self.tree_of(parent)?,
+				None => self.empty_tree()?,
+			};
+			let live = self.entries_at(&tree)?;
+			let trunk = if prev.is_none() {
+				base.clone()
+			} else {
+				match &head {
+					Some(head) => self.entries_at(&self.tree_of(head)?)?,
+					None => HashMap::new(),
+				}
+			};
+			let mut live_adds = Vec::new();
+			let mut live_removes = Vec::new();
+			for (index, preimage, entry, _) in &changed {
+				let rel = &paths[*index].0;
+				let path = Path::new(rel);
+				let current = live.get(rel.as_bytes());
+				let trunk_entry = trunk.get(rel.as_bytes());
+				// The publication preimage: the session's own copy when the live
+				// revision moved too, else trunk's, exactly as a single write does.
+				// The live history is only asked when those copies differ.
+				let live_moved = if preimage.is_some() && preimage.as_ref() != trunk_entry {
+					self.live_change_at(previous.as_deref(), current, trunk_entry, path)?
+				} else {
+					None
+				};
+				let before = if preimage.is_some() && live_moved.is_some() {
+					preimage.as_ref()
+				} else {
+					trunk_entry
+				};
+				let current_sha = current.map(|(_, sha)| sha.as_str());
+				let before_sha = before.map(|(_, sha)| sha.as_str());
+				let proposed = if current_sha == before_sha {
+					entry.as_ref().map(|(_, blob)| blob.clone())
+				} else {
+					let standalone = head.is_none()
+						&& current.is_none()
+						&& before_sha.is_some()
+						&& live_moved.is_none();
+					let sibling = previous.is_none()
+						&& match before_sha {
+							Some(sha) => {
+								let bytes = self.git(&["cat-file", "blob", sha])?;
+								self.known_revision(session, path, &bytes)?
+									&& current_sha == trunk_entry.map(|(_, sha)| sha.as_str())
+							}
+							None => false,
+						};
+					if standalone || sibling {
+						entry.as_ref().map(|(_, blob)| blob.clone())
+					} else {
+						let bytes = |sha: Option<&str>| -> Result<Option<Vec<u8>>> {
+							match sha {
+								Some(sha) => self.git(&["cat-file", "blob", sha]).map(Some),
+								None => Ok(None),
+							}
+						};
+						let before_bytes = bytes(before_sha)?;
+						let current_bytes = bytes(current_sha)?;
+						match self.merge_live(
+							path,
+							before_bytes.as_deref(),
+							paths[*index].1.as_deref(),
+							current_bytes.as_deref(),
+						) {
+							Ok(Some(bytes)) => Some(self.hash_object(&bytes)?),
+							Ok(None) => None,
+							Err(error) => {
+								errors.push(format!("{rel}: {error}"));
+								live_failed.insert(*index);
+								continue;
+							}
+						}
+					}
+				};
+				if proposed.as_deref() == current_sha {
+					continue;
+				}
+				match proposed {
+					Some(blob) => {
+						let mode = match current {
+							Some((mode, _)) => mode.clone(),
+							None => entry
+								.as_ref()
+								.map_or_else(|| "100644".to_owned(), |(mode, _)| mode.clone()),
+						};
+						live_adds.push((mode, blob, path.to_path_buf()));
+					}
+					None => live_removes.push(path.to_path_buf()),
+				}
+			}
+			if !live_adds.is_empty() || !live_removes.is_empty() {
+				let updated = self.apply("__live__", &tree, &live_adds, &live_removes)?;
+				let deletion = if live_removes.is_empty() {
+					""
+				} else {
+					"\nGitfs-Deletion: true"
+				};
+				let count = live_adds.len() + live_removes.len();
+				let subject = if count == 1 {
+					let path = live_adds
+						.first()
+						.map(|(_, _, path)| path)
+						.or_else(|| live_removes.first());
+					format!("capture {}", printable(path.map(PathBuf::as_path).unwrap()))
+				} else {
+					format!("capture {count} paths")
+				};
+				let commit = self.commit_tree(
+					&updated,
+					parent.as_deref(),
+					&format!(
+						"gitfs live: {subject}\n\nGitfs-Session: {session}\nGitfs-Overlay: {session_commit}{deletion}"
+					),
+				)?;
+				checkpoint("publish")?;
+				self.git(&[
+					"update-ref",
+					LIVE_REF,
+					&commit,
+					previous
+						.as_deref()
+						.unwrap_or("0000000000000000000000000000000000000000"),
+				])
+				.map_err(|error| {
+					capture.uncertain();
+					format!(
+						"live publication outcome unknown for {commit}: {error}; reconcile before retry"
+					)
+				})?;
+			}
+		}
+		let changed_indices: HashSet<usize> = changed.iter().map(|(index, ..)| *index).collect();
+		let mut ledger = self.load_ledger(session)?;
+		let mut saved = Vec::new();
+		for (index, (rel, content)) in paths.iter().enumerate() {
+			let Some(sha) = &adopted[index] else {
+				continue;
+			};
+			if live_failed.contains(&index) {
+				continue;
+			}
+			if changed_indices.contains(&index) {
+				let actual = match std::fs::read(self.root.join(rel)) {
+					Ok(bytes) => Some(bytes),
+					Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+					Err(error) => {
+						errors.push(format!(
+							"{rel}: cannot verify captured disk content: {error}"
+						));
+						continue;
+					}
+				};
+				if actual != *content {
+					errors.push(format!(
+						"{rel}: partial_success: {rel} already captured but disk changed during capture; do not automatically retry"
+					));
+				} else {
+					saved.push(rel.clone());
+				}
+			}
+			ledger.insert(
+				rel.clone(),
+				LedgerEntry {
+					blob: sha.clone(),
+					mtime: fs_mtime(&self.root.join(rel)).unwrap_or_else(now_ms),
+				},
+			);
+		}
+		self.save_ledger(session, &ledger)?;
+		Ok((saved, errors))
+	}
+
+	/// A capture path a revision tree holds or, before a session wrote anything,
+	/// the one trunk holds: what `selected_blob` answers for many paths at once.
+	pub(crate) fn capture_tracks(&self, session: &str, rels: &[String]) -> Result<Vec<bool>> {
+		let tracked = match self.tip(session)? {
+			Some(tip) => self.entries_at(&self.tree_of(&tip)?)?,
+			None => match self.head()? {
+				Some(head) => self.entries_at(&self.tree_of(&head)?)?,
+				None => HashMap::new(),
+			},
+		};
+		Ok(rels
+			.iter()
+			.map(|rel| tracked.contains_key(rel.as_bytes()))
+			.collect())
+	}
+
+	/// Gitlink paths in a revision tree; a capture path under one is a
+	/// submodule's business, checked once for a whole batch.
+	fn gitlinks(&self, tree: &str) -> Result<HashSet<String>> {
+		let listing = self.git(&["ls-tree", "-r", "-z", "--full-tree", tree])?;
+		let mut links = HashSet::new();
+		for row in listing.split(|b| *b == 0).filter(|row| !row.is_empty()) {
+			let Some(tab) = row.iter().position(|b| *b == b'\t') else {
+				continue;
+			};
+			let Ok(header) = std::str::from_utf8(&row[..tab]) else {
+				continue;
+			};
+			if header.starts_with("160000 ") {
+				if let Ok(path) = std::str::from_utf8(&row[tab + 1..]) {
+					links.insert(path.to_owned());
+				}
+			}
+		}
+		Ok(links)
+	}
+
+	/// The mode a capture writes: the revision's own executable bit, else disk's.
+	fn capture_mode(&self, existing: Option<&(String, String)>, rel: &Path) -> String {
+		match existing {
+			Some((mode, _)) => normalize_mode(mode),
+			None => disk_mode(&self.root.join(rel)),
+		}
+	}
+
+	/// A path changed on the shared revision, answered from trees already read.
+	fn live_change_at(
+		&self,
+		live: Option<&str>,
+		current: Option<&(String, String)>,
+		trunk: Option<&(String, String)>,
+		rel: &Path,
+	) -> Result<Option<Option<Vec<u8>>>> {
+		let Some(live) = live else {
+			return Ok(None);
+		};
+		if current == trunk {
+			if current.is_none() && self.explicit_live_deletion(live, rel)? {
+				return Ok(Some(None));
+			}
+			return Ok(None);
+		}
+		match current {
+			Some((_, blob)) => Ok(Some(Some(self.git(&["cat-file", "blob", blob])?))),
+			None => Ok(Some(None)),
+		}
 	}
 
 	/// Merge one materialize conflict. The shared worktree holds a revision
